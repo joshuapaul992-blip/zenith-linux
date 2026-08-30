@@ -5,7 +5,6 @@ Zenith Linux is a lightweight, custom independent Linux distribution built compl
 ## Features
 - **Ultra-lean Footprint:** Monolithic optimized kernel under 10MB.
 - **Universal Hardware Support:** Out-of-the-box support for USB 2.0/3.0, NVMe/SATA storage, and generic EFI/VESA framebuffers.
-- **Customized Terminal:** Built-in custom console typography/fonts right at boot.
 - **Fast Userland:** Powered by a statically-linked modern BusyBox environment.
 
 ## How to Test
