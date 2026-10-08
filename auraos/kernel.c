@@ -136,7 +136,10 @@ static size_t vga_write_at(const char *str, uint8_t attr, size_t row, size_t col
 /* Write "0x" followed by exactly 16 hex digits. Returns characters written. */
 static size_t vga_write_hex64_at(uint64_t value, uint8_t attr, size_t row, size_t col)
 {
-    static const char digits[16] = "0123456789ABCDEF";
+    /* Sized by the initializer (16 digits + NUL) so the terminator is kept;
+       GCC 15 rejects a [16] array here under -Wunterminated-string-init. */
+    static const char digits[] = "0123456789ABCDEF";
+    _Static_assert(sizeof(digits) == 17, "16 hex digits plus NUL");
     char buf[2 + 16 + 1];
 
     buf[0] = '0';
