@@ -158,6 +158,9 @@ floppy: $(FLOPPY)
 # ---- USB stick: GRUB boot.img + core.img (kernel in memdisk, kestrel.root=usb)
 #      and an MBR partition of type 0x4b holding the Kestrel boot volume
 #      (header + ustar of rootfs/); sector 0 also carries the option-B marker.
+#      For UEFI machines an EFI System Partition holds EFI/BOOT/BOOTX64.EFI
+#      (GRUB x86_64-efi with the same memdisk), when GRUB's EFI files and
+#      mtools are installed. A FAT volume "KESTREL RPT" receives REPORT.TXT.
 USBIMG := $(BUILD)/kestrel-usb.img
 USBIMG_FLAGS ?=
 $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(shell find rootfs -type f) $(BUILD)/cmdline.stamp
@@ -170,10 +173,22 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(shell find roo
 	@echo "  GRUB    core.img (USB, memdisk)"
 	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(BUILD)/usb-core.img \
 	    -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
-	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb
+	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb test
+	@rm -f $(BUILD)/usb-esp.img
+	@if [ -d "$(GRUB_LIB)/x86_64-efi" ] && command -v mformat >/dev/null; then \
+	    echo "  GRUB    BOOTX64.EFI (USB, memdisk)"; \
+	    $(GRUB_MKIMAGE) -O x86_64-efi -d $(GRUB_LIB)/x86_64-efi -o $(BUILD)/usb-bootx64.efi \
+	        -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
+	        memdisk tar normal configfile multiboot2 efi_gop efi_uga video video_fb test && \
+	    truncate -s 8M $(BUILD)/usb-esp.img && \
+	    MTOOLS_SKIP_CHECK=1 mformat -i $(BUILD)/usb-esp.img -T 16384 -h 64 -s 32 -v KESTREL_EFI :: && \
+	    MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD)/usb-esp.img ::/EFI ::/EFI/BOOT && \
+	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BUILD)/usb-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI; \
+	else echo "  (no GRUB x86_64-efi files or mtools: BIOS-only stick)"; fi
 	@echo "  USBIMG  $@"
 	@$(PYTHON) tools/mkusbimg.py $@ --rootfs rootfs --boot-img $(GRUB_LIB)/i386-pc/boot.img \
-	    --core-img $(BUILD)/usb-core.img $(USBIMG_FLAGS)
+	    --core-img $(BUILD)/usb-core.img $$(test -f $(BUILD)/usb-esp.img && echo --esp-img $(BUILD)/usb-esp.img) \
+	    $(USBIMG_FLAGS)
 
 usbimg: $(USBIMG)
 

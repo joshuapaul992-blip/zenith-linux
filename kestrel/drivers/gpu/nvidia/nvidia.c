@@ -499,6 +499,60 @@ static void read_display_state(struct nv_device *d)
 }
 
 /* ======================================================================== */
+/*  register snapshot for the modeset stage (reads only)                      */
+/* ======================================================================== */
+static void snap(struct nv_device *d, uint32_t reg, const char *what)
+{
+    if (d->nregs < NV_MAX_REGS) {
+        d->regs[d->nregs].reg = reg;
+        d->regs[d->nregs].val = rd32(d, reg);
+        d->regs[d->nregs].what = what;
+        d->nregs++;
+    }
+}
+
+static void snapshot(struct nv_device *d)
+{
+    static const struct { uint32_t reg; const char *what; } global[] = {
+        { 0x000200, "PMC_ENABLE" },          { 0x001700, "PRAMIN window" },
+        { 0x001704, "BAR1 instance block" }, { 0x001714, "BAR2 instance block" },
+        { 0x088050, "PCI ROM shadow" },      { 0x021c04, "display fuse" },
+        { 0x022448, "head count" },          { 0x100ce0, "VRAM size" },
+        { 0x610010, "display instance memory" },
+        { 0x610078, "disp" },                { 0x61008c, "chan intr status" },
+        { 0x610090, "chan intr enable" },    { 0x61009c, "chan error status" },
+        { 0x6100a0, "chan error enable" },   { 0x6100ac, "supervisor/owner status" },
+        { 0x6100b0, "supervisor intr enable" }, { 0x6101d0, "disp ctrl" },
+        { 0x610490, "core channel control" }, { 0x611494, "core push" },
+        { 0x611498, "core push 2" },         { 0x61149c, "core push 3" },
+        { 0x612004, "head/DAC/SOR masks" },  { 0x6194e8, "vbios handoff" },
+        { 0x619f04, "vbios image pointer" },
+    };
+    for (size_t i = 0; i < sizeof global / sizeof *global; i++) snap(d, global[i].reg, global[i].what);
+    for (int h = 0; h < NV_MAX_HEADS; h++) {
+        if (!(d->head_mask & (1u << h))) continue;
+        const uint32_t o = (uint32_t)h * 0x800;
+        snap(d, 0x616104 + o, "head caps 0"); snap(d, 0x616108 + o, "head caps 1"); snap(d, 0x61610c + o, "head caps 2");
+        snap(d, 0x6101b4 + o, "head caps copy 0"); snap(d, 0x6101d4 + o, "head supervisor mask");
+        snap(d, 0x6100c0 + o, "head vblank intr"); snap(d, 0x616308 + o, "head underflow");
+        snap(d, 0x612200 + o, "head rgclk div");
+        snap(d, 0x614100 + o, "VPLL ctrl"); snap(d, 0x614104 + o, "VPLL coef (P<<16|N<<8|M)");
+        snap(d, 0x61410c + o, "VPLL 0c"); snap(d, 0x614110 + o, "VPLL fN");
+    }
+    for (int s = 0; s < NV_MAX_SORS; s++) {
+        if (!(d->sor_mask & (1u << s))) continue;
+        const uint32_t o = (uint32_t)s * 0x800;
+        snap(d, 0x61c000 + o, "SOR caps"); snap(d, 0x6301c4 + o, "SOR caps copy");
+        snap(d, 0x61c004 + o, "SOR power"); snap(d, 0x61c030 + o, "SOR state");
+        snap(d, 0x612300 + o, "SOR clock"); snap(d, 0x61c10c + o, "SOR DP ctrl (link A)");
+        snap(d, 0x61c110 + o, "SOR DP pattern"); snap(d, 0x61c118 + o, "SOR DP drive current");
+        snap(d, 0x61c120 + o, "SOR DP pre-emphasis"); snap(d, 0x61c130 + o, "SOR DP 130");
+        snap(d, 0x61c13c + o, "SOR DP post-cursor");
+    }
+    for (uint32_t m = 0; m < 16; m++) snap(d, 0x612308 + m * 0x80, "OR route (or*2 + sublink)");
+}
+
+/* ======================================================================== */
 /*  probe and report                                                           */
 /* ======================================================================== */
 int nv_probe(struct nv_device *d, const struct nv_platform *plat)
@@ -520,7 +574,7 @@ int nv_probe(struct nv_device *d, const struct nv_platform *plat)
          d->bios.nconns, d->bios.ni2c);
 
     for (int i = 0; i < NVBIOS_MAX_OUTPUTS; i++) { d->dp[i].aux = -1; d->dp[i].route_sor = -1; }
-    if (d->display_present && d->state_supported) read_display_state(d);
+    if (d->display_present && d->state_supported) { read_display_state(d); snapshot(d); }
     if (d->display_present && d->aux_supported) probe_dp(d);
     else nvlog("nvidia: DP AUX probing not supported on %s yet\n", d->chip_name);
     return NV_OK;
@@ -627,6 +681,11 @@ size_t nv_report(const struct nv_device *d, char *buf, size_t cap)
             sb_printf(&b, "          surface offset %08x (VRAM %lx), size %08x, storage %08x, params %08x, viewport in %08x out %08x\n",
                       s->offset, (unsigned long)s->offset << 8, s->size, s->storage, s->params, s->viewport_in, s->viewport_out);
         }
+    }
+    if (d->nregs) {
+        sb_printf(&b, "\nRegister snapshot (read-only, for the modeset stage)\n");
+        for (int i = 0; i < d->nregs; i++)
+            sb_printf(&b, "  %06x = %08x  %s\n", d->regs[i].reg, d->regs[i].val, d->regs[i].what);
     }
     return b.n < cap ? b.n : cap;
 }

@@ -6,7 +6,7 @@ Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
 - UEFI with OVMF from the ISO, using a GOP frame buffer
 - legacy BIOS from the 1.44 MB floppy image
-- legacy BIOS from a USB stick image on an emulated xHCI port (`make run-usb`)
+- legacy BIOS and UEFI from a USB stick image on an emulated xHCI port (`make run-usb`)
 
 ## Building
 
@@ -18,7 +18,8 @@ sudo apt install build-essential nasm grub-pc-bin grub-efi-amd64-bin grub-common
 make            # build/kernel.elf
 make iso        # build/kestrel.iso          hybrid BIOS + UEFI (grub-mkrescue)
 make floppy     # build/kestrel-floppy.img   1.44 MB, BIOS (grub-mkimage + memdisk)
-make usbimg     # build/kestrel-usb.img      64 MiB USB stick: GRUB + Kestrel boot volume (rootfs/)
+make usbimg     # build/kestrel-usb.img      64 MiB USB stick, BIOS + UEFI: GRUB, Kestrel boot volume
+                #                            (rootfs/) and a FAT report volume (REPORT.TXT, VBIOS.ROM)
 make run-usb    # QEMU q35, boot from the stick on xHCI (kernel runs with kestrel.root=usb)
 make run        # QEMU, legacy BIOS
 make run-uefi   # QEMU, OVMF (set OVMF=/path/to/OVMF_CODE.fd if not auto-detected)
@@ -27,7 +28,10 @@ make run-pci    # QEMU q35: 200 GiB SATA disk on AHCI, NVMe behind a root port, 
                 #           and mouse) behind two bridges
 make iso KERNEL_CMDLINE="ahci.selftest=rw"   # bake a kernel command line into the ISO
 make iso KERNEL_CMDLINE="nvme.selftest=rw"   # NVMe read/compare/write-restore self-test at boot
-make test-pci   # host unit test of the PCI enumerator against a simulated config space
+make test       # all host unit tests:
+make test-pci   #   PCI enumerator against a simulated config space
+make test-nvbios #  NVIDIA VBIOS parser (NVBIOS_ROM=card.rom also parses a real dump)
+make test-nvidia #  NVIDIA probe against a simulated GP106
 make check      # grub-file --is-x86-multiboot2
 make debug      # QEMU paused with a gdb stub on :1234
 ```
@@ -140,6 +144,7 @@ Shell built-ins:
 | `ps`, `mem`, `pci`, `usb` | views of `/proc/tasks`, `/proc/meminfo`, `/proc/pci`, `/proc/usb` |
 | `disk`, `log`, `font` | SATA disks and the MBR of `/dev/sda`; kernel log; all 256 glyphs |
 | `lsblk`, `bootvol`, `recovery` | block devices and partitions; how the boot volume was found; the recovery console |
+| `gpu`, `report` | the NVIDIA report; write `REPORT.TXT` and `VBIOS.ROM` to the boot stick |
 | `reboot`, `poweroff` | restart, or power off through `reboot(2)` |
 
 ### Core utilities (`kernel/coreutils/`)
@@ -172,6 +177,45 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 - `/proc/uptime` and `/proc/meminfo`
 - `/sys/class/graphics/fb0/{virtual_size,name}` and `TIOCGWINSZ` for the screen
 - the CPUID brand-string leaves `0x80000002`–`0x80000004` for the CPU
+
+## NVIDIA GPUs (`drivers/gpu/nvidia/`): stage 1, detection
+
+Kestrel has no NVIDIA mode-setting driver yet. Stage 1 detects the card and collects everything the mode-setting stage needs, without changing what is on screen. The monitor the firmware lit stays monitor 0, the boot frame buffer. The register knowledge comes from nouveau (Linux v6.6, MIT licence; see `third_party/nouveau/LICENSE`).
+
+- **Chip:** `PMC_BOOT_0` gives the chipset (e.g. `136` = GP106, Quadro P2000) and the family. The VRAM size is read on Pascal and later.
+- **VBIOS** (`nvbios.c`, hardware independent):
+  - It is copied from PRAMIN (the image the VBIOS left in VRAM, seen through the BAR0 window) or from PROM (the ROM chip, with the PCI ROM shadow turned off).
+  - The PCI expansion ROM is used only when both of those fail. Candidates are scored like nouveau does, and the PRAMIN window and shadow bit are restored afterwards.
+  - The parser walks the image chain (PCIR, NPDE, checksums) and remaps table pointers into the extended `0xE0` image on Pascal. It reads the BIT table and version, and DCB 4.x outputs, connectors and I2C/AUX ports.
+- **DisplayPort** (GM20x and Pascal):
+  - The AUX pads are switched to AUX mode.
+  - Each DisplayPort output's AUX channel reports whether a monitor is attached.
+  - From the monitor it reads the DPCD capabilities, the link the firmware trained, lane status, and the EDID (I2C-over-AUX, both blocks).
+- **Firmware state:** the display engine's armed core-channel state shows, for every head:
+  - its raster, pixel clock and depth;
+  - its scan-out surface;
+  - which SOR (output resource) it drives, and how each DCB output is routed.
+
+  A read-only register snapshot of everything nouveau's mode-setting path touches is included as well.
+
+The shell command `gpu` prints the report. It also lands in `REPORT.TXT`, with the VBIOS image in `VBIOS.ROM` (see the report volume). Boot with `nvidia.probe=0` to skip the probe.
+
+**Testing.** No NVIDIA hardware or emulator was available, so the code is checked in two ways:
+- **`make test-nvbios`** parses a synthetic Pascal-style ROM: an x86 image with a checksum, an EFI image, and an extended image holding the DCB. `NVBIOS_ROM=VBIOS.ROM make test-nvbios` parses a real dump.
+- **`make test-nvidia`** runs the whole probe against a simulated GP106 BAR0. The simulation provides:
+  - a PRAMIN window over fake VRAM, and a PROM that only answers with the shadow bit cleared;
+  - AUX channels with a DisplayPort monitor (DPCD and EDID);
+  - firmware head and SOR state.
+
+  It checks that every temporarily changed register is restored. The simulation encodes the same nouveau semantics as the driver, so it verifies the driver's logic, not the hardware's behaviour.
+
+**Stage 2 (lighting further monitors) is not written yet.** It will be built against a real card's report. Depending on what that report shows, it needs:
+- the display core channel: instance memory, DMA objects and a command buffer;
+- framebuffers in VRAM;
+- the mode-change supervisor;
+- pixel clock PLLs from the VBIOS tables;
+- DisplayPort link training;
+- the VBIOS script interpreter.
 
 ## PCI enumerator (`drivers/pci/`)
 
@@ -386,6 +430,14 @@ The shell's `recovery` command opens the same console at any time. `bootvol` and
 | LBA 0 | GRUB `boot.img` plus the option-B marker |
 | From LBA 1 | `core.img`, carrying the stripped kernel and a `grub.cfg` with `kestrel.root=usb` in its memdisk |
 | LBA 2048 | the `0x4B` partition with the header and a ustar of `rootfs/` |
+| then | an EFI System Partition (`0xEF`, 8 MiB) with `EFI/BOOT/BOOTX64.EFI`: GRUB x86_64-efi with the same memdisk, so the stick also boots on UEFI machines |
+| last 24 MiB | the FAT16 report volume `KESTREL RPT` (`0x0E`, first table entry so that every OS mounts it) |
+
+**Report volume.** Many machines have no serial port, so Kestrel writes its diagnostics to the stick it booted from (`kernel/report.c`):
+- **The files:** `REPORT.TXT` (2 MiB) holds the kernel version, firmware, command line, CPU, every driver's report section (the NVIDIA report, for one) and the complete kernel log. `VBIOS.ROM` (1 MiB) holds the graphics card's video BIOS.
+- **How it writes them:** the kernel finds the volume by its FAT label, follows the two files' cluster chains and overwrites only their data sectors. Sizes, the FAT and the directory never change, so the stick stays valid for every OS.
+- **When:** at every boot (`kestrel.report=0` turns this off), and on demand with the shell command `report`.
+- **Write path:** USB mass storage got WRITE(10)/WRITE(16) and SYNCHRONIZE CACHE for this, and the block layer got `blk_write()`/`blk_flush()`, also wired to SATA and NVMe.
 
 Options:
 - `--layout gpt` builds a protective MBR + GPT. A BIOS-boot partition holds `core.img`, and the blocklists are patched the way grub-setup does it.
@@ -434,6 +486,8 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               ahci/          standalone AHCI SATA driver (ahci.h, ahci.c)
               nvme/          standalone NVMe driver: admin + I/O queue pair, PRP lists (nvme.h, nvme.c)
               video/         EDID parser (edid.c), Bochs/QEMU DISPI mode setter (bochs_dispi.c)
+              gpu/nvidia/    NVIDIA stage 1: VBIOS parser (nvbios.c), probe (nvidia.c): chip, VBIOS,
+                             DP AUX/DPCD/EDID, firmware display state; host tests in test/
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
@@ -453,6 +507,8 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
 kernel/       kernel.c       initialisation sequence, init and worker threads
               syscall.c      syscall table (Linux x86_64 numbers), handlers, ENOSYS stubs
               klog.c         dmesg ring buffer, panic screen
+              report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume
+              gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
               display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
               tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
                              model, per-TTY lock, cursor blink on every monitor, focus hotkeys,
@@ -518,3 +574,5 @@ The structure is laid out for these, in order:
 Kestrel source: yours to license as you wish.
 
 Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus.
+
+NVIDIA register and VBIOS table knowledge in `drivers/gpu/nvidia/` is derived from nouveau (`third_party/nouveau/LICENSE`): MIT, © Red Hat Inc.

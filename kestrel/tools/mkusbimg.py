@@ -7,6 +7,8 @@ Layout (MBR, the default):
   LBA 1..     GRUB core.img (kernel + grub.cfg inside its memdisk)
   LBA 2048..  partition type 0x4B (option A): Kestrel volume header,
               then the ustar payload built from --rootfs
+  then        optional EFI System Partition (type 0xEF, from --esp-img) with
+              EFI/BOOT/BOOTX64.EFI, so the same stick boots on UEFI machines
   after it    FAT16 partition "KESTREL RPT" (MBR type 0x0E, first table entry
               so that every OS mounts it): README.TXT, plus REPORT.TXT and
               VBIOS.ROM, which the kernel overwrites in place with its
@@ -29,6 +31,7 @@ GPT_TYPE = b"KESTREL-BOOT-VOL"
 BIOS_BOOT_GUID = uuid.UUID("21686148-6449-6e6f-744e-656564454649")
 PAYLOAD_OFFSET = 4096
 BASIC_DATA_GUID = uuid.UUID("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7")
+ESP_GUID = uuid.UUID("c12a7328-f81f-11d2-ba4b-00a0c93ec93b")
 
 # Report volume: the kernel finds it by this exact FAT volume label and only
 # ever overwrites the data clusters of REPORT.TXT and VBIOS.ROM.
@@ -188,6 +191,7 @@ def main():
     ap.add_argument("--plain-type", action="store_true", help="partition type 0x83 / Linux data (option B only)")
     ap.add_argument("--corrupt-payload", action="store_true")
     ap.add_argument("--no-report", action="store_true", help="no FAT report volume")
+    ap.add_argument("--esp-img", help="FAT image placed in an EFI System Partition (UEFI boot)")
     a = ap.parse_args()
 
     total = a.size * 1024 * 1024 // SECTOR
@@ -215,12 +219,18 @@ def main():
     report_sectors = 0 if a.no_report else REPORT_MIB * 1024 * 1024 // SECTOR
     report_start = end - report_sectors
     report_start -= report_start % 2048                         # 1 MiB aligned
-    part_count = (report_start if report_sectors else end) - part_start
+    esp = open(a.esp_img, "rb").read() if a.esp_img else b""
+    esp_sectors = (len(esp) + SECTOR - 1) // SECTOR
+    esp_start = report_start - esp_sectors
+    esp_start -= esp_start % 2048
+    part_count = (esp_start if esp else report_start if report_sectors else end) - part_start
     need = (PAYLOAD_OFFSET + len(payload)) // SECTOR
     if need > part_count:
         raise SystemExit(f"payload ({len(payload)} bytes) does not fit; use a larger --size")
     if report_sectors:
         img[report_start * SECTOR:(report_start + report_sectors) * SECTOR] = fat16_volume(report_sectors, report_start)
+    if esp:
+        img[esp_start * SECTOR:esp_start * SECTOR + len(esp)] = esp
 
     if core:
         img[core_lba * SECTOR:core_lba * SECTOR + len(core)] = core
@@ -244,6 +254,8 @@ def main():
     if a.layout == "mbr":
         ptype = 0x83 if a.plain_type else 0x4B
         entries = [mbr_entry(0x80, ptype, part_start, part_count)]
+        if esp:
+            entries.insert(0, mbr_entry(0x00, 0xEF, esp_start, esp_sectors))
         if report_sectors:      # first entry: older Windows mounts only that one on removable media
             entries.insert(0, mbr_entry(0x00, 0x0E, report_start, report_sectors))
         for i, e in enumerate(entries):
@@ -253,6 +265,8 @@ def main():
         ktype = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4").bytes_le if a.plain_type else GPT_TYPE
         parts = [(gpt_guid_bytes(BIOS_BOOT_GUID), uuid.uuid4().bytes_le, 34, part_start - 1, "BIOS boot")] if core else []
         parts.append((ktype, vol_uuid.bytes_le, part_start, part_start + part_count - 1, a.label))
+        if esp:
+            parts.append((ESP_GUID.bytes_le, uuid.uuid4().bytes_le, esp_start, esp_start + esp_sectors - 1, "EFI system"))
         if report_sectors:
             parts.append((BASIC_DATA_GUID.bytes_le, uuid.uuid4().bytes_le, report_start,
                           report_start + report_sectors - 1, "KESTREL RPT"))
@@ -264,6 +278,7 @@ def main():
     print(f"{a.out}: {a.size} MiB {a.layout.upper()}, GRUB core {core_sectors} sectors, "
           f"Kestrel partition at LBA {part_start} ({'0x83/linux' if a.plain_type else 'kestrel'} type), "
           f"payload {len(payload)} bytes crc {crc32(payload):08x}, uuid {vol_uuid}"
+          f"{f', ESP at LBA {esp_start}' if esp else ''}"
           f"{f', report volume at LBA {report_start}' if report_sectors else ''}"
           f"{', no sector-0 marker' if a.no_marker else ''}{', CORRUPTED payload' if a.corrupt_payload else ''}")
 

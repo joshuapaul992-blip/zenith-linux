@@ -34,6 +34,7 @@
 #define NV_MAX_SORS         8
 #define NV_BIOS_MAX         (1024 * 1024)
 #define NV_EDID_MAX         256
+#define NV_MAX_REGS         192
 
 struct nv_platform {
     /* Map `size` bytes of MMIO uncached (BAR0). Required. */
@@ -113,6 +114,11 @@ struct nv_device {
 
     /* per DCB output */
     struct nv_dp_probe dp[NVBIOS_MAX_OUTPUTS];
+
+    /* read-only snapshot of the registers a modeset touches (from nouveau's
+     * gf119/gm200 display code), taken at probe time */
+    int      nregs;
+    struct { uint32_t reg, val; const char *what; } regs[NV_MAX_REGS];
 };
 
 /* Probe one GPU. The caller fills the PCI fields (ids, bar0, bar1) first;
