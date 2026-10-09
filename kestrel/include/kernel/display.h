@@ -27,6 +27,11 @@ struct display_head {
     int       pitch;                /* bytes per scan line (>= width * bytes_pp)     */
     int       bytes_pp;             /* 4, or 3 for packed 24-bpp VBE modes           */
     uint8_t   r_pos, g_pos, b_pos;  /* bit position of each 8-bit channel            */
+    /* VRAM the CPU cannot map (vram == NULL, e.g. NVIDIA through the PRAMIN
+     * window): the terminal draws into `shadow` and publishes changed spans
+     * with write_span(write_ctx, byte offset into the frame buffer, ...). */
+    void    (*write_span)(void *ctx, uint32_t offset, const void *src, uint32_t len);
+    void     *write_ctx;
     char      name[32];             /* "VBE frame buffer", "bochs-display 00:04.0"   */
     char      monitor[16];          /* EDID monitor name, or "" if unknown           */
 };

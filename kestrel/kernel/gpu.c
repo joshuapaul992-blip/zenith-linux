@@ -12,6 +12,8 @@
 #include <kernel/string.h>
 #include <kernel/time.h>
 #include <kernel/bootinfo.h>
+#include <kernel/cpu.h>
+#include <kernel/display.h>
 #include "pci.h"
 #include "nvidia.h"
 
@@ -61,7 +63,16 @@ static uint32_t read_pci_rom(void *buf, uint32_t max)
     return copied;
 }
 
+/* Modeset milestones: rewrite REPORT.TXT so the log survives a hang or a
+ * dark screen (there is no serial port on the test machine). */
+static bool report_ready;
+static void checkpoint(const char *stage)
+{
+    if (report_ready) report_save(stage);
+}
+
 static const struct nv_platform kestrel_nv = {
+    .checkpoint   = checkpoint,
     .map_mmio     = map_mmio,
     .delay_us     = udelay,
     .log_putc     = klog_putc,
@@ -69,6 +80,74 @@ static const struct nv_platform kestrel_nv = {
     .free         = release,
     .read_pci_rom = read_pci_rom,
 };
+
+/* ---- stage 2: modeset (nvidia.modeset=1, or =2 to also re-drive firmware-lit
+ * monitors) ----------------------------------------------------------------- */
+static int modeset_level(void)
+{
+    const char *o = strstr(g_boot.cmdline, "nvidia.modeset=");
+    return o ? o[15] - '0' : 0;
+}
+
+static void try_modeset(struct pci_device *p, struct nv_device *d)
+{
+    int level = modeset_level();
+    if (level != 1 && level != 2) return;
+    /* Supervisor interrupts are polled; keep the GPU's INTx line quiet. */
+    uint16_t cmd = pci_read16(p->bus, p->device, p->function, 0x04);
+    pci_write16(p->bus, p->device, p->function, 0x04, cmd | PCI_CMD_INTX_DISABLE);
+    report_ready = !strstr(g_boot.cmdline, "kestrel.report=0") && report_locate();
+    struct nv_modeset_opts opts = { .trace_scripts = true, .takeover = level == 2 };
+    const char *w = strstr(g_boot.cmdline, "nvidia.maxres=");
+    if (w) {
+        w += 14;
+        while (*w >= '0' && *w <= '9') opts.max_width = opts.max_width * 10 + (*w++ - '0');
+        if (*w == 'x') for (w++; *w >= '0' && *w <= '9'; w++) opts.max_height = opts.max_height * 10 + (*w - '0');
+    }
+    kprintf("nvidia: experimental modeset (nvidia.modeset=%d)\n", level);
+    uint64_t t0 = time_ms();
+    int rc = nv_modeset(d, &opts);
+    kprintf("nvidia: modeset finished in %lu ms: %s\n", time_ms() - t0, nv_strerror(rc));
+}
+
+struct nv_display_ctx { struct nv_device *dev; uint64_t fb; };
+
+/* Frame buffers in VRAM are written through the BAR0 PRAMIN window, which
+ * is one shared register: keep interrupts (and so other TTYs) out. */
+static void vram_span(void *ctx, uint32_t offset, const void *src, uint32_t len)
+{
+    struct nv_display_ctx *c = ctx;
+    uint64_t f = irq_save();
+    nv_vram_write(c->dev, c->fb + offset, src, len);
+    irq_restore(f);
+}
+
+void gpu_register_displays(void)
+{
+    static struct nv_display_ctx ctxs[MAX_GPUS * NV_MAX_HEADS];
+    int nctx = 0;
+    for (int g = 0; g < ngpus; g++) {
+        struct nv_device *d = &gpus[g];
+        for (int i = 0; i < d->ms.nouts; i++) {
+            const struct nv_output *o = &d->ms.out[i];
+            if (o->kept || !o->lit) continue;
+            size_t bytes = (size_t)o->pitch * o->mode.vdisplay;
+            uint64_t shadow = pmm_alloc_contig((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+            if (!shadow) { kprintf("nvidia: no RAM for the shadow of head %d\n", o->head); continue; }
+            struct nv_display_ctx *c = &ctxs[nctx++];
+            c->dev = d;
+            c->fb = o->fb;
+            struct display_head h = {
+                .phys = 0, .vram = NULL, .shadow = (uint32_t *)(uintptr_t)shadow,
+                .width = o->mode.hdisplay, .height = o->mode.vdisplay, .pitch = (int)o->pitch, .bytes_pp = 4,
+                .r_pos = 16, .g_pos = 8, .b_pos = 0,
+                .write_span = vram_span, .write_ctx = c,
+            };
+            snprintf(h.name, sizeof h.name, "%s head %d DP-%d", d->chip_name, o->head, o->dcb);
+            display_register(&h);
+        }
+    }
+}
 
 /* ---- probe ------------------------------------------------------------------ */
 static size_t report_section(char *buf, size_t cap) { return gpu_report(buf, cap); }
@@ -99,6 +178,7 @@ void gpu_probe(void)
         kprintf("nvidia: probe of %02x:%02x.%x finished in %lu ms: %s\n", p->bus, p->device, p->function,
                 time_ms() - t0, nv_strerror(rc));
         if (d->bios_data && d->bios_size) report_set_blob(d->bios_data, d->bios_size, "NVIDIA video BIOS");
+        if (rc == NV_OK) try_modeset(p, d);
     }
     if (ngpus) report_add_section("NVIDIA GPU", report_section);
 }

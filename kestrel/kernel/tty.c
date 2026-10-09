@@ -92,6 +92,10 @@ static void publish(const struct kestrel_tty *t, int x, int y, int w, int h)
     const size_t bpp = (size_t)t->bytes_pp;
     for (int py = y; py < y + h; py++) {
         size_t off = (size_t)py * (size_t)t->pitch + (size_t)x * bpp;
+        if (t->write_span) {
+            t->write_span(t->write_ctx, (uint32_t)off, (uint8_t *)t->shadow + off, (uint32_t)((size_t)w * bpp));
+            continue;
+        }
         memcpy((uint8_t *)t->framebuffer_address + off, (uint8_t *)t->shadow + off, (size_t)w * bpp);
     }
 }
@@ -542,6 +546,8 @@ static bool tty_setup(struct kestrel_tty *t, int index, const struct display_hea
     t->native_width  = h->width;
     t->native_height = h->height;
     t->pitch         = h->pitch;
+    t->write_span    = h->write_span;
+    t->write_ctx     = h->write_ctx;
     t->bytes_pp      = h->bytes_pp;
     t->r_pos = h->r_pos; t->g_pos = h->g_pos; t->b_pos = h->b_pos;
     t->index    = index;

@@ -30,7 +30,7 @@ int display_register(const struct display_head *h)
         kprintf("display: %s ignored, %d monitors already registered\n", h->name, MAX_MONITORS);
         return -1;
     }
-    if (!h->vram || h->width <= 0 || h->height <= 0 || (h->bytes_pp != 3 && h->bytes_pp != 4) ||
+    if ((!h->vram && !(h->write_span && h->shadow)) || h->width <= 0 || h->height <= 0 || (h->bytes_pp != 3 && h->bytes_pp != 4) ||
         h->pitch < h->width * h->bytes_pp) {
         kprintf("display: %s ignored, bad geometry %dx%d pitch %d\n", h->name, h->width, h->height, h->pitch);
         return -1;
@@ -133,6 +133,7 @@ void display_probe(void)
 {
     gpu_probe();                    /* native GPU drivers: NVIDIA detection (stage 1) */
     probe_boot_fb();
+    gpu_register_displays();        /* monitors lit by nvidia.modeset=1 */
     for (size_t i = 0; i < pci_device_count(); i++) {
         struct pci_device *dev = pci_device_at(i);
         if (dev->vendor_id == DISPI_PCI_VENDOR && dev->device_id == DISPI_PCI_DEVICE &&

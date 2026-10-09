@@ -62,6 +62,8 @@ struct kestrel_tty {
                                            VRAM (NULL: draw straight into VRAM)     */
     int       native_width, native_height;  /* pixels                               */
     int       pitch;                    /* bytes per scan line (>= width * bpp)     */
+    void    (*write_span)(void *ctx, uint32_t offset, const void *src, uint32_t len);
+    void     *write_ctx;                /* VRAM without a CPU mapping, see display.h */
     int       bytes_pp;                 /* 4 (x8r8g8b8 and friends) or 3 (24 bpp)   */
     uint8_t   r_pos, g_pos, b_pos;      /* pixel format of this monitor             */
     int       index;                    /* monitor number = system_ttys[] index     */
