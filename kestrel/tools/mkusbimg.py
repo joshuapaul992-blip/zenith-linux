@@ -5,15 +5,19 @@ Layout (MBR, the default):
   LBA 0       GRUB boot.img; bytes 3..22 carry the option-B marker
               "KESTREL_BOOT" + u64 LBA of the volume header
   LBA 1..     GRUB core.img (kernel + grub.cfg inside its memdisk)
-  LBA 2048..  partition 1, type 0x4B (option A): Kestrel volume header,
+  LBA 2048..  partition type 0x4B (option A): Kestrel volume header,
               then the ustar payload built from --rootfs
+  after it    FAT16 partition "KESTREL RPT" (MBR type 0x0E, first table entry
+              so that every OS mounts it): README.TXT, plus REPORT.TXT and
+              VBIOS.ROM, which the kernel overwrites in place with its
+              diagnostic report and the graphics card's video BIOS
 
 GPT layout (--layout gpt): protective MBR + GPT; partition 1 is a BIOS boot
 partition holding core.img, partition 2 has the Kestrel type GUID
 ("KESTREL-BOOT-VOL" as raw bytes) and a unique partition GUID equal to the
-volume UUID.
+volume UUID, partition 3 is the report volume (Microsoft basic data).
 
-Test knobs: --no-marker (option A only), --plain-type (partition type 0x83
+--no-report leaves out the report volume. Test knobs: --no-marker (option A only), --plain-type (partition type 0x83
 so that only option B finds it), --no-grub (data-only stick),
 --corrupt-payload (flip one payload byte after the CRC is computed).
 """
@@ -24,6 +28,87 @@ MAGIC = b"KESTREL_BOOT"
 GPT_TYPE = b"KESTREL-BOOT-VOL"
 BIOS_BOOT_GUID = uuid.UUID("21686148-6449-6e6f-744e-656564454649")
 PAYLOAD_OFFSET = 4096
+BASIC_DATA_GUID = uuid.UUID("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7")
+
+# Report volume: the kernel finds it by this exact FAT volume label and only
+# ever overwrites the data clusters of REPORT.TXT and VBIOS.ROM.
+REPORT_LABEL = b"KESTREL RPT"
+REPORT_MIB = 24
+REPORT_FILES = [  # (8.3 name, size, initial contents)
+    (b"README  TXT", None, None),
+    (b"REPORT  TXT", 2 * 1024 * 1024, None),
+    (b"VBIOS   ROM", 1024 * 1024, b"\0"),
+]
+README = b"""Kestrel report volume\r
+=====================\r
+\r
+Kestrel writes two files here every time it boots from this stick:\r
+\r
+  REPORT.TXT  kernel version, command line, graphics card report (NVIDIA:\r
+              chip, video BIOS tables, DisplayPort outputs, monitors and\r
+              their EDID) and the complete kernel log\r
+  VBIOS.ROM   the graphics card's video BIOS image (NVIDIA cards)\r
+\r
+Both files keep their size; unused space is padded. Copy them off the\r
+stick to share them. The shell command 'report' writes them again with the\r
+log up to that moment; boot with kestrel.report=0 to stop automatic writes.\r
+"""
+
+
+def fat16_volume(sectors, hidden):
+    """A FAT16 file system of `sectors` sectors holding REPORT_FILES, each
+    allocated contiguously."""
+    spc, reserved, nfats, root_entries = 4, 4, 2, 512
+    root_secs = root_entries * 32 // SECTOR
+    fat_secs = 1
+    while True:
+        data = sectors - reserved - nfats * fat_secs - root_secs
+        clusters = data // spc
+        need = (clusters + 2) * 2 // SECTOR + 1
+        if need <= fat_secs:
+            break
+        fat_secs = need
+    assert 4085 <= clusters < 65525, "not a FAT16 cluster count"
+    vol = bytearray(sectors * SECTOR)
+    bpb = struct.pack("<3s8sHBHBHHBHHHII", b"\xeb\x3c\x90", b"KESTREL ", SECTOR, spc, reserved,
+                      nfats, root_entries, sectors if sectors < 65536 else 0, 0xF8, fat_secs,
+                      63, 255, hidden, sectors if sectors >= 65536 else 0)
+    bpb += struct.pack("<BBBI11s8s", 0x80, 0, 0x29, 0x4B524550, REPORT_LABEL, b"FAT16   ")
+    vol[0:len(bpb)] = bpb
+    vol[510:512] = b"\x55\xaa"
+
+    fat = bytearray(fat_secs * SECTOR)
+    struct.pack_into("<HH", fat, 0, 0xFFF8, 0xFFFF)
+    root = bytearray(root_secs * SECTOR)
+    t = time.localtime()
+    fdate = ((t.tm_year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday
+    ftime = (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2)
+
+    def dirent(name, attr, clus, size):     # 32 bytes, FAT spec section 6
+        return struct.pack("<11sBBBHHHHHHHI", name, attr, 0, 0, ftime, fdate, fdate, 0,
+                           ftime, fdate, clus, size)
+    root[0:32] = dirent(REPORT_LABEL, 0x08, 0, 0)
+    data_lba = reserved + nfats * fat_secs + root_secs
+    cluster = 2
+    for i, (name, size, fill) in enumerate(REPORT_FILES, start=1):
+        if size is None:
+            body = README
+        else:
+            body = (b"Kestrel has not written a report to this stick yet.\r\n" if fill is None else b"")
+            body = body.ljust(size, b" " if fill is None else fill)
+        n = (len(body) + spc * SECTOR - 1) // (spc * SECTOR)
+        for c in range(cluster, cluster + n):
+            struct.pack_into("<H", fat, c * 2, c + 1 if c < cluster + n - 1 else 0xFFFF)
+        off = (data_lba + (cluster - 2) * spc) * SECTOR
+        vol[off:off + len(body)] = body
+        root[i * 32:(i + 1) * 32] = dirent(name, 0x20, cluster, len(body))
+        cluster += n
+    for k in range(nfats):
+        off = (reserved + k * fat_secs) * SECTOR
+        vol[off:off + len(fat)] = fat
+    off = (reserved + nfats * fat_secs) * SECTOR
+    vol[off:off + len(root)] = root
+    return vol
 
 
 def crc32(b, crc=0):
@@ -102,6 +187,7 @@ def main():
     ap.add_argument("--no-marker", action="store_true", help="omit the sector-0 marker (option A only)")
     ap.add_argument("--plain-type", action="store_true", help="partition type 0x83 / Linux data (option B only)")
     ap.add_argument("--corrupt-payload", action="store_true")
+    ap.add_argument("--no-report", action="store_true", help="no FAT report volume")
     a = ap.parse_args()
 
     total = a.size * 1024 * 1024 // SECTOR
@@ -125,10 +211,16 @@ def main():
     else:
         core_lba = 34
         part_start = max(2048, ((core_lba + core_sectors + 2047) // 2048) * 2048)
-    part_count = total - part_start - (34 if a.layout == "gpt" else 0)
+    end = total - (34 if a.layout == "gpt" else 0)             # first sector past the usable area
+    report_sectors = 0 if a.no_report else REPORT_MIB * 1024 * 1024 // SECTOR
+    report_start = end - report_sectors
+    report_start -= report_start % 2048                         # 1 MiB aligned
+    part_count = (report_start if report_sectors else end) - part_start
     need = (PAYLOAD_OFFSET + len(payload)) // SECTOR
     if need > part_count:
         raise SystemExit(f"payload ({len(payload)} bytes) does not fit; use a larger --size")
+    if report_sectors:
+        img[report_start * SECTOR:(report_start + report_sectors) * SECTOR] = fat16_volume(report_sectors, report_start)
 
     if core:
         img[core_lba * SECTOR:core_lba * SECTOR + len(core)] = core
@@ -151,12 +243,19 @@ def main():
 
     if a.layout == "mbr":
         ptype = 0x83 if a.plain_type else 0x4B
-        img[446:462] = mbr_entry(0x80, ptype, part_start, part_count)
+        entries = [mbr_entry(0x80, ptype, part_start, part_count)]
+        if report_sectors:      # first entry: older Windows mounts only that one on removable media
+            entries.insert(0, mbr_entry(0x00, 0x0E, report_start, report_sectors))
+        for i, e in enumerate(entries):
+            img[446 + 16 * i:462 + 16 * i] = e
     else:
         img[446:462] = mbr_entry(0x00, 0xEE, 1, min(total - 1, 0xFFFFFFFF))
         ktype = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4").bytes_le if a.plain_type else GPT_TYPE
         parts = [(gpt_guid_bytes(BIOS_BOOT_GUID), uuid.uuid4().bytes_le, 34, part_start - 1, "BIOS boot")] if core else []
         parts.append((ktype, vol_uuid.bytes_le, part_start, part_start + part_count - 1, a.label))
+        if report_sectors:
+            parts.append((BASIC_DATA_GUID.bytes_le, uuid.uuid4().bytes_le, report_start,
+                          report_start + report_sectors - 1, "KESTREL RPT"))
         write_gpt(img, total, parts, uuid.uuid4().bytes_le)
     img[510:512] = b"\x55\xaa"
 
@@ -165,6 +264,7 @@ def main():
     print(f"{a.out}: {a.size} MiB {a.layout.upper()}, GRUB core {core_sectors} sectors, "
           f"Kestrel partition at LBA {part_start} ({'0x83/linux' if a.plain_type else 'kestrel'} type), "
           f"payload {len(payload)} bytes crc {crc32(payload):08x}, uuid {vol_uuid}"
+          f"{f', report volume at LBA {report_start}' if report_sectors else ''}"
           f"{', no sector-0 marker' if a.no_marker else ''}{', CORRUPTED payload' if a.corrupt_payload else ''}")
 
 

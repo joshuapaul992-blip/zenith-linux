@@ -291,7 +291,13 @@ static int sata_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
     int rc = ahci_read(b->ctx, lba, count, buf);
     return rc == AHCI_OK ? 0 : rc == AHCI_ERR_TIMEOUT ? -ETIMEDOUT : -EIO;
 }
-static const struct blkdev_ops sata_ops = { .read = sata_read };
+static int sata_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
+{
+    int rc = ahci_write(b->ctx, lba, count, buf);
+    return rc == AHCI_OK ? 0 : rc == AHCI_ERR_TIMEOUT ? -ETIMEDOUT : -EIO;
+}
+static int sata_flush(struct blkdev *b) { return ahci_flush(b->ctx) == AHCI_OK ? 0 : -EIO; }
+static const struct blkdev_ops sata_ops = { .read = sata_read, .write = sata_write, .flush = sata_flush };
 
 /* ---- block layer: "nvmeN" disks, one per namespace ------------------------ */
 static int nvme_blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
@@ -305,7 +311,13 @@ static int nvme_blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *b
     default:               return -EIO;
     }
 }
-static const struct blkdev_ops nvme_ops = { .read = nvme_blk_read };
+static int nvme_blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
+{
+    int rc = nvme_write(b->ctx, lba, count, buf);
+    return rc == NVME_OK ? 0 : rc == NVME_ERR_TIMEOUT ? -ETIMEDOUT : rc == NVME_ERR_NODEV ? -ENODEV : -EIO;
+}
+static int nvme_blk_flush(struct blkdev *b) { return nvme_flush(b->ctx) == NVME_OK ? 0 : -EIO; }
+static const struct blkdev_ops nvme_ops = { .read = nvme_blk_read, .write = nvme_blk_write, .flush = nvme_blk_flush };
 
 void storage_register_devices(void)
 {

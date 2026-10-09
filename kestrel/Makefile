@@ -49,7 +49,7 @@ CFLAGS := -std=gnu11 -O2 -g -pipe \
           -m64 -march=x86-64 -mcmodel=small -mno-red-zone \
           -mno-mmx -mno-sse -mno-sse2 -mno-80387 -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
-          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -Idrivers/video -MMD -MP
+          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -Idrivers/video -Idrivers/gpu/nvidia -MMD -MP
 # -mcmodel=small: the kernel is linked/identity-mapped at 2 MiB (below 2 GiB).
 # A future higher-half move (0xFFFFFFFF80000000) would switch to -mcmodel=kernel.
 
@@ -69,7 +69,8 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c lib/crc32.c \
            drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
-           kernel/display.c kernel/tty.c kernel/kush.c \
+           kernel/display.c kernel/tty.c kernel/report.c \
+           drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \
            kernel/coreutils/ls.c kernel/coreutils/fileops.c kernel/coreutils/copy.c \
            kernel/coreutils/text.c kernel/coreutils/perms.c kernel/coreutils/sysinfo.c \
@@ -91,7 +92,7 @@ QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
 #   make iso KERNEL_CMDLINE="ahci.selftest=rw ahci.verify=5"
 KERNEL_CMDLINE ?=
 
-.PHONY: FORCE all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test-pci fonts clean distclean
+.PHONY: FORCE all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
 
 all: $(KERNEL)
 
@@ -233,6 +234,24 @@ test-pci:
 	    -DPCI_PORT_IO_HOOKS -DPCI_NO_MEM_FALLBACK -DPCI_MAX_TRACKED=4 -Idrivers/pci \
 	    drivers/pci/test/pci_sim_test.c drivers/pci/pci.c -o $(BUILD)/pci_sim_test_small
 	@$(BUILD)/pci_sim_test_small | tail -1
+
+# Host-side unit test of the NVIDIA VBIOS parser; NVBIOS_ROM=card.rom also
+# parses and prints a real ROM dump (e.g. VBIOS.ROM from the report stick)
+test-nvbios:
+	@mkdir -p $(BUILD)
+	@$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -Idrivers/gpu/nvidia \
+	    drivers/gpu/nvidia/test/nvbios_test.c drivers/gpu/nvidia/nvbios.c -o $(BUILD)/nvbios_test
+	@$(BUILD)/nvbios_test $(NVBIOS_ROM)
+
+# Host-side test of the NVIDIA probe against a simulated GP106 BAR0
+test-nvidia:
+	@mkdir -p $(BUILD)
+	@$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -DNV_MMIO_HOOKS \
+	    -Idrivers/gpu/nvidia -Idrivers/gpu/nvidia/test drivers/gpu/nvidia/test/nvidia_sim_test.c \
+	    drivers/gpu/nvidia/nvidia.c drivers/gpu/nvidia/nvbios.c -o $(BUILD)/nvidia_sim_test
+	@$(BUILD)/nvidia_sim_test > $(BUILD)/nvidia_sim_test.log; rc=$$?; tail -1 $(BUILD)/nvidia_sim_test.log; exit $$rc
+
+test: test-pci test-nvbios test-nvidia
 
 check: $(KERNEL)
 	@test -n "$(GRUB_FILE)" || { echo "error: grub-file not found"; exit 1; }

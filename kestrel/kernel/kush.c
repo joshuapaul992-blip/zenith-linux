@@ -18,6 +18,9 @@
 #include <kernel/recovery.h>
 #include <kernel/tty.h>
 #include <kernel/klog.h>
+#include <kernel/report.h>
+#include <kernel/gpu.h>
+#include <kernel/block.h>
 #include <kernel/keyboard.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
@@ -247,6 +250,27 @@ static int cmd_font(struct kush_session *sh, int argc, char **argv)
     return 0;
 }
 
+static int cmd_report(struct kush_session *sh, int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    tty_printf(sh->tty, "writing the report to %s ...\n", report_where());
+    int rc = report_save("requested from the shell");
+    if (rc == 0) tty_printf(sh->tty, C_OK "done" C_RESET ": %s\n", report_where());
+    else tty_printf(sh->tty, C_ERR "failed" C_RESET ": %s (boot from a stick made with 'make usbimg')\n", blk_strerror(rc));
+    return rc ? 1 : 0;
+}
+
+static int cmd_gpu(struct kush_session *sh, int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    size_t cap = 64 * 1024;
+    char *buf = kmalloc(cap);
+    if (!buf) return 1;
+    tty_write(sh->tty, buf, gpu_report(buf, cap));
+    kfree(buf);
+    return 0;
+}
+
 static int cmd_reboot(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc;
@@ -269,6 +293,8 @@ static const struct kush_cmd commands[] = {
     { "bootvol",  "",       "how the boot volume was found and mounted",       cmd_view },
     { "recovery", "",       "open the boot recovery console",                  cmd_recovery },
     { "log",      "",       "recent kernel messages",                          cmd_log },
+    { "report",   "",       "write REPORT.TXT + VBIOS.ROM to the boot stick",  cmd_report },
+    { "gpu",      "",       "NVIDIA GPU: chip, VBIOS tables, outputs, monitors", cmd_gpu },
     { "font",     "",       "show all 256 glyphs of kestrel_font",             cmd_font },
     { "reboot",   "",       "restart the machine",                             cmd_reboot },
     { "poweroff", "",       "power off (emulators) or halt",                   cmd_reboot },

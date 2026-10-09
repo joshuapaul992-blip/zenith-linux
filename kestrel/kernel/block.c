@@ -40,6 +40,8 @@ const char *blk_strerror(int err)
     case ERANGE:     return "beyond end of device";
     case EINVAL:     return "invalid argument";
     case ENOMEM:     return "out of memory";
+    case EROFS:      return "read-only device";
+    case ENOENT:     return "not found";
     default:         return "error";
     }
 }
@@ -91,6 +93,37 @@ int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
         if (b != disk) { b->errors++; b->last_error = rc; }
         if (rc == -ENODEV) blk_mark_removed(disk);
     }
+    return rc;
+}
+
+int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
+{
+    if (!b || !buf) return -EINVAL;
+    if (count == 0) return 0;
+    if (lba >= b->blocks || count > b->blocks - lba) return -ERANGE;
+    struct blkdev *disk = b;
+    while (disk->parent) { lba += disk->start; disk = disk->parent; }   /* stays inside the partition */
+    if (!disk->ops->write) return -EROFS;
+    if (disk->removed || b->removed) return -ENODEV;
+    disk_lock(disk);
+    int rc = disk->removed ? -ENODEV : disk->ops->write(disk, lba, count, buf);
+    disk_unlock(disk);
+    if (rc < 0) {
+        disk->errors++; disk->last_error = rc;
+        if (b != disk) { b->errors++; b->last_error = rc; }
+        if (rc == -ENODEV) blk_mark_removed(disk);
+    }
+    return rc;
+}
+
+int blk_flush(struct blkdev *b)
+{
+    struct blkdev *disk = blk_disk_of(b);
+    if (!disk || !disk->ops->flush) return 0;
+    if (disk->removed) return -ENODEV;
+    disk_lock(disk);
+    int rc = disk->ops->flush(disk);
+    disk_unlock(disk);
     return rc;
 }
 

@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define KLOG_SIZE 16384
+#define KLOG_SIZE (256 * 1024)          /* holds a whole boot plus GPU traces */
 
 /* Append a formatted message to the kernel log. The log is always mirrored
  * to COM1; it is also echoed to the on-screen console once the console is

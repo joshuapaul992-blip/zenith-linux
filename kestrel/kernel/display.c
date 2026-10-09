@@ -13,6 +13,7 @@
 #include <kernel/mm.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
+#include <kernel/gpu.h>
 #include "pci.h"
 #include "edid.h"
 #include "bochs_dispi.h"
@@ -130,6 +131,7 @@ static void probe_dispi(struct pci_device *dev)
 
 void display_probe(void)
 {
+    gpu_probe();                    /* native GPU drivers: NVIDIA detection (stage 1) */
     probe_boot_fb();
     for (size_t i = 0; i < pci_device_count(); i++) {
         struct pci_device *dev = pci_device_at(i);

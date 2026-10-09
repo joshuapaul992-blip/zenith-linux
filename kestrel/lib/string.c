@@ -65,6 +65,14 @@ int strncmp(const char *a, const char *b, size_t n)
     return 0;
 }
 
+char *strstr(const char *h, const char *n)
+{
+    size_t len = strlen(n);
+    for (; *h; h++)
+        if (strncmp(h, n, len) == 0) return (char *)h;
+    return len ? NULL : (char *)h;
+}
+
 char *strchr(const char *s, int c)
 {
     for (;; s++) {

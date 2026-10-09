@@ -34,6 +34,7 @@
 #include <kernel/usbhost.h>
 #include <kernel/tty.h>
 #include <kernel/display.h>
+#include <kernel/report.h>
 #include <kernel/kush.h>
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
@@ -375,6 +376,11 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
      * waiting for USB storage to settle; a mandatory volume that is missing
      * or unreadable ends in the recovery console, not a crash. */
     bootvol_mount_root();
+
+    /* No serial port on many machines: write REPORT.TXT (and the video BIOS)
+     * to the stick's "KESTREL RPT" volume, if there is one. */
+    if (!strstr(g_boot.cmdline, "kestrel.report=0") && report_locate())
+        report_save("written at boot");
 
     if (!task_create("init", init_main, NULL)) panic("cannot start init");
     if (!(ch.flags & BOOTOPT_SAFE_MODE)) {

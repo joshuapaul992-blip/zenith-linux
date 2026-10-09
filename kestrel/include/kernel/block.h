@@ -26,6 +26,9 @@ struct blkdev_ops {
     /* read `count` blocks; buf is identity-mapped kernel memory (DMA safe) */
     int  (*read)(struct blkdev *b, uint64_t lba, uint32_t count, void *buf);
     bool (*alive)(struct blkdev *b);        /* optional: still attached?       */
+    /* optional: write `count` blocks (buf DMA safe), and flush caches */
+    int  (*write)(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf);
+    int  (*flush)(struct blkdev *b);
 };
 
 struct blkdev {
@@ -68,6 +71,10 @@ struct blkdev *blk_disk_of(struct blkdev *b);       /* partition -> its disk */
 
 int  blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf);
 int  blk_read_bytes(struct blkdev *b, uint64_t offset, void *buf, size_t len);
+/* Raw block writes (kernel use only; /dev nodes stay read-only). -EROFS if
+ * the driver cannot write. blk_flush() asks the device to commit its cache. */
+int  blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf);
+int  blk_flush(struct blkdev *b);
 uint64_t blk_size_bytes(const struct blkdev *b);
 
 const char *blk_strerror(int err);

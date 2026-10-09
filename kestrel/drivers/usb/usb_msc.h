@@ -40,6 +40,7 @@
 #define MSC_ERR_NOTREADY   -7      /* unit never became ready                    */
 #define MSC_ERR_RANGE      -8      /* LBA outside the medium                     */
 #define MSC_ERR_UNSUPPORTED -9     /* block size / device type not usable        */
+#define MSC_ERR_READONLY  -10      /* medium is write protected                  */
 
 /* SCSI sense keys used by the driver */
 #define SENSE_NO_SENSE       0x0
@@ -49,6 +50,7 @@
 #define SENSE_HARDWARE_ERROR 0x4
 #define SENSE_ILLEGAL_REQ    0x5
 #define SENSE_UNIT_ATTENTION 0x6
+#define SENSE_DATA_PROTECT   0x7
 
 struct usb_msc_platform {
     void     (*delay_us)(uint32_t us);
@@ -78,6 +80,7 @@ struct usb_msc_dev {
 
     /* statistics and the most recent error, for diagnostics */
     uint32_t commands, reads, blocks_read, retries, resets, errors, timeouts;
+    uint32_t writes, blocks_written;
     uint8_t  sense_key, asc, ascq;
     int      last_error;
     uint8_t  last_opcode;
@@ -95,6 +98,11 @@ int  usb_msc_probe(const struct xhci_msc_info *info, uint8_t lun,
  * Splits into <= 64 KiB transfers, retries each up to 3 times with Reset
  * Recovery in between, and validates the residue of every transfer. */
 int  usb_msc_read(struct usb_msc_dev *d, uint64_t lba, uint32_t count, void *buf);
+
+/* Write `count` blocks at `lba` from `buf`, split and retried like reads.
+ * usb_msc_sync() flushes the device's write cache. */
+int  usb_msc_write(struct usb_msc_dev *d, uint64_t lba, uint32_t count, const void *buf);
+int  usb_msc_sync(struct usb_msc_dev *d);
 
 /* Device still attached in the same enumeration generation? */
 bool usb_msc_alive(const struct usb_msc_dev *d);

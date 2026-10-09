@@ -271,6 +271,7 @@ static int msc_errno(int rc)
     case MSC_ERR_TIMEOUT:  return -ETIMEDOUT;
     case MSC_ERR_NOMEDIUM: return -ENOMEDIUM;
     case MSC_ERR_RANGE:    return -ERANGE;
+    case MSC_ERR_READONLY: return -EROFS;
     default:               return -EIO;
     }
 }
@@ -279,8 +280,15 @@ static int ublk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
     struct usb_disk *u = b->ctx;
     return msc_errno(usb_msc_read(&u->msc, lba, count, buf));
 }
+static int ublk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
+{
+    struct usb_disk *u = b->ctx;
+    return msc_errno(usb_msc_write(&u->msc, lba, count, buf));
+}
+static int ublk_flush(struct blkdev *b) { return msc_errno(usb_msc_sync(&((struct usb_disk *)b->ctx)->msc)); }
 static bool ublk_alive(struct blkdev *b) { return usb_msc_alive(&((struct usb_disk *)b->ctx)->msc); }
-static const struct blkdev_ops ublk_ops = { .read = ublk_read, .alive = ublk_alive };
+static const struct blkdev_ops ublk_ops = { .read = ublk_read, .write = ublk_write, .flush = ublk_flush,
+                                            .alive = ublk_alive };
 
 static bool known(uint8_t slot, uint32_t gen)
 {

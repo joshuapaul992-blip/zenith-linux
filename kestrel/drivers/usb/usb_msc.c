@@ -2,7 +2,8 @@
  *  usb_msc.c -- USB Mass Storage Bulk-Only Transport + SCSI block commands
  *  References: USB MSC Bulk-Only Transport 1.0 (sections 5, 6.6, 6.7);
  *              SPC-4 (INQUIRY, TEST UNIT READY, REQUEST SENSE);
- *              SBC-3 (READ CAPACITY 10/16, READ 10/16).
+ *              SBC-3 (READ CAPACITY 10/16, READ 10/16, WRITE 10/16,
+ *              SYNCHRONIZE CACHE 10).
  * ============================================================================= */
 #include "usb_msc.h"
 #include <stdarg.h>
@@ -20,6 +21,9 @@
 #define SCSI_READ_CAPACITY10  0x25
 #define SCSI_READ10           0x28
 #define SCSI_READ16           0x88
+#define SCSI_WRITE10          0x2A
+#define SCSI_WRITE16          0x8A
+#define SCSI_SYNC_CACHE10     0x35
 #define SCSI_SERVICE_ACTION16 0x9E
 #define SAI_READ_CAPACITY16   0x10
 
@@ -139,6 +143,7 @@ const char *usb_msc_strerror(int err)
     case MSC_ERR_NOTREADY:    return "unit not ready";
     case MSC_ERR_RANGE:       return "block out of range";
     case MSC_ERR_UNSUPPORTED: return "unsupported device";
+    case MSC_ERR_READONLY:    return "write protected";
     default:                  return "unknown error";
     }
 }
@@ -163,6 +168,9 @@ static const char *opcode_name(uint8_t op)
     case SCSI_SERVICE_ACTION16: return "READ CAPACITY(16)";
     case SCSI_READ10:           return "READ(10)";
     case SCSI_READ16:           return "READ(16)";
+    case SCSI_WRITE10:          return "WRITE(10)";
+    case SCSI_WRITE16:          return "WRITE(16)";
+    case SCSI_SYNC_CACHE10:     return "SYNCHRONIZE CACHE";
     default:                    return "SCSI command";
     }
 }
@@ -328,11 +336,12 @@ static int request_sense(struct usb_msc_dev *d)
     return MSC_OK;
 }
 
-/* Run one SCSI command; on CHECK CONDITION fetch and log the sense data. */
-static int scsi(struct usb_msc_dev *d, const uint8_t *cdb, uint8_t cdb_len, void *buf, uint32_t len,
-                uint32_t timeout_ms, uint32_t *moved, bool quiet)
+/* Run one SCSI command; on CHECK CONDITION fetch and log the sense data.
+ * `out` selects a data-out (host to device) stage, e.g. for WRITE. */
+static int scsi_dir(struct usb_msc_dev *d, const uint8_t *cdb, uint8_t cdb_len, bool out, void *buf,
+                    uint32_t len, uint32_t timeout_ms, uint32_t *moved, bool quiet)
 {
-    int rc = bot_command(d, cdb, cdb_len, true, buf, len, timeout_ms, moved);
+    int rc = bot_command(d, cdb, cdb_len, !out, buf, len, timeout_ms, moved);
     if (rc != MSC_ERR_CHECK) return rc;
     int sr = request_sense(d);
     if (sr != MSC_OK) {
@@ -345,6 +354,12 @@ static int scsi(struct usb_msc_dev *d, const uint8_t *cdb, uint8_t cdb_len, void
         msc_log("usb-msc: slot %u: %s: CHECK CONDITION, sense %s (ASC %02x ASCQ %02x)\n", d->slot,
                 opcode_name(cdb[0]), scsi_sense_key_name(d->sense_key), d->asc, d->ascq);
     return MSC_ERR_CHECK;
+}
+
+static int scsi(struct usb_msc_dev *d, const uint8_t *cdb, uint8_t cdb_len, void *buf, uint32_t len,
+                uint32_t timeout_ms, uint32_t *moved, bool quiet)
+{
+    return scsi_dir(d, cdb, cdb_len, false, buf, len, timeout_ms, moved, quiet);
 }
 
 int usb_msc_test_unit_ready(struct usb_msc_dev *d)
@@ -592,4 +607,95 @@ int usb_msc_read(struct usb_msc_dev *d, uint64_t lba, uint32_t count, void *buf)
         out += (size_t)n * d->block_size;
     }
     return MSC_OK;
+}
+
+/* ======================================================================== */
+/*  WRITE(10) / WRITE(16), SYNCHRONIZE CACHE                                   */
+/* ======================================================================== */
+static int write_chunk(struct usb_msc_dev *d, uint64_t lba, uint32_t n, const uint8_t *buf)
+{
+    uint8_t cdb[16];
+    mzero(cdb, sizeof cdb);
+    uint8_t len;
+    if (d->use_16 || lba + n - 1 > 0xFFFFFFFFull) {
+        cdb[0] = SCSI_WRITE16;
+        put_be64(cdb + 2, lba);
+        put_be32(cdb + 10, n);
+        len = 16;
+    } else {
+        cdb[0] = SCSI_WRITE10;
+        put_be32(cdb + 2, (uint32_t)lba);
+        put_be16(cdb + 7, (uint16_t)n);
+        len = 10;
+    }
+    uint32_t want = n * d->block_size, got = 0;
+    /* The xHCI driver copies OUT data into its bounce buffer, never writes `buf`. */
+    int rc = scsi_dir(d, cdb, len, true, (void *)buf, want, d->io_timeout_ms, &got, false);
+    if (rc == MSC_OK && got != want) {
+        msc_log("usb-msc: slot %u: short write at LBA %lu: %u of %u bytes\n", d->slot,
+                (unsigned long)lba, got, want);
+        rc = MSC_ERR_IO;
+    }
+    return rc;
+}
+
+int usb_msc_write(struct usb_msc_dev *d, uint64_t lba, uint32_t count, const void *buf)
+{
+    if (!d || !d->present) return MSC_ERR_NODEV;
+    if (count == 0) return MSC_OK;
+    if (lba >= d->blocks || count > d->blocks - lba) {
+        msc_log("usb-msc: slot %u: write of %u blocks at LBA %lu beyond the medium (%lu blocks)\n",
+                d->slot, count, (unsigned long)lba, (unsigned long)d->blocks);
+        return MSC_ERR_RANGE;
+    }
+    uint32_t per = XHCI_BULK_MAX / d->block_size;
+    const uint8_t *in = buf;
+    d->writes++;
+
+    while (count) {
+        uint32_t n = count < per ? count : per;
+        int rc = MSC_ERR_IO;
+        for (int attempt = 0; attempt < READ_RETRIES; attempt++) {
+            if (attempt) {
+                d->retries++;
+                msc_log("usb-msc: slot %u: retrying WRITE at LBA %lu (attempt %d/%d)\n", d->slot,
+                        (unsigned long)lba, attempt + 1, READ_RETRIES);
+                sleep_ms(20u * (uint32_t)attempt);
+            }
+            rc = write_chunk(d, lba, n, in);
+            if (rc == MSC_OK || rc == MSC_ERR_NODEV) break;
+            if (!usb_msc_alive(d)) { rc = MSC_ERR_NODEV; break; }
+            if (rc == MSC_ERR_CHECK) {
+                if (d->sense_key == SENSE_NOT_READY && d->asc == 0x3A) { rc = MSC_ERR_NOMEDIUM; break; }
+                if (d->sense_key == SENSE_ILLEGAL_REQ) break;
+                if (d->sense_key == SENSE_DATA_PROTECT) { rc = MSC_ERR_READONLY; break; }
+            }
+        }
+        if (rc != MSC_OK) {
+            d->errors++;
+            d->last_error = rc;
+            if (rc == MSC_ERR_NODEV) d->present = false;
+            msc_log("usb-msc: slot %u: WRITE of %u blocks at LBA %lu failed: %s\n", d->slot, n,
+                    (unsigned long)lba, usb_msc_strerror(rc));
+            return rc;
+        }
+        d->blocks_written += n;
+        lba += n;
+        count -= n;
+        in += (size_t)n * d->block_size;
+    }
+    return MSC_OK;
+}
+
+/* SYNCHRONIZE CACHE(10) over the whole medium. Sticks without a write cache
+ * may reject it with ILLEGAL REQUEST; that is not an error. */
+int usb_msc_sync(struct usb_msc_dev *d)
+{
+    if (!d || !d->present) return MSC_ERR_NODEV;
+    uint8_t cdb[10];
+    mzero(cdb, sizeof cdb);
+    cdb[0] = SCSI_SYNC_CACHE10;
+    int rc = scsi(d, cdb, 10, NULL, 0, d->io_timeout_ms, NULL, true);
+    if (rc == MSC_ERR_CHECK && d->sense_key == SENSE_ILLEGAL_REQ) return MSC_OK;
+    return rc;
 }
