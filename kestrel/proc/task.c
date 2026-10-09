@@ -100,6 +100,7 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     t->quantum = SCHED_QUANTUM;
     t->start_tick = pit_ticks();
     t->cwd = cur ? cur->cwd : NULL;
+    t->tty = cur ? cur->tty : 0;
     t->umask = 022;
     t->state = TASK_READY;
     kprintf("sched: created pid %d (%s)\n", t->pid, t->name);

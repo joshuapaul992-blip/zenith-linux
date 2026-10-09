@@ -2,13 +2,19 @@
  *
  * The 8042 controller translates the keyboard's native scancode set 2 to
  * set 1 (config bit 6), so this driver decodes set 1, including the 0xE0
- * prefix used by the arrow/navigation cluster. Key presses are queued in a
- * lock-free single-producer ring buffer filled by the IRQ1 handler. */
+ * prefix used by the arrow/navigation cluster.
+ *
+ * Until the TTYs exist (boot manager, early recovery) key presses go to one
+ * ring buffer filled by the IRQ1 handler. Afterwards every key goes through
+ * deliver(): Ctrl+Alt+Fn switches the keyboard focus between monitors right
+ * here in the ISR, and any other key is queued on the focused TTY only; the
+ * readers below then read the queue of their own task's TTY. */
 #include <kernel/keyboard.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
 #include <kernel/task.h>
 #include <kernel/klog.h>
+#include <kernel/tty.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
@@ -34,14 +40,20 @@ static const char map_shift[0x59] = {
     'B', 'N', 'M', '<', '>', '?', 0,   '*', 0,   ' ', 0,
 };
 
-static void enqueue(uint16_t key, char ascii)
+/* ISR context (IRQ1, or the timer hook for USB). */
+static void deliver(uint16_t key, char ascii, uint8_t m)
 {
+    if (tty_hotkey(key, m)) return;             /* Ctrl+Alt+Fn: focus switch, consumed */
+    struct key_event ev = { key, ascii, m };
+    if (tty_route_key(&ev)) return;             /* -> the focused TTY's queue */
     uint32_t next = (q_head + 1) % QSIZE;
     if (next == q_tail) return;                 /* full: drop */
-    queue[q_head] = (struct key_event){ key, ascii, mods };
+    queue[q_head] = ev;
     q_head = next;
     wakeup(&keyboard_waitq);
 }
+
+static void enqueue(uint16_t key, char ascii) { deliver(key, ascii, mods); }
 
 static uint16_t nav_key(uint8_t sc)
 {
@@ -135,10 +147,19 @@ void keyboard_init(void)
     kprintf("keyboard: PS/2 controller config=%02x, IRQ1 enabled\n", cfg);
 }
 
-bool keyboard_has_input(void) { return q_head != q_tail; }
+/* Once input goes to the TTYs, a reader gets the keys of its own task's TTY. */
+static struct kestrel_tty *reader_tty(void) { return tty_input_active() ? tty_current() : NULL; }
+
+bool keyboard_has_input(void)
+{
+    struct kestrel_tty *t = reader_tty();
+    return t ? tty_has_key(t) : q_head != q_tail;
+}
 
 bool keyboard_poll(struct key_event *ev)
 {
+    struct kestrel_tty *t = reader_tty();
+    if (t) return tty_read_key(t, ev, false);
     uint64_t f = irq_save();
     bool ok = q_head != q_tail;
     if (ok) { *ev = queue[q_tail]; q_tail = (q_tail + 1) % QSIZE; }
@@ -148,6 +169,8 @@ bool keyboard_poll(struct key_event *ev)
 
 void keyboard_wait(struct key_event *ev)
 {
+    struct kestrel_tty *t = reader_tty();
+    if (t) { tty_read_key(t, ev, true); return; }
     for (;;) {
         uint64_t f = irq_save();
         if (q_head != q_tail) {
@@ -163,16 +186,16 @@ void keyboard_wait(struct key_event *ev)
 void keyboard_inject(uint16_t key, char ascii, uint8_t m)
 {
     uint64_t f = irq_save();
-    uint32_t next = (q_head + 1) % QSIZE;
-    if (next != q_tail) {
-        queue[q_head] = (struct key_event){ key, ascii, m };
-        q_head = next;
-        wakeup(&keyboard_waitq);
-    }
+    deliver(key, ascii, m);
     irq_restore(f);
 }
 
-void keyboard_flush(void) { uint64_t f = irq_save(); q_tail = q_head; irq_restore(f); }
+void keyboard_flush(void)
+{
+    struct kestrel_tty *t = reader_tty();
+    if (t) { tty_flush_keys(t); return; }
+    uint64_t f = irq_save(); q_tail = q_head; irq_restore(f);
+}
 
 const char *keyboard_key_name(uint16_t key)
 {

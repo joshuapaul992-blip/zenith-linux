@@ -5,6 +5,7 @@
 #include <kernel/fb.h>
 #include <kernel/string.h>
 #include <kernel/cpu.h>
+#include <kernel/tty.h>
 
 static char   log_buf[KLOG_SIZE];
 static size_t log_len;              /* total bytes ever written (wraps buffer) */
@@ -57,7 +58,9 @@ void kprintf(const char *fmt, ...)
     log_append(buf, (size_t)n);
     serial_write(buf);
     irq_restore(f);
-    if (to_console && g_fb.ready) con_write(&g_con, buf, (size_t)n);
+    if (!to_console || !g_fb.ready) return;
+    if (tty_ready()) tty_write(tty_get(0), buf, (size_t)n);     /* system console: monitor 0 */
+    else con_write(&g_con, buf, (size_t)n);
 }
 
 void panic(const char *fmt, ...)

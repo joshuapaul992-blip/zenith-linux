@@ -3,7 +3,7 @@
 #include <kernel/bootvol.h>
 #include <kernel/block.h>
 #include <kernel/usbhost.h>
-#include <kernel/term.h>
+#include <kernel/tty.h>
 #include <kernel/console.h>
 #include <kernel/serial.h>
 #include <kernel/keyboard.h>
@@ -28,10 +28,11 @@
 
 static const char *g_reason, *g_detail;
 
-/* ---- output: the terminal (or the plain console) and COM1 ------------------ */
+/* ---- output: the calling task's TTY (or the plain console) and COM1 -------- */
 static void rputc(char c)
 {
-    if (term_active()) term_putc(c);
+    struct kestrel_tty *t = tty_current();
+    if (t) tty_putc(t, c);
     else con_putc(&g_con, c);
     serial_putc(c);
 }
@@ -109,16 +110,20 @@ static void log_tail(int lines)
 /* ---- the diagnostic screen ------------------------------------------------ */
 static void title_bar(const char *text)
 {
-    char line[TERM_COLS + 1];
+    struct kestrel_tty *t = tty_current();
+    int cols = t ? t->max_cols : g_con.cols;          /* the width of this monitor */
+    char line[256];
+    if (cols > (int)sizeof line) cols = (int)sizeof line;
     int n = snprintf(line, sizeof line, "  %s", text);
-    while (n < TERM_COLS - 1) line[n++] = ' ';
+    if (n > cols - 1) n = cols - 1;
+    while (n < cols - 1) line[n++] = ' ';
     line[n] = 0;
     rprintf(C_TITLE "%s" C_RESET "\n", line);
 }
 
 static void diagnostics(void)
 {
-    if (term_active()) term_clear();
+    if (tty_current()) tty_clear(tty_current());
     title_bar("KESTREL RECOVERY CONSOLE  -  boot pipeline diagnostic trace");
     rprintf("\n " C_ERR "%s" C_RESET "\n", g_reason ? g_reason : "Recovery requested");
     if (g_detail && *g_detail) rprintf("   %s\n", g_detail);
@@ -168,7 +173,7 @@ static int next_char(void)
 static void read_line(char *buf, size_t cap)
 {
     size_t n = 0;
-    term_cursor_enable(true);
+    tty_cursor_enable(tty_current(), true);
     for (;;) {
         int c = next_char();
         if (c < 0) {
@@ -180,7 +185,7 @@ static void read_line(char *buf, size_t cap)
         if (c == '\b') {
             if (!n) continue;
             n--;
-            if (term_active()) term_backspace();
+            if (tty_current()) tty_backspace(tty_current());
             serial_putc('\b'); serial_putc(' '); serial_putc('\b');
             continue;
         }
@@ -188,8 +193,7 @@ static void read_line(char *buf, size_t cap)
         buf[n++] = (char)c;
         rputc((char)c);
     }
-    term_cursor_enable(false);
-    buf[n] = 0;
+    buf[n] = 0;                         /* cursor stays on: the shell continues here */
 }
 
 /* ---- commands ------------------------------------------------------------------ */

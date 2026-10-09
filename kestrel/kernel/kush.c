@@ -1,18 +1,23 @@
 /* kernel/kush.c -- 'kush', the Kestrel command interpreter (KUSH: Kestrel User SHell)
  *
+ * One kush instance runs per monitor, each in its own thread bound to that
+ * monitor's TTY. All shell state (line editor, history, $?, parse buffers)
+ * lives in a struct kush_session, so instances share nothing.
+ *
  *   input     keyboard IRQ (PS/2 scan code or USB HID report) -> ASCII ->
- *             the keyboard driver's interrupt-safe ring buffer -> wakes this
- *             thread (keyboard_wait) -> line editor below
- *   editor    1024-byte line buffer; printable keys are appended and echoed
- *             at (term_col, term_row); Backspace steps back and blanks the
- *             cell; Enter ends the line. Also: Up/Down history, Tab
- *             completion of command names, Ctrl+C, Ctrl+U, Ctrl+L.
+ *             the focused TTY's key queue -> wakes this TTY's shell thread
+ *             (tty_read_key) -> line editor below
+ *   editor    the TTY's 1024-byte input_buffer; printable keys are appended
+ *             at buffer_index and echoed at the TTY's cursor; Backspace steps
+ *             back and blanks the cell; Enter ends the line. Also: Up/Down
+ *             history, Tab completion of command names, Ctrl+C, Ctrl+U, Ctrl+L.
  *   REPL      prompt "kestrel:/# ", read a line, split into words, run the
  *             matching built-in, repeat.
  */
 #include <kernel/kush.h>
 #include <kernel/recovery.h>
-#include <kernel/term.h>
+#include <kernel/tty.h>
+#include <kernel/klog.h>
 #include <kernel/keyboard.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
@@ -34,11 +39,20 @@
 #define KUSH_MAX_ARGS   16
 #define KUSH_HISTORY    16
 
-static char   line[KUSH_LINE_MAX];
-static size_t line_len;
+_Static_assert(KUSH_LINE_MAX == TTY_INPUT_MAX, "the line editor works in the TTY's input_buffer");
 
-static char   history[KUSH_HISTORY][KUSH_LINE_MAX];
-static int    hist_count, hist_next;            /* ring of past commands */
+struct kush_session {
+    struct kestrel_tty *tty;                    /* the monitor this shell owns   */
+    char   history[KUSH_HISTORY][KUSH_LINE_MAX];
+    int    hist_count, hist_next;               /* ring of past commands         */
+    int    last_status;                         /* $?                            */
+    char   cmdline[KUSH_LINE_MAX];              /* line handed to the parser     */
+    char   store[KUSH_LINE_MAX * 2];            /* parsed words                  */
+};
+
+/* The line being edited: this TTY's own input buffer. */
+#define LINE     (sh->tty->input_buffer)
+#define LINE_LEN (sh->tty->buffer_index)
 
 /* ======================================================================== */
 /*  output helpers                                                             */
@@ -51,23 +65,21 @@ static int    hist_count, hist_next;            /* ring of past commands */
 #define C_ERR    "\033[91m"
 #define C_PATH   "\033[94m"
 
-static int last_status;                          /* $? */
-
-static void kush_prompt(void)
+static void kush_prompt(struct kush_session *sh)
 {
     char cwd[256];
     if (u_getcwd(cwd, sizeof cwd) < 0) strlcpy(cwd, "?", sizeof cwd);
-    term_printf(C_OK "kestrel" C_RESET ":" C_PATH "%s" C_RESET "# ", cwd);
+    tty_printf(sh->tty, C_OK "kestrel" C_RESET ":" C_PATH "%s" C_RESET "# ", cwd);
 }
 
 /* Print a file (procfs/sysfs or device) through the kernel VFS API. */
-static void show_file(const char *path)
+static void show_file(struct kush_session *sh, const char *path)
 {
     struct file *f;
-    if (vfs_open(path, O_RDONLY, 0, &f) < 0) { term_printf(C_ERR "kush: cannot open %s\n" C_RESET, path); return; }
+    if (vfs_open(path, O_RDONLY, 0, &f) < 0) { tty_printf(sh->tty, C_ERR "kush: cannot open %s\n" C_RESET, path); return; }
     char *buf = kmalloc(1024);
     ssize_t n;
-    while (buf && (n = vfs_read(f, buf, 1024)) > 0) term_write(buf, (size_t)n);
+    while (buf && (n = vfs_read(f, buf, 1024)) > 0) tty_write(sh->tty, buf, (size_t)n);
     kfree(buf);
     vfs_close(f);
 }
@@ -82,16 +94,16 @@ static void fmt_size(char *out, size_t cap, uint64_t bytes)
 /* ======================================================================== */
 /*  built-in commands                                                          */
 /* ======================================================================== */
-typedef int (*kush_fn)(int argc, char **argv);
+typedef int (*kush_fn)(struct kush_session *sh, int argc, char **argv);
 struct kush_cmd { const char *name, *args, *help; kush_fn fn; };
 static const struct kush_cmd commands[];
 
-static int cmd_help(int argc, char **argv);
+static int cmd_help(struct kush_session *sh, int argc, char **argv);
 
-static int cmd_clear(int argc, char **argv)
+static int cmd_clear(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
-    term_clear();                               /* black screen, cursor to 0,0 */
+    tty_clear(sh->tty);                               /* black screen, cursor to 0,0 */
     return 0;
 }
 
@@ -115,16 +127,16 @@ static void cpu_features(char *out, size_t cap)
             n += (size_t)snprintf(out + n, n < cap ? cap - n : 0, "%s%s", n ? " " : "", f[i].name);
 }
 
-static int cmd_sysinfo(int argc, char **argv)
+static int cmd_sysinfo(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
     char a[160], b[32], c[32];
     uint64_t ms = uptime_ms();
 
-    term_printf(C_TITLE "%s %s (%s)" C_RESET "  built " __DATE__ " " __TIME__ " with gcc " __VERSION__ "\n",
+    tty_printf(sh->tty, C_TITLE "%s %s (%s)" C_RESET "  built " __DATE__ " " __TIME__ " with gcc " __VERSION__ "\n",
                 KESTREL_NAME, KESTREL_VERSION, KESTREL_MACHINE);
-    term_printf(C_LABEL "  Uptime     " C_RESET "%lum %lu.%lus\n", ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100);
-    term_printf(C_LABEL "  Boot       " C_RESET "%s firmware, %s, entry \"%s\"\n",
+    tty_printf(sh->tty, C_LABEL "  Uptime     " C_RESET "%lum %lu.%lus\n", ms / 60000, (ms / 1000) % 60, (ms % 1000) / 100);
+    tty_printf(sh->tty, C_LABEL "  Boot       " C_RESET "%s firmware, %s, entry \"%s\"\n",
                 g_boot.uefi ? "UEFI" : "BIOS", g_boot.loader, g_boot.boot_entry_name);
 
     /* CPU: vendor, brand string, family/model/stepping, features */
@@ -133,11 +145,11 @@ static int cmd_sysinfo(int argc, char **argv)
     uint32_t family = (eax >> 8) & 0xF, model = (eax >> 4) & 0xF, stepping = eax & 0xF;
     if (family == 0xF) family += (eax >> 20) & 0xFF;
     if (family >= 6) model |= ((eax >> 16) & 0xF) << 4;
-    term_printf(C_LABEL "  CPU        " C_RESET "%s\n", g_boot.cpu_brand[0] ? g_boot.cpu_brand : "(no brand string)");
-    term_printf(C_LABEL "             " C_RESET "vendor %s, family %u, model %u, stepping %u, %u logical CPU(s) per package\n",
+    tty_printf(sh->tty, C_LABEL "  CPU        " C_RESET "%s\n", g_boot.cpu_brand[0] ? g_boot.cpu_brand : "(no brand string)");
+    tty_printf(sh->tty, C_LABEL "             " C_RESET "vendor %s, family %u, model %u, stepping %u, %u logical CPU(s) per package\n",
                 g_boot.cpu_vendor, family, model, stepping, (ebx >> 16) & 0xFF ? (ebx >> 16) & 0xFF : 1);
     cpu_features(a, sizeof a);
-    term_printf(C_LABEL "             " C_RESET "%s\n", a);
+    tty_printf(sh->tty, C_LABEL "             " C_RESET "%s\n", a);
 
     /* Memory: from the PMM and the Multiboot2 memory map */
     int regions = 0;
@@ -152,19 +164,25 @@ static int cmd_sysinfo(int argc, char **argv)
     }
     fmt_size(b, sizeof b, pmm_total_bytes());
     fmt_size(c, sizeof c, pmm_free_bytes());
-    term_printf(C_LABEL "  Memory     " C_RESET "%s usable in %d region(s), %s free, top of RAM 0x%lx\n", b, regions, c, top);
-    term_printf(C_LABEL "             " C_RESET "kernel image %lu KiB, heap %zu KiB (%zu KiB used)\n",
+    tty_printf(sh->tty, C_LABEL "  Memory     " C_RESET "%s usable in %d region(s), %s free, top of RAM 0x%lx\n", b, regions, c, top);
+    tty_printf(sh->tty, C_LABEL "             " C_RESET "kernel image %lu KiB, heap %zu KiB (%zu KiB used)\n",
                 (uint64_t)(_kernel_end - _kernel_start) >> 10, heap_size() >> 10, heap_used() >> 10);
 
-    term_printf(C_LABEL "  Display    " C_RESET "%ux%ux%u via %s at 0x%lx, %dx%d text cells, %s\n",
-                g_fb.width, g_fb.height, g_fb.bpp, g_boot.uefi ? "GOP" : "VBE", g_fb.phys,
-                TERM_COLS, TERM_ROWS, g_fb.double_buffered ? "double buffered" : "direct");
+    for (int i = 0; i < tty_count; i++) {           /* one line per monitor, each with its own grid */
+        const struct display_head *h = display_get(i);
+        const struct kestrel_tty *t = tty_get(i);
+        tty_printf(sh->tty, C_LABEL "%s" C_RESET "monitor %d: %dx%dx32 at 0x%lx, tty%d %d x %d cells, %s%s%s\n",
+                   i ? "             " : "  Display    ", i, t->native_width, t->native_height, h->phys,
+                   i + 1, t->max_cols, t->max_rows, h->name,
+                   i == active_keyboard_tty ? ", " C_OK "keyboard" C_RESET : "",
+                   t == sh->tty ? " (this shell)" : "");
+    }
     storage_summary(a, sizeof a);
-    term_printf(C_LABEL "  Storage    " C_RESET "%s\n", a);
+    tty_printf(sh->tty, C_LABEL "  Storage    " C_RESET "%s\n", a);
     usb_summary(a, sizeof a);
-    term_printf(C_LABEL "  USB        " C_RESET "%s\n", a);
-    term_printf(C_LABEL "  PCI        " C_RESET "%zu functions\n", pci_device_count());
-    term_printf(C_LABEL "  Scheduler  " C_RESET "%s, %lu context switches\n",
+    tty_printf(sh->tty, C_LABEL "  USB        " C_RESET "%s\n", a);
+    tty_printf(sh->tty, C_LABEL "  PCI        " C_RESET "%zu functions\n", pci_device_count());
+    tty_printf(sh->tty, C_LABEL "  Scheduler  " C_RESET "%s, %lu context switches\n",
                 sched_preemption() ? "preemptive round-robin" : "cooperative (safe mode)", sched_context_switches());
     return 0;
 }
@@ -175,65 +193,65 @@ static const struct { const char *cmd, *path; } views[] = {
     { "bootvol", "/proc/bootvol" }, { "lsblk", "/proc/partitions" },
 };
 
-static int cmd_view(int argc, char **argv)
+static int cmd_view(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc;
     for (size_t i = 0; i < sizeof views / sizeof *views; i++)
-        if (strcmp(argv[0], views[i].cmd) == 0) { show_file(views[i].path); return 0; }
+        if (strcmp(argv[0], views[i].cmd) == 0) { show_file(sh, views[i].path); return 0; }
     return 1;
 }
 
-static int cmd_log(int argc, char **argv)
+static int cmd_log(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
-    term_puts(C_DIM);
-    show_file("/proc/kmsg");
-    term_puts(C_RESET);
+    tty_puts(sh->tty, C_DIM);
+    show_file(sh, "/proc/kmsg");
+    tty_puts(sh->tty, C_RESET);
     return 0;
 }
 
-static int cmd_disk(int argc, char **argv)
+static int cmd_disk(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
     char s[160];
     storage_summary(s, sizeof s);
-    term_printf("%s\n", s);
+    tty_printf(sh->tty, "%s\n", s);
     struct file *f;
     if (vfs_open("/dev/sda", O_RDONLY, 0, &f) < 0) return 0;
     uint8_t *mbr = kmalloc(512);
     if (mbr && vfs_read(f, mbr, 512) == 512)
-        term_printf("/dev/sda LBA 0: boot signature %02x %02x (%s)\n", mbr[510], mbr[511],
+        tty_printf(sh->tty, "/dev/sda LBA 0: boot signature %02x %02x (%s)\n", mbr[510], mbr[511],
                     mbr[510] == 0x55 && mbr[511] == 0xAA ? C_OK "valid MBR" C_RESET : C_ERR "none" C_RESET);
     kfree(mbr);
     vfs_close(f);
     return 0;
 }
 
-static int cmd_recovery(int argc, char **argv)
+static int cmd_recovery(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
     enum recovery_action a = recovery_enter("Recovery console requested from the shell", NULL);
-    term_printf("left the recovery console (%s)\n", a == RECOVERY_RETRY ? "retry" : "continue");
+    tty_printf(sh->tty, "left the recovery console (%s)\n", a == RECOVERY_RETRY ? "retry" : "continue");
     return 0;
 }
 
-static int cmd_font(int argc, char **argv)
+static int cmd_font(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
-    term_puts(C_DIM "     0 1 2 3 4 5 6 7 8 9 A B C D E F" C_RESET "\n");
+    tty_puts(sh->tty, C_DIM "     0 1 2 3 4 5 6 7 8 9 A B C D E F" C_RESET "\n");
     for (int r = 0; r < 16; r++) {
-        term_printf(C_DIM " %X0  " C_RESET, r);
-        for (int c = 0; c < 16; c++) { term_put_glyph((unsigned char)(r * 16 + c)); term_putc(' '); }
-        term_putc('\n');
+        tty_printf(sh->tty, C_DIM " %X0  " C_RESET, r);
+        for (int c = 0; c < 16; c++) { tty_put_glyph(sh->tty, (unsigned char)(r * 16 + c)); tty_putc(sh->tty, ' '); }
+        tty_putc(sh->tty, '\n');
     }
     return 0;
 }
 
-static int cmd_reboot(int argc, char **argv)
+static int cmd_reboot(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc;
     bool off = argv[0][0] == 'p';
-    term_puts(off ? "Powering off...\n" : "Restarting...\n");
+    tty_puts(sh->tty, off ? "Powering off...\n" : "Restarting...\n");
     u_reboot(off ? LINUX_REBOOT_CMD_POWER_OFF : LINUX_REBOOT_CMD_RESTART);
     return 1;
 }
@@ -257,22 +275,22 @@ static const struct kush_cmd commands[] = {
     { NULL, NULL, NULL, NULL },
 };
 
-static int cmd_help(int argc, char **argv)
+static int cmd_help(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc; (void)argv;
-    term_puts(C_TITLE "kush built-in tools" C_RESET "\n");
+    tty_puts(sh->tty, C_TITLE "kush built-in tools" C_RESET "\n");
     for (const struct kush_cmd *c = commands; c->name; c++) {
         char name[32];
         snprintf(name, sizeof name, "%s %s", c->name, c->args);
-        term_printf("  " C_OK "%-28s" C_RESET " %s\n", name, c->help);
+        tty_printf(sh->tty, "  " C_OK "%-28s" C_RESET " %s\n", name, c->help);
     }
-    term_puts(C_TITLE "core utilities" C_RESET C_DIM " (system calls; output can be redirected with > and >>)" C_RESET "\n");
+    tty_puts(sh->tty, C_TITLE "core utilities" C_RESET C_DIM " (system calls; output can be redirected with > and >>)" C_RESET "\n");
     for (const struct cu_cmd *c = cu_commands; c->name; c++) {
         char name[32];
         snprintf(name, sizeof name, "%s %s", c->name, c->usage);
-        term_printf("  " C_OK "%-28s" C_RESET " %s\n", name, c->help);
+        tty_printf(sh->tty, "  " C_OK "%-28s" C_RESET " %s\n", name, c->help);
     }
-    term_puts(C_DIM "  syntax: 'quotes' \"quotes\" \\escapes  > file  >> file  < file  $?   keys: Up/Down history, Tab, Ctrl+C/U/L" C_RESET "\n");
+    tty_puts(sh->tty, C_DIM "  syntax: 'quotes' \"quotes\" \\escapes  > file  >> file  < file  $?   keys: Up/Down history, Tab, Ctrl+C/U/L" C_RESET "\n");
     return 0;
 }
 
@@ -289,7 +307,7 @@ struct parsed {
     bool  append;
 };
 
-static int kush_parse(const char *line, char *store, size_t cap, struct parsed *p)
+static int kush_parse(const char *line, char *store, size_t cap, struct parsed *p, int last_status)
 {
     memset(p, 0, sizeof *p);
     size_t w = 0;
@@ -333,39 +351,38 @@ static int kush_parse(const char *line, char *store, size_t cap, struct parsed *
     return 0;
 }
 
-static int kush_execute(char *cmdline)
+static int kush_execute(struct kush_session *sh, char *cmdline)
 {
-    static char store[KUSH_LINE_MAX * 2];
     struct parsed p;
-    int rc = kush_parse(cmdline, store, sizeof store, &p);
+    int rc = kush_parse(cmdline, sh->store, sizeof sh->store, &p, sh->last_status);
     if (rc < 0) {
         static const char *const why[] = { "", "missing file name after redirection", "line too long",
                                            "unterminated quote", "too many arguments" };
-        term_printf(C_ERR "kush: syntax error: %s" C_RESET "\n", why[-rc]);
+        tty_printf(sh->tty, C_ERR "kush: syntax error: %s" C_RESET "\n", why[-rc]);
         return 2;
     }
     if (p.argc == 0) return 0;
 
     for (const struct kush_cmd *c = commands; c->name; c++)
         if (strcmp(c->name, p.argv[0]) == 0) {
-            if (p.out_file || p.in_file) term_puts(C_DIM "kush: note: shell built-ins write to the screen; redirection ignored" C_RESET "\n");
-            return c->fn(p.argc, p.argv);
+            if (p.out_file || p.in_file) tty_puts(sh->tty, C_DIM "kush: note: shell built-ins write to the screen; redirection ignored" C_RESET "\n");
+            return c->fn(sh, p.argc, p.argv);
         }
 
     const struct cu_cmd *u = cu_find(p.argv[0]);
     if (!u) {
-        term_printf(C_ERR "kush: %s: command not found" C_RESET " (try 'help')\n", p.argv[0]);
+        tty_printf(sh->tty, C_ERR "kush: %s: command not found" C_RESET " (try 'help')\n", p.argv[0]);
         return 127;
     }
     struct cu_io io = { 0, 1, 2 };
     if (p.in_file) {
         io.in = u_open(p.in_file, O_RDONLY, 0);
-        if (io.in < 0) { term_printf(C_ERR "kush: %s: %s" C_RESET "\n", p.in_file, cu_strerror(io.in)); return 1; }
+        if (io.in < 0) { tty_printf(sh->tty, C_ERR "kush: %s: %s" C_RESET "\n", p.in_file, cu_strerror(io.in)); return 1; }
     }
     if (p.out_file) {
         io.out = u_open(p.out_file, O_WRONLY | O_CREAT | (p.append ? O_APPEND : O_TRUNC), 0644);
         if (io.out < 0) {
-            term_printf(C_ERR "kush: %s: %s" C_RESET "\n", p.out_file, cu_strerror(io.out));
+            tty_printf(sh->tty, C_ERR "kush: %s: %s" C_RESET "\n", p.out_file, cu_strerror(io.out));
             if (io.in != 0) u_close(io.in);
             return 1;
         }
@@ -379,80 +396,83 @@ static int kush_execute(char *cmdline)
 /* ======================================================================== */
 /*  line editor                                                                */
 /* ======================================================================== */
-static void erase_line(void)
+static void erase_line(struct kush_session *sh)
 {
-    while (line_len) { line_len--; term_backspace(); }
+    while (LINE_LEN) { LINE_LEN--; tty_backspace(sh->tty); }
 }
 
-static void replace_line(const char *text)
+static void replace_line(struct kush_session *sh, const char *text)
 {
-    erase_line();
+    erase_line(sh);
     size_t n = strnlen(text, KUSH_LINE_MAX - 1);
-    memcpy(line, text, n);
-    line_len = n;
-    term_write(line, line_len);
+    memcpy(LINE, text, n);
+    LINE_LEN = (int)n;
+    tty_write(sh->tty, LINE, (size_t)LINE_LEN);
 }
 
-static void complete(void)
+static void complete(struct kush_session *sh)
 {
-    if (memchr(line, ' ', line_len)) return;    /* only the command word */
+    size_t len = (size_t)LINE_LEN;
+    if (memchr(LINE, ' ', len)) return;         /* only the command word */
     const char *match = NULL;
     int count = 0;
     for (const struct kush_cmd *c = commands; c->name; c++)
-        if (strncmp(c->name, line, line_len) == 0) { match = c->name; count++; }
+        if (strncmp(c->name, LINE, len) == 0) { match = c->name; count++; }
     for (const struct cu_cmd *c = cu_commands; c->name; c++)
-        if (strncmp(c->name, line, line_len) == 0) { match = c->name; count++; }
+        if (strncmp(c->name, LINE, len) == 0) { match = c->name; count++; }
     if (count == 1) {
-        for (const char *p = match + line_len; *p && line_len < KUSH_LINE_MAX - 1; p++) {
-            line[line_len++] = *p;
-            term_putc(*p);
+        for (const char *p = match + len; *p && LINE_LEN < KUSH_LINE_MAX - 1; p++) {
+            LINE[LINE_LEN++] = *p;
+            tty_putc(sh->tty, *p);
         }
-        if (line_len < KUSH_LINE_MAX - 1) { line[line_len++] = ' '; term_putc(' '); }
+        if (LINE_LEN < KUSH_LINE_MAX - 1) { LINE[LINE_LEN++] = ' '; tty_putc(sh->tty, ' '); }
     } else if (count > 1) {                      /* show the candidates, then the line again */
-        term_putc('\n');
+        tty_putc(sh->tty, '\n');
         for (const struct kush_cmd *c = commands; c->name; c++)
-            if (strncmp(c->name, line, line_len) == 0) term_printf("%s  ", c->name);
+            if (strncmp(c->name, LINE, len) == 0) tty_printf(sh->tty, "%s  ", c->name);
         for (const struct cu_cmd *c = cu_commands; c->name; c++)
-            if (strncmp(c->name, line, line_len) == 0) term_printf("%s  ", c->name);
-        term_putc('\n');
-        kush_prompt();
-        term_write(line, line_len);
+            if (strncmp(c->name, LINE, len) == 0) tty_printf(sh->tty, "%s  ", c->name);
+        tty_putc(sh->tty, '\n');
+        kush_prompt(sh);
+        tty_write(sh->tty, LINE, len);
     }
 }
 
-/* Returns the line length, or -1 if the line was cancelled. */
-static int kush_readline(void)
+static const char *history_at(struct kush_session *sh, int pos)
 {
-    line_len = 0;
-    int hist_pos = hist_count;                  /* one past the newest entry */
+    return sh->history[(sh->hist_next - (sh->hist_count - pos) + KUSH_HISTORY) % KUSH_HISTORY];
+}
+
+/* Returns the line length, or -1 if the line was cancelled. */
+static int kush_readline(struct kush_session *sh)
+{
+    LINE_LEN = 0;
+    int hist_pos = sh->hist_count;              /* one past the newest entry */
 
     for (;;) {
         struct key_event ev;
-        keyboard_wait(&ev);                     /* sleeps until the keyboard IRQ wakes us */
+        tty_read_key(sh->tty, &ev, true);       /* sleeps until a key arrives on this TTY */
 
         switch (ev.key) {
         case KEY_ENTER:
-            line[line_len] = 0;
-            term_putc('\n');                    /* term_row++, term_col = 0 */
-            return (int)line_len;
+            LINE[LINE_LEN] = 0;
+            tty_putc(sh->tty, '\n');            /* cursor_row++, cursor_col = 0 */
+            return LINE_LEN;
         case KEY_BACKSPACE:
-            if (line_len) { line_len--; term_backspace(); }
+            if (LINE_LEN) { LINE_LEN--; tty_backspace(sh->tty); }
             continue;
         case KEY_UP:
-            if (hist_pos > 0 && hist_count) {
-                hist_pos--;
-                replace_line(history[(hist_next - (hist_count - hist_pos) + KUSH_HISTORY) % KUSH_HISTORY]);
-            }
+            if (hist_pos > 0 && sh->hist_count) replace_line(sh, history_at(sh, --hist_pos));
             continue;
         case KEY_DOWN:
-            if (hist_pos < hist_count) {
+            if (hist_pos < sh->hist_count) {
                 hist_pos++;
-                if (hist_pos == hist_count) erase_line();
-                else replace_line(history[(hist_next - (hist_count - hist_pos) + KUSH_HISTORY) % KUSH_HISTORY]);
+                if (hist_pos == sh->hist_count) erase_line(sh);
+                else replace_line(sh, history_at(sh, hist_pos));
             }
             continue;
         case KEY_TAB:
-            complete();
+            complete(sh);
             continue;
         case KEY_CHAR:
             break;
@@ -461,24 +481,27 @@ static int kush_readline(void)
         }
 
         char c = ev.ascii;
-        if (c == 3) { term_puts("^C\n"); return -1; }                       /* Ctrl+C */
-        if (c == 21) { erase_line(); continue; }                             /* Ctrl+U */
-        if (c == 12) { term_clear(); kush_prompt(); term_write(line, line_len); continue; }  /* Ctrl+L */
+        if (c == 3) { tty_puts(sh->tty, "^C\n"); return -1; }                /* Ctrl+C */
+        if (c == 21) { erase_line(sh); continue; }                          /* Ctrl+U */
+        if (c == 12) {                                                      /* Ctrl+L */
+            tty_clear(sh->tty); kush_prompt(sh); tty_write(sh->tty, LINE, (size_t)LINE_LEN);
+            continue;
+        }
         if ((unsigned char)c < 0x20 || c == 0x7F) continue;                 /* non-printable */
-        if (line_len >= KUSH_LINE_MAX - 1) continue;                          /* buffer full */
-        line[line_len++] = c;
-        term_putc(c);                            /* drawn at term_col, then term_col++ */
+        if (LINE_LEN >= KUSH_LINE_MAX - 1) continue;                        /* buffer full */
+        LINE[LINE_LEN++] = c;
+        tty_putc(sh->tty, c);                   /* drawn at the cursor, then cursor_col++ */
     }
 }
 
-static void remember(const char *cmdline)
+static void remember(struct kush_session *sh, const char *cmdline)
 {
     if (!*cmdline) return;
-    int newest = (hist_next - 1 + KUSH_HISTORY) % KUSH_HISTORY;
-    if (hist_count && strcmp(history[newest], cmdline) == 0) return;   /* no duplicates in a row */
-    strlcpy(history[hist_next], cmdline, KUSH_LINE_MAX);
-    hist_next = (hist_next + 1) % KUSH_HISTORY;
-    if (hist_count < KUSH_HISTORY) hist_count++;
+    int newest = (sh->hist_next - 1 + KUSH_HISTORY) % KUSH_HISTORY;
+    if (sh->hist_count && strcmp(sh->history[newest], cmdline) == 0) return;   /* no duplicates in a row */
+    strlcpy(sh->history[sh->hist_next], cmdline, KUSH_LINE_MAX);
+    sh->hist_next = (sh->hist_next + 1) % KUSH_HISTORY;
+    if (sh->hist_count < KUSH_HISTORY) sh->hist_count++;
 }
 
 /* ======================================================================== */
@@ -486,17 +509,24 @@ static void remember(const char *cmdline)
 /* ======================================================================== */
 void kush_main(void)
 {
-    static char cmdline[KUSH_LINE_MAX];
+    struct kush_session *sh = kzalloc(sizeof *sh);      /* ~20 KiB: not on the 16 KiB stack */
+    struct kestrel_tty *tty = tty_current();
+    if (!sh || !tty) panic("kush: no session memory or no terminal");
+    sh->tty = tty;
     u_chdir("/root");                           /* start in root's home, like a login shell */
-    term_puts(C_TITLE "kush" C_RESET " (Kestrel shell)" " -- type " C_OK "help" C_RESET " for a list of tools.\n\n");
-    keyboard_flush();
+    tty_printf(tty, C_TITLE "kush" C_RESET " (Kestrel shell) on " C_OK "tty%d" C_RESET
+               ", monitor %d, %dx%d, %d x %d cells -- type " C_OK "help" C_RESET " for a list of tools.\n"
+               C_DIM "Ctrl+Alt+F1..F%d moves the keyboard to another monitor." C_RESET "\n\n",
+               tty->index + 1, tty->index, tty->native_width, tty->native_height,
+               tty->max_cols, tty->max_rows, tty_count);
+    tty_flush_keys(tty);
     for (;;) {
-        kush_prompt();
-        int n = kush_readline();
+        kush_prompt(sh);
+        int n = kush_readline(sh);
         if (n < 0) continue;
-        memcpy(cmdline, line, (size_t)n + 1);    /* hand the line to the parser, */
-        line_len = 0;                            /* and reset the input index    */
-        remember(cmdline);
-        last_status = kush_execute(cmdline);
+        memcpy(sh->cmdline, LINE, (size_t)n + 1);       /* hand the line to the parser, */
+        LINE_LEN = 0;                                   /* and reset the input index    */
+        remember(sh, sh->cmdline);
+        sh->last_status = kush_execute(sh, sh->cmdline);
     }
 }

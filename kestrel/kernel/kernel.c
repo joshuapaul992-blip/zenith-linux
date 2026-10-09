@@ -8,8 +8,9 @@
  *                               buffer (+ back buffer), PIC, PIT, keyboard,
  *                               scheduler (boot thread = pid 0)
  *   Phase 2  boot manager       menu, countdown, tools, F8 options
- *   Phase 3  kernel services    console, syscalls, VFS (/ /dev /proc /sys),
- *                               init (pid 1) and kernel worker threads
+ *   Phase 3  kernel services    monitors + one TTY per monitor, syscalls, VFS
+ *                               (/ /dev /proc /sys), init (pid 1) with a shell
+ *                               per monitor, kernel worker threads
  *   Phase 4  idle               pid 0 halts until there is work
  */
 #include <kernel/cpu.h>
@@ -31,7 +32,8 @@
 #include "pci.h"
 #include <kernel/storage.h>
 #include <kernel/usbhost.h>
-#include <kernel/term.h>
+#include <kernel/tty.h>
+#include <kernel/display.h>
 #include <kernel/kush.h>
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
@@ -131,8 +133,8 @@ static void pci_init(void)
 /*  Phase 3: services, init (summary + shell) and kernel threads                */
 /* ========================================================================== */
 
-/* The interactive terminal (term.c) owns the whole 128 x 48 screen once
- * Phase 3 starts; the generic console (g_con) forwards its output to it. */
+/* Once Phase 3 starts every monitor has its own terminal (tty.c); the generic
+ * console (g_con) forwards its output to the calling task's TTY. */
 #define CON_ROWS ((int)g_fb.height / 16)
 
 /* --- init (pid 1): talks to the kernel only through system calls ---------- */
@@ -204,6 +206,17 @@ static void section(const char *title)
     u_puts(buf);
 }
 
+/* A shell on another monitor: bind the thread to that TTY first, so its
+ * stdin/stdout (/dev/tty) and everything it starts use that monitor. */
+static int shell_main(void *arg)
+{
+    tty_bind_current((int)(intptr_t)arg);
+    u_open("/dev/tty", O_RDONLY, 0);
+    u_open("/dev/tty", O_WRONLY, 0);
+    u_open("/dev/tty", O_WRONLY, 0);
+    kush_main();
+}
+
 static int init_main(void *arg)
 {
     (void)arg;
@@ -246,7 +259,16 @@ static int init_main(void *arg)
 
     if (!(g_boot.boot_flags & BOOTOPT_DEBUG)) klog_set_console(false);
 
-    kush_main();                                  /* interactive shell; never returns */
+    /* One shell per monitor: TTY 0 keeps this thread, every other TTY gets a
+     * thread of its own, so a command running on one monitor never blocks
+     * typing on another. */
+    for (int i = 1; i < tty_count; i++) {
+        char name[TASK_NAME_LEN];
+        snprintf(name, sizeof name, "kush/tty%d", i + 1);
+        if (!task_create(name, shell_main, (void *)(intptr_t)i))
+            kprintf("init: cannot start a shell on tty%d\n", i + 1);
+    }
+    kush_main();                                  /* interactive shell on tty1; never returns */
 }
 
 /* --- kworker/0: CPU-bound work, proves time-slice preemption ------------- */
@@ -326,7 +348,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     fb_clear(COL_BLACK);
     fb_flush();
     con_init(&g_con, &font_8x16, 0, 0, (int)g_fb.width / 8, CON_ROWS, COL_LIGHTGRAY, COL_BLACK);
-    if (term_init()) con_set_redirect(term_write);  /* 128x48 terminal with kestrel_font */
+    display_probe();                                /* boot frame buffer + secondary adapters */
+    if (tty_init_all()) con_set_redirect(tty_write_current);   /* a terminal per monitor */
     else con_clear(&g_con);
     con_printf(&g_con, "\033[97mStarting %s\033[0m  (%s)\n\n", ch.name,
                ch.flags ? "advanced options" : "normal boot");

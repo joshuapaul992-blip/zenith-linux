@@ -65,22 +65,67 @@ Layout is an 85×32 character grid drawn with a 12×24 font:
 - the **Tools:** block
 - a silver legend bar at the bottom: `ENTER=Choose  TAB=Menu  ESC=Cancel`
 
-## After boot: terminal and shell
+## After boot: one terminal and one shell per monitor
 
-The screen becomes a 128 × 48 text terminal (`kernel/term.c`) drawn with `kestrel_font[256][16]`. `init` (pid 1) prints a short system summary, read through system calls, and then starts `kush`, the Kestrel shell (`kernel/kush.c`).
+Every monitor gets its own text terminal (`kernel/tty.c`), drawn with `kestrel_font[256][16]`. `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts one `kush` shell (`kernel/kush.c`) per monitor, each in its own thread.
 
-The terminal is built in layers:
-- **Glyph rendering:** `draw_char(c, x, y, fg, bg)` draws the 16 rows of a glyph, setting fg pixels for 1 bits and bg pixels for 0 bits (bit 7 is the leftmost pixel). It clips to the screen and publishes the 8 × 16 cell to video memory.
-- **Layout:**
-  - `term_col` and `term_row` track the cursor. Lines wrap at column 128.
-  - `scroll_screen()` copies pixel rows 16–767 up one text row with per-scan-line `memcpy`, so source and destination never overlap. It then blanks the bottom 16 rows to `0x00000000` and sets `term_row` to 47.
-  - ANSI colour codes are supported.
-- **Cursor:** a solid inverse-video block toggled every 500 ms from the 1 kHz timer interrupt (`pit_add_tick_hook`). A shadow copy of every cell lets the cursor restore exactly what it covered. Every keystroke redraws the cursor at the new position and restarts the blink, so it is never hidden while you type.
-- **Input:**
-  - The PS/2 or USB HID interrupt converts the key to ASCII and puts it in the keyboard driver's interrupt-safe ring buffer, which wakes the shell.
-  - The shell appends printable characters to its 1024-byte line buffer and draws them at `term_col`/`term_row`.
-  - Backspace steps left, back across a line wrap if needed, and blanks the cell with a space in the background colour.
-  - Enter prints a newline and hands the line to the parser.
+**Monitors** (`kernel/display.c`):
+- Display drivers register one head per monitor. Each head has its frame buffer, native resolution, pitch and pixel format.
+- Monitor 0 is the boot frame buffer (the VBE or GOP mode set by GRUB).
+- Further monitors come from drivers that can set modes. Today that is `drivers/video/bochs_dispi.c`, for QEMU's `bochs-display` and `secondary-vga`. It reads the monitor's EDID (`drivers/video/edid.c`) and sets the preferred timing, so each monitor runs at its own native resolution.
+- A native GPU driver would add its monitors through the same `display_register()` call. There is no NVIDIA driver yet.
+
+**Terminals** (`struct kestrel_tty`, `system_ttys[MAX_MONITORS]`). Each TTY owns:
+- its frame buffer pointer, plus an optional RAM shadow
+- its native width and height, and pitch
+- `max_cols × max_rows` (width / 8 × height / 16): 128 × 48 at 1024×768, 160 × 64 at 1280×1024, 240 × 67 at 1920×1080
+- the cursor position, the blink state and the colours
+- the ANSI escape parser
+- a key queue, and a 1024-byte `input_buffer`
+
+No global screen size is used anywhere in the rendering path.
+
+**Rendering:**
+- `draw_char(tty, c, x, y, fg, bg)` draws the 16 rows of a glyph into that TTY's surface using that TTY's own pitch, clipped to its own size. Set bits get the fg colour and clear bits the bg colour; bit 7 is the leftmost pixel.
+- `scroll_screen(tty)` moves that monitor's text up one row with a per-scan-line `memcpy` (source and destination never overlap) and blanks the bottom row. Only that monitor's memory is read or written.
+- A monitor with a RAM shadow is drawn and scrolled in the shadow, and the changed rectangle is then copied to VRAM, because reading VRAM over PCIe is slow.
+
+**Cursor:**
+- The 1 kHz timer interrupt walks every TTY and toggles each cursor every 500 ms, at that TTY's own cell and on its own phase.
+- The monitor with keyboard focus shows a solid inverse block, and the others a two-pixel bar.
+
+**Locking:**
+- Every TTY has its own lock, and drawing runs with interrupts enabled. A flood of output on one monitor therefore never stalls the timer.
+- The blink skips only the TTY that is busy at that moment, and the scheduler keeps switching between the shells.
+- With interrupts off (the kernel log from an interrupt handler), a busy TTY is skipped instead of waited for.
+
+**Keyboard:**
+- The PS/2 and USB HID interrupt paths both go through one routine.
+- **Ctrl+Alt+F1 … F12** moves the keyboard focus to TTY 1 … 12 right there in the interrupt handler. Every other key is queued on the focused TTY only, and wakes the shell of that TTY.
+- Each task is bound to a TTY (`tcb.tty`, inherited by the threads it creates). `keyboard_wait()` and `/dev/tty` read the queue of the caller's TTY.
+
+**Device nodes:**
+- `/dev/tty` is the caller's own terminal.
+- `/dev/console` is TTY 1.
+- `/dev/tty1`, `/dev/tty2`, … are the terminals of monitor 0, 1, …, so `echo hi > /dev/tty2` prints on the second monitor.
+- `TIOCGWINSZ` reports the size of the caller's monitor.
+- The kernel log goes to TTY 1.
+
+**Line editing:** the shell edits its line in its TTY's `input_buffer`, and keeps its history, `$?` and parse buffers in a per-session struct. The shells share no state.
+- Printable characters are appended and echoed at the TTY's cursor.
+- Backspace steps left, back across a line wrap if needed, and blanks the cell.
+- Enter hands the line to the parser.
+
+Kestrel runs on one CPU. "Independent" means preemptive threads: while a command runs on one monitor (even `cat /dev/random`), the other shells still respond and every cursor keeps blinking.
+
+Try it with three monitors in QEMU:
+
+```sh
+make iso
+qemu-system-x86_64 -m 256M -vga none -device VGA \
+    -device bochs-display,xres=1280,yres=1024 \
+    -device secondary-vga,xres=1920,yres=1080 -cdrom build/kestrel.iso
+```
 
 `kush` is the shell. Its prompt shows the working directory (`kestrel:/root# `), and it starts in `/root`. Its command line understands:
 - `'single'` and `"double"` quotes, and backslash escapes
@@ -380,13 +425,15 @@ arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order
 drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char, draw_string,
                              clipping, scrolling, back buffer + dirty-rect flush (24/32 bpp)
               console.c      text-mode emulation over the LFB (ANSI colours, scrolling)
-              keyboard.c     PS/2 IRQ1 driver, scancode set 1 incl. E0 arrows/F-keys, ring buffer
+              keyboard.c     PS/2 IRQ1 driver, scancode set 1 incl. E0 arrows/F-keys; Ctrl+Alt+Fn focus
+                             hotkeys and routing to the focused TTY (PS/2 and USB HID)
               serial.c       COM1 log
               font_*.c       Spleen 8x16 and 12x24 (boot manager), generated by tools/bdf2c.py
               kestrel_font.c kestrel_font[256][16] for the terminal, from tools/sheet2font.py
               pci/           standalone PCI enumerator (pci.h, pci.c, test/pci_sim_test.c)
               ahci/          standalone AHCI SATA driver (ahci.h, ahci.c)
               nvme/          standalone NVMe driver: admin + I/O queue pair, PRP lists (nvme.h, nvme.c)
+              video/         EDID parser (edid.c), Bochs/QEMU DISPI mode setter (bochs_dispi.c)
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
@@ -406,8 +453,12 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
 kernel/       kernel.c       initialisation sequence, init and worker threads
               syscall.c      syscall table (Linux x86_64 numbers), handlers, ENOSYS stubs
               klog.c         dmesg ring buffer, panic screen
-              term.c         128x48 terminal: draw_char, cell model, scrolling, blinking cursor
-              kush.c         kush shell: line editor, quoting, redirection, $?, built-ins
+              display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
+              tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
+                             model, per-TTY lock, cursor blink on every monitor, focus hotkeys,
+                             per-TTY key queues, /dev/tty line discipline
+              kush.c         kush shell (one instance per monitor): line editor, quoting,
+                             redirection, $?, built-ins
               coreutils/     pwd cd ls mkdir rmdir touch rm cp mv cat head tail grep echo
                              chmod chown date uname neofetch (+ cu_lib.c helpers, table.c)
               storage.c      PCI -> AHCI and NVMe glue, boot-time MBR verify, /dev/sdX, nvmeN,
@@ -459,7 +510,8 @@ The structure is laid out for these, in order:
 4. **A real libc port** (musl, newlib). The ABI types are already Linux-compatible.
 5. **A writable file system** (FAT or ext2) on the block layer, next to the read-only tarfs.
 6. **ACPI parsing** for power-off on real hardware. The emulator ports are used today.
-7. **Hardware support:** HPET/APIC interrupts (the HPET is only used as a clocksource today), SMP, USB hubs, an EHCI driver for machines without xHCI.
+7. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
+8. **Hardware support:** HPET/APIC interrupts (the HPET is only used as a clocksource today), SMP, USB hubs, an EHCI driver for machines without xHCI.
 
 ## Licenses
 

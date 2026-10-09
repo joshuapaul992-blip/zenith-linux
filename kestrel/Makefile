@@ -49,7 +49,7 @@ CFLAGS := -std=gnu11 -O2 -g -pipe \
           -m64 -march=x86-64 -mcmodel=small -mno-red-zone \
           -mno-mmx -mno-sse -mno-sse2 -mno-80387 -mgeneral-regs-only \
           -Wall -Wextra -Wno-unused-parameter \
-          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -MMD -MP
+          -Iinclude -Idrivers/pci -Idrivers/ahci -Idrivers/nvme -Idrivers/usb -Idrivers/video -MMD -MP
 # -mcmodel=small: the kernel is linked/identity-mapped at 2 MiB (below 2 GiB).
 # A future higher-half move (0xFFFFFFFF80000000) would switch to -mcmodel=kernel.
 
@@ -68,7 +68,8 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c lib/crc32.c \
-           drivers/kestrel_font.c kernel/term.c kernel/kush.c \
+           drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
+           kernel/display.c kernel/tty.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \
            kernel/coreutils/ls.c kernel/coreutils/fileops.c kernel/coreutils/copy.c \
            kernel/coreutils/text.c kernel/coreutils/perms.c kernel/coreutils/sysinfo.c \

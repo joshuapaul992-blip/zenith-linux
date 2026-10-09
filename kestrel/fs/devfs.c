@@ -8,6 +8,7 @@
 #include <kernel/string.h>
 #include <kernel/cpu.h>
 #include <kernel/mm.h>
+#include <kernel/tty.h>
 
 #define MKDEV(ma, mi) (((ma) << 8) | (mi))
 
@@ -33,69 +34,92 @@ static const struct vnode_ops null_ops   = { .read = null_read,   .write = sink_
 static const struct vnode_ops zero_ops   = { .read = zero_read,   .write = sink_write };
 static const struct vnode_ops random_ops = { .read = random_read, .write = sink_write };
 
-/* ---- tty: canonical line discipline on keyboard + text console --------- */
+/* ---- tty: one terminal per monitor --------------------------------------
+ *
+ *   /dev/tty         the calling task's TTY (shell, its utilities)
+ *   /dev/console     TTY 0, the system console
+ *   /dev/tty1 ...    the TTY of monitor 0, 1, ... (Linux numbering: Ctrl+Alt+F1 = tty1)
+ *
+ * The line discipline lives in tty.c and keeps its line in that TTY's own
+ * input_buffer. Without any TTY (no usable frame buffer) the text console
+ * g_con and the global keyboard queue are used instead. */
 
-static char   tty_line[256];
-static size_t tty_len, tty_pos;     /* bytes in completed line / already consumed */
-static bool   tty_ready;
+static struct kestrel_tty *vnode_tty(struct vnode *v) { return v->ctx ? v->ctx : tty_current(); }
+
+static char   con_line[256];
+static size_t con_len, con_pos;     /* bytes in completed line / already consumed */
+static bool   con_ready;
 
 static void tty_echo(const char *s) { con_puts(&g_con, s); }
 
-static ssize_t tty_read(struct vnode *v, void *buf, size_t n, uint64_t o)
+static ssize_t con_read(void *buf, size_t n)
 {
-    (void)v; (void)o;
-    if (!tty_ready) {                       /* gather one edited line */
-        tty_len = tty_pos = 0;
+    if (!con_ready) {                       /* gather one edited line */
+        con_len = con_pos = 0;
         con_show_cursor(&g_con, true);
         for (;;) {
             struct key_event ev;
             keyboard_wait(&ev);
             char c = ev.ascii;
-            if (c == '\n') { tty_line[tty_len++] = '\n'; tty_echo("\n"); break; }
-            if (c == '\b') { if (tty_len) { tty_len--; tty_echo("\b \b"); } continue; }
-            if (c == 3)    { tty_echo("^C\n"); tty_len = 0; tty_line[tty_len++] = '\n'; break; }   /* Ctrl+C */
-            if (c == 4)    { if (tty_len == 0) { con_show_cursor(&g_con, false); return 0; } continue; } /* Ctrl+D = EOF */
+            if (c == '\n') { con_line[con_len++] = '\n'; tty_echo("\n"); break; }
+            if (c == '\b') { if (con_len) { con_len--; tty_echo("\b \b"); } continue; }
+            if (c == 3)    { tty_echo("^C\n"); con_len = 0; con_line[con_len++] = '\n'; break; }   /* Ctrl+C */
+            if (c == 4)    { if (con_len == 0) { con_show_cursor(&g_con, false); return 0; } continue; } /* Ctrl+D = EOF */
             if (c == 12)   { con_puts(&g_con, "\033[2J"); continue; }                                     /* Ctrl+L */
-            if (c == 21)   { while (tty_len) { tty_len--; tty_echo("\b \b"); } continue; }               /* Ctrl+U */
-            if (c >= ' ' && c < 127 && tty_len < sizeof tty_line - 1) {
-                tty_line[tty_len++] = c;
-                char s[2] = { c, 0 };
-                tty_echo(s);
+            if (c == 21)   { while (con_len) { con_len--; tty_echo("\b \b"); } continue; }               /* Ctrl+U */
+            if (c >= ' ' && c < 127 && con_len < sizeof con_line - 1) {
+                con_line[con_len++] = c;
+                char e[2] = { c, 0 };
+                tty_echo(e);
             }
         }
         con_show_cursor(&g_con, false);
-        tty_ready = true;
+        con_ready = true;
     }
-    size_t avail = tty_len - tty_pos;
+    size_t avail = con_len - con_pos;
     if (n > avail) n = avail;
-    memcpy(buf, tty_line + tty_pos, n);
-    tty_pos += n;
-    if (tty_pos >= tty_len) tty_ready = false;
+    memcpy(buf, con_line + con_pos, n);
+    con_pos += n;
+    if (con_pos >= con_len) con_ready = false;
     return (ssize_t)n;
 }
 
-static ssize_t tty_write(struct vnode *v, const void *buf, size_t n, uint64_t o)
+static ssize_t devtty_read(struct vnode *v, void *buf, size_t n, uint64_t o)
 {
-    (void)v; (void)o;
-    con_write(&g_con, buf, n);
+    (void)o;
+    struct kestrel_tty *t = vnode_tty(v);
+    return t ? (ssize_t)tty_read_line(t, buf, n) : con_read(buf, n);
+}
+
+static ssize_t devtty_write(struct vnode *v, const void *buf, size_t n, uint64_t o)
+{
+    (void)o;
+    struct kestrel_tty *t = vnode_tty(v);
+    if (t) tty_write(t, buf, n);
+    else con_write(&g_con, buf, n);
     return (ssize_t)n;
 }
 
-static int tty_ioctl(struct vnode *v, unsigned long req, void *arg)
+static int devtty_ioctl(struct vnode *v, unsigned long req, void *arg)
 {
-    (void)v;
-    if (req == TIOCGWINSZ) {
+    if (req == TIOCGWINSZ) {                /* the size of this TTY's own monitor */
         struct winsize *ws = arg;
-        ws->ws_row = (uint16_t)g_con.rows; ws->ws_col = (uint16_t)g_con.cols;
-        ws->ws_xpixel = (uint16_t)(g_con.cols * g_con.font->width);
-        ws->ws_ypixel = (uint16_t)(g_con.rows * g_con.font->height);
+        struct kestrel_tty *t = vnode_tty(v);
+        if (t) {
+            ws->ws_row = (uint16_t)t->max_rows; ws->ws_col = (uint16_t)t->max_cols;
+            ws->ws_xpixel = (uint16_t)t->native_width; ws->ws_ypixel = (uint16_t)t->native_height;
+        } else {
+            ws->ws_row = (uint16_t)g_con.rows; ws->ws_col = (uint16_t)g_con.cols;
+            ws->ws_xpixel = (uint16_t)(g_con.cols * g_con.font->width);
+            ws->ws_ypixel = (uint16_t)(g_con.rows * g_con.font->height);
+        }
         return 0;
     }
     return -ENOTTY;
 }
 
-static const struct vnode_ops tty_ops     = { .read = tty_read, .write = tty_write, .ioctl = tty_ioctl };
-static const struct vnode_ops console_ops = { .read = null_read, .write = tty_write, .ioctl = tty_ioctl };
+static const struct vnode_ops tty_ops     = { .read = devtty_read, .write = devtty_write, .ioctl = devtty_ioctl };
+static const struct vnode_ops console_ops = { .read = null_read, .write = devtty_write, .ioctl = devtty_ioctl };
 
 /* ---- serial ------------------------------------------------------------ */
 static ssize_t serial_dev_write(struct vnode *v, const void *buf, size_t n, uint64_t o)
@@ -170,6 +194,15 @@ static void add_dev(struct vnode *dir, const char *name, uint32_t mode, uint32_t
     vfs_node_add(dir, d);
 }
 
+static void add_tty(struct vnode *dir, const char *name, uint32_t mode, uint32_t rdev,
+                    const struct vnode_ops *ops, struct kestrel_tty *t)
+{
+    struct vnode *d = vfs_node_new(dir->fs, name, VCHR, mode, ops);
+    d->rdev = rdev;
+    d->ctx = t;
+    vfs_node_add(dir, d);
+}
+
 static struct vnode *devfs_root;
 
 struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
@@ -194,7 +227,12 @@ void devfs_init(const char *mountpoint)
     add_dev(r, "urandom", 0666, MKDEV(1, 9),  &random_ops);
     add_dev(r, "kmsg",    0644, MKDEV(1, 11), &kmsg_ops);
     add_dev(r, "tty",     0666, MKDEV(5, 0),  &tty_ops);
-    add_dev(r, "console", 0600, MKDEV(5, 1),  &console_ops);
+    add_tty(r, "console", 0600, MKDEV(5, 1),  &console_ops, tty_get(0));
+    for (int i = 0; i < tty_count; i++) {
+        char name[8];
+        snprintf(name, sizeof name, "tty%d", i + 1);
+        add_tty(r, name, 0620, MKDEV(4, (uint32_t)(i + 1)), &tty_ops, tty_get(i));
+    }
     add_dev(r, "ttyS0",   0660, MKDEV(4, 64), &serial_ops);
     add_dev(r, "fb0",     0660, MKDEV(29, 0), &fb_ops);
     vfs_mount(m, mountpoint);

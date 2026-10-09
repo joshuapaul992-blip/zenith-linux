@@ -49,6 +49,7 @@ struct tcb {
     struct vnode *cwd;
     uint32_t  uid, gid;
     uint32_t  umask;
+    int       tty;              /* system_ttys[] index: /dev/tty, stdin/stdout */
 };
 
 void        sched_init(void);
