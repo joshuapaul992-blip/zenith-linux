@@ -70,7 +70,8 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c lib/crc32.c \
            drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
            kernel/display.c kernel/tty.c kernel/report.c \
-           drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
+           drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
+           drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \
            kernel/coreutils/ls.c kernel/coreutils/fileops.c kernel/coreutils/copy.c \
            kernel/coreutils/text.c kernel/coreutils/perms.c kernel/coreutils/sysinfo.c \
@@ -263,7 +264,7 @@ test-nvidia:
 	@mkdir -p $(BUILD)
 	@$(HOSTCC) -std=gnu11 -O1 -g -Wall -Wextra -fsanitize=address,undefined -DNV_MMIO_HOOKS \
 	    -Idrivers/gpu/nvidia -Idrivers/gpu/nvidia/test drivers/gpu/nvidia/test/nvidia_sim_test.c \
-	    drivers/gpu/nvidia/nvidia.c drivers/gpu/nvidia/nvbios.c -o $(BUILD)/nvidia_sim_test
+	    drivers/gpu/nvidia/nvidia.c drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvfmt.c -o $(BUILD)/nvidia_sim_test
 	@$(BUILD)/nvidia_sim_test > $(BUILD)/nvidia_sim_test.log; rc=$$?; tail -1 $(BUILD)/nvidia_sim_test.log; exit $$rc
 
 test: test-pci test-nvbios test-nvidia
