@@ -6,89 +6,26 @@
  *  subdev/bios/shadow{,ramin,rom}.c, subdev/i2c/{auxgm200,padgm200,gm200}.c,
  *  engine/disp/{gf119,gm200}.c.
  * ============================================================================= */
-#include "nvidia.h"
+#include "nvpriv.h"
 #include <stdarg.h>
 
 /* ======================================================================== */
 /*  MMIO and small helpers                                                     */
 /* ======================================================================== */
-static const struct nv_platform *P;
-
-#ifdef NV_MMIO_HOOKS            /* host test: a simulated BAR0 (test/nvidia_sim_test.c) */
-uint32_t nv_sim_rd32(uint32_t reg);
-void     nv_sim_wr32(uint32_t reg, uint32_t v);
-static inline uint32_t rd32(const struct nv_device *d, uint32_t reg) { (void)d; return nv_sim_rd32(reg); }
-static inline void wr32(struct nv_device *d, uint32_t reg, uint32_t v) { (void)d; nv_sim_wr32(reg, v); }
-#else
-static inline uint32_t rd32(const struct nv_device *d, uint32_t reg) { return *(const volatile uint32_t *)(d->mmio + reg); }
-static inline void wr32(struct nv_device *d, uint32_t reg, uint32_t v) { *(volatile uint32_t *)(d->mmio + reg) = v; }
-#endif
-static inline uint32_t mask32(struct nv_device *d, uint32_t reg, uint32_t mask, uint32_t data)
-{
-    uint32_t old = rd32(d, reg);
-    wr32(d, reg, (old & ~mask) | data);
-    return old;
-}
-static void udelay(uint32_t us) { P->delay_us(us); }
+const struct nv_platform *nv_plat;
+#define P       nv_plat
+#define rd32    nv_rd32
+#define wr32    nv_wr32
+#define mask32  nv_mask
+#define nvlog   nv_log
+static void udelay(uint32_t us) { nv_udelay(us); }
 static void mzero(void *p, size_t n) { volatile uint8_t *b = p; while (n--) *b++ = 0; }
 static void mcopy(void *dst, const void *src, size_t n) { uint8_t *a = dst; const uint8_t *b = src; while (n--) *a++ = *b++; }
 
-/* ---- a small formatter: %s %c %d %u %x %lu %lx %llu, width and 0 flag ---- */
-struct sbuf { char *p; size_t n, cap; void (*putc)(char); };
-
-static void sb_putc(struct sbuf *b, char c)
+void nv_log(const char *f, ...)
 {
-    if (b->putc) { b->putc(c); return; }
-    if (b->n + 1 < b->cap) b->p[b->n] = c;
-    b->n++;
-}
-
-static void sb_vprintf(struct sbuf *b, const char *f, va_list ap)
-{
-    for (; *f; f++) {
-        if (*f != '%') { sb_putc(b, *f); continue; }
-        f++;
-        bool zero = false, left = false;
-        if (*f == '-') { left = true; f++; }
-        if (*f == '0') { zero = true; f++; }
-        int width = 0;
-        while (*f >= '0' && *f <= '9') width = width * 10 + (*f++ - '0');
-        int lng = 0;
-        while (*f == 'l') { lng++; f++; }
-        char tmp[24]; int n = 0;
-        const char *s = tmp;
-        switch (*f) {
-        case 's': s = va_arg(ap, const char *); if (!s) s = "(null)"; while (s[n]) n++; break;
-        case 'c': tmp[0] = (char)va_arg(ap, int); n = 1; break;
-        case 'd': case 'u': case 'x': {
-            uint64_t v; bool neg = false;
-            if (*f == 'd') { int64_t sv = lng ? va_arg(ap, long) : va_arg(ap, int); neg = sv < 0; v = neg ? (uint64_t)-sv : (uint64_t)sv; }
-            else v = lng ? va_arg(ap, unsigned long) : va_arg(ap, unsigned);
-            unsigned base = *f == 'x' ? 16 : 10;
-            char rev[24]; int r = 0;
-            do { rev[r++] = "0123456789abcdef"[v % base]; v /= base; } while (v);
-            if (neg) tmp[n++] = '-';
-            while (r) tmp[n++] = rev[--r];
-            break;
-        }
-        case '%': tmp[0] = '%'; n = 1; break;
-        default: continue;
-        }
-        if (!left) for (int i = n; i < width; i++) sb_putc(b, zero ? '0' : ' ');
-        for (int i = 0; i < n; i++) sb_putc(b, s[i]);
-        if (left) for (int i = n; i < width; i++) sb_putc(b, ' ');
-    }
-}
-
-static void sb_printf(struct sbuf *b, const char *f, ...)
-{
-    va_list ap; va_start(ap, f); sb_vprintf(b, f, ap); va_end(ap);
-}
-
-static void nvlog(const char *f, ...)
-{
-    struct sbuf b = { 0, 0, 0, P->log_putc };
-    va_list ap; va_start(ap, f); sb_vprintf(&b, f, ap); va_end(ap);
+    struct nv_sbuf b = { 0, 0, 0, P->log_putc };
+    va_list ap; va_start(ap, f); nv_sb_vprintf(&b, f, ap); va_end(ap);
 }
 
 const char *nv_strerror(int err)
@@ -102,6 +39,8 @@ const char *nv_strerror(int err)
     case NV_ERR_NOSINK:  return "no sink";
     case NV_ERR_NOMEM:   return "out of memory";
     case NV_ERR_NOBIOS:  return "no VBIOS";
+    case NV_ERR_NOSUPP:  return "not supported";
+    case NV_ERR_STATE:   return "unexpected hardware state";
     default:             return "error";
     }
 }
@@ -316,7 +255,7 @@ static int aux_init(struct nv_device *d, int ch)
 
 /* One AUX transaction of up to 16 bytes. Returns <0 on error, otherwise the
  * reply code (0 = ACK; 1 = native NACK, 4 = I2C NACK). *size = bytes moved. */
-static int aux_xfer(struct nv_device *d, int ch, bool retry, uint8_t type, uint32_t addr, uint8_t *data, uint8_t *size)
+int nv_aux_xfer(struct nv_device *d, int ch, bool retry, uint8_t type, uint32_t addr, uint8_t *data, uint8_t *size)
 {
     const uint32_t base = (uint32_t)ch * 0x50;
     uint32_t ctrl, stat = 0, xbuf[4] = { 0 };
@@ -368,7 +307,7 @@ out:
 }
 
 /* Hybrid (shared I2C/AUX) pads must be switched to AUX mode first. */
-static void pad_aux_mode(struct nv_device *d, int share)
+void nv_aux_pad_mode(struct nv_device *d, int share)
 {
     const uint32_t base = (uint32_t)share * 0x50;
     mask32(d, 0x00d970 + base, 0x0000c003, 0x00000002);
@@ -379,11 +318,24 @@ int nv_aux_dpcd_read(struct nv_device *d, int ch, uint32_t addr, uint8_t *buf, u
 {
     while (len) {
         uint8_t n = (uint8_t)(len < 16 ? len : 16), got = n;
-        int rc = aux_xfer(d, ch, true, AUX_TYPE_NATIVE_RD, addr, buf, &got);
+        int rc = nv_aux_xfer(d, ch, true, AUX_TYPE_NATIVE_RD, addr, buf, &got);
         if (rc < 0) return rc;
         if (rc) return NV_ERR_NACK;
         if (!got) return NV_ERR_IO;
         addr += got; buf += got; len -= got;
+    }
+    return NV_OK;
+}
+
+int nv_aux_dpcd_write(struct nv_device *d, int ch, uint32_t addr, const uint8_t *buf, uint32_t len)
+{
+    while (len) {
+        uint8_t n = (uint8_t)(len < 16 ? len : 16), cnt = n, tmp[16];
+        mcopy(tmp, buf, n);
+        int rc = nv_aux_xfer(d, ch, true, AUX_TYPE_NATIVE_WR, addr, tmp, &cnt);
+        if (rc < 0) return rc;
+        if (rc) return NV_ERR_NACK;
+        addr += n; buf += n; len -= n;
     }
     return NV_OK;
 }
@@ -393,7 +345,7 @@ int nv_aux_dpcd_read(struct nv_device *d, int ch, uint32_t addr, uint8_t *buf, u
 int nv_aux_i2c_read(struct nv_device *d, int ch, uint8_t i2c, uint8_t offset, uint8_t *buf, uint32_t len)
 {
     uint8_t one = 1, off = offset;
-    int rc = aux_xfer(d, ch, true, AUX_TYPE_I2C_WR | AUX_TYPE_MOT, i2c, &off, &one);
+    int rc = nv_aux_xfer(d, ch, true, AUX_TYPE_I2C_WR | AUX_TYPE_MOT, i2c, &off, &one);
     if (rc < 0) return rc;
     if (rc) return NV_ERR_NACK;
     while (len) {
@@ -401,7 +353,7 @@ int nv_aux_i2c_read(struct nv_device *d, int ch, uint8_t i2c, uint8_t offset, ui
         uint8_t type = (uint8_t)(AUX_TYPE_I2C_RD | (len > 16 ? AUX_TYPE_MOT : 0));
         for (int tries = 0; tries < 32 && !cnt; tries++) {
             cnt = n;
-            rc = aux_xfer(d, ch, true, type, i2c, buf, &cnt);
+            rc = nv_aux_xfer(d, ch, true, type, i2c, buf, &cnt);
             if (rc < 0) return rc;
             if (rc) return NV_ERR_NACK;
         }
@@ -421,7 +373,7 @@ static void probe_dp(struct nv_device *d)
         if (c->auxch == DCB_I2C_UNUSED) continue;
         p->probed = true;
         p->aux = c->auxch;
-        if (c->share != DCB_I2C_UNUSED) pad_aux_mode(d, c->share);
+        if (c->share != DCB_I2C_UNUSED) nv_aux_pad_mode(d, c->share);
         p->sink = rd32(d, 0x00d958 + (uint32_t)p->aux * 0x50) & 0x10000000;
         if (!p->sink) { p->dpcd_rc = p->edid_rc = NV_ERR_NOSINK; continue; }
 
@@ -580,9 +532,9 @@ int nv_probe(struct nv_device *d, const struct nv_platform *plat)
     return NV_OK;
 }
 
-static void hexline(struct sbuf *b, const uint8_t *p, uint32_t n)
+static void hexline(struct nv_sbuf *b, const uint8_t *p, uint32_t n)
 {
-    for (uint32_t i = 0; i < n; i++) sb_printf(b, "%02x%s", p[i], i + 1 < n ? " " : "");
+    for (uint32_t i = 0; i < n; i++) nv_sb_printf(b, "%02x%s", p[i], i + 1 < n ? " " : "");
 }
 
 static const char *sor_proto(uint8_t p)
@@ -595,97 +547,97 @@ static const char *sor_proto(uint8_t p)
 
 size_t nv_report(const struct nv_device *d, char *buf, size_t cap)
 {
-    struct sbuf b = { buf, 0, cap, 0 };
-    sb_printf(&b, "PCI        %02x:%02x.%x  %04x:%04x  subsystem %04x:%04x\n", d->bus, d->dev, d->fn,
+    struct nv_sbuf b = { buf, 0, cap, 0 };
+    nv_sb_printf(&b, "PCI        %02x:%02x.%x  %04x:%04x  subsystem %04x:%04x\n", d->bus, d->dev, d->fn,
               d->vendor_id, d->device_id, d->subsys_vendor, d->subsys_id);
-    sb_printf(&b, "BARs       BAR0 %lx (MMIO), BAR1 %lx (%lu MiB VRAM aperture)\n",
+    nv_sb_printf(&b, "BARs       BAR0 %lx (MMIO), BAR1 %lx (%lu MiB VRAM aperture)\n",
               (unsigned long)d->bar0, (unsigned long)d->bar1, (unsigned long)(d->bar1_size >> 20));
-    sb_printf(&b, "chip       %s (%s), chipset %03x rev %02x, PMC_BOOT_0 %08x\n", d->chip_name, d->family,
+    nv_sb_printf(&b, "chip       %s (%s), chipset %03x rev %02x, PMC_BOOT_0 %08x\n", d->chip_name, d->family,
               d->chipset, d->chiprev, d->boot0);
-    sb_printf(&b, "VRAM       %lu MiB\n", (unsigned long)(d->vram_bytes >> 20));
-    sb_printf(&b, "display    %s; AUX probing %s; firmware state readback %s\n",
+    nv_sb_printf(&b, "VRAM       %lu MiB\n", (unsigned long)(d->vram_bytes >> 20));
+    nv_sb_printf(&b, "display    %s; AUX probing %s; firmware state readback %s\n",
               d->display_present ? "present" : "fused off", d->aux_supported ? "yes" : "no (chip not supported yet)",
               d->state_supported ? "yes" : "no");
-    if (!d->bios_ok) { sb_printf(&b, "VBIOS      none found\n"); return b.n < cap ? b.n : cap; }
+    if (!d->bios_ok) { nv_sb_printf(&b, "VBIOS      none found\n"); return b.n < cap ? b.n : cap; }
 
     const struct nvbios *v = &d->bios;
-    sb_printf(&b, "VBIOS      %02x.%02x.%02x.%02x.%02x, %u bytes from %s (score %d), BIT at %x\n",
+    nv_sb_printf(&b, "VBIOS      %02x.%02x.%02x.%02x.%02x, %u bytes from %s (score %d), BIT at %x\n",
               v->version[0], v->version[1], v->version[2], v->version[3], v->version[4], d->bios_size,
               d->bios_source, d->bios_score, v->bit_offset);
     for (int i = 0; i < v->nimages; i++)
-        sb_printf(&b, "  image %d  %06x +%6u bytes, type %02x%s%s, PCI %04x:%04x\n", i, v->image[i].base, v->image[i].size,
+        nv_sb_printf(&b, "  image %d  %06x +%6u bytes, type %02x%s%s, PCI %04x:%04x\n", i, v->image[i].base, v->image[i].size,
                   v->image[i].type, v->image[i].type == 0 ? (v->image[i].checksum_ok ? ", checksum ok" : ", BAD CHECKSUM") : "",
                   v->image[i].last ? ", last" : "", v->image[i].vendor, v->image[i].device);
-    sb_printf(&b, "DCB        version %u.%u at %x, %u entries; connector table %x (v%x), I2C table %x (v%x)\n",
+    nv_sb_printf(&b, "DCB        version %u.%u at %x, %u entries; connector table %x (v%x), I2C table %x (v%x)\n",
               v->dcb_ver >> 4, v->dcb_ver & 0xf, v->dcb, v->dcb_cnt, v->conn_table, v->conn_ver, v->i2c_table, v->i2c_ver);
 
-    sb_printf(&b, "\nConnectors\n");
+    nv_sb_printf(&b, "\nConnectors\n");
     for (int i = 0; i < v->nconns; i++)
-        sb_printf(&b, "  %d: %-12s type %02x, location %u, hpd %02x, dp %02x\n", i, nvbios_conn_type_name(v->conn[i].type),
+        nv_sb_printf(&b, "  %d: %-12s type %02x, location %u, hpd %02x, dp %02x\n", i, nvbios_conn_type_name(v->conn[i].type),
                   v->conn[i].type, v->conn[i].location, v->conn[i].hpd, v->conn[i].dp);
-    sb_printf(&b, "\nI2C / AUX ports\n");
+    nv_sb_printf(&b, "\nI2C / AUX ports\n");
     for (int i = 0; i < v->ni2c; i++) {
         const struct nvbios_i2c *c = &v->i2c[i];
-        if (c->type == DCB_I2C_UNUSED) { sb_printf(&b, "  %d: unused\n", i); continue; }
-        sb_printf(&b, "  %d: type %02x, i2c port %d, aux channel %d, pad %d\n", i, c->type,
+        if (c->type == DCB_I2C_UNUSED) { nv_sb_printf(&b, "  %d: unused\n", i); continue; }
+        nv_sb_printf(&b, "  %d: type %02x, i2c port %d, aux channel %d, pad %d\n", i, c->type,
                   c->drive == 0xff ? -1 : c->drive, c->auxch == 0xff ? -1 : c->auxch, c->share == 0xff ? -1 : c->share);
     }
 
-    sb_printf(&b, "\nOutputs (DCB) and what is attached\n");
+    nv_sb_printf(&b, "\nOutputs (DCB) and what is attached\n");
     for (int i = 0; i < v->noutputs; i++) {
         const struct nvbios_output *o = &v->output[i];
         const struct nv_dp_probe *p = &d->dp[i];
-        sb_printf(&b, "  DCB %d: %-6s SOR mask %x, link %x, heads %x, connector %u, i2c %u, location %u  [%08x %08x]\n",
+        nv_sb_printf(&b, "  DCB %d: %-6s SOR mask %x, link %x, heads %x, connector %u, i2c %u, location %u  [%08x %08x]\n",
                   o->index, nvbios_output_type_name(o->type), o->or, o->link, o->heads, o->connector, o->i2c_index,
                   o->location, o->raw_conn, o->raw_conf);
         if (o->type == DCB_OUTPUT_DP)
-            sb_printf(&b, "         board limit %u lanes x %u.%02u Gbps\n", o->dp_link_nr, o->dp_link_bw * 27 / 100, o->dp_link_bw * 27 % 100);
-        if (p->route_sor >= 0) sb_printf(&b, "         routed to SOR %d (link %d)\n", p->route_sor, p->route_link);
+            nv_sb_printf(&b, "         board limit %u lanes x %u.%02u Gbps\n", o->dp_link_nr, o->dp_link_bw * 27 / 100, o->dp_link_bw * 27 % 100);
+        if (p->route_sor >= 0) nv_sb_printf(&b, "         routed to SOR %d (link %d)\n", p->route_sor, p->route_link);
         if (!p->probed) continue;
-        if (!p->sink) { sb_printf(&b, "         aux %d: nothing connected\n", p->aux); continue; }
-        sb_printf(&b, "         aux %d: sink present; DPCD: %s\n", p->aux, nv_strerror(p->dpcd_rc));
+        if (!p->sink) { nv_sb_printf(&b, "         aux %d: nothing connected\n", p->aux); continue; }
+        nv_sb_printf(&b, "         aux %d: sink present; DPCD: %s\n", p->aux, nv_strerror(p->dpcd_rc));
         if (p->dpcd_rc == NV_OK) {
-            sb_printf(&b, "           caps   "); hexline(&b, p->dpcd, 16); sb_printf(&b, "\n");
-            sb_printf(&b, "           DPCD %u.%u, max %u lanes x %u.%02u Gbps%s; firmware trained %u lanes x %u.%02u Gbps\n",
+            nv_sb_printf(&b, "           caps   "); hexline(&b, p->dpcd, 16); nv_sb_printf(&b, "\n");
+            nv_sb_printf(&b, "           DPCD %u.%u, max %u lanes x %u.%02u Gbps%s; firmware trained %u lanes x %u.%02u Gbps\n",
                       p->dpcd[0] >> 4, p->dpcd[0] & 0xf, p->dpcd[2] & 0x1f, p->dpcd[1] * 27 / 100, p->dpcd[1] * 27 % 100,
                       (p->dpcd[2] & 0x80) ? ", enhanced framing" : "", p->link_cfg[1] & 0x1f,
                       p->link_cfg[0] * 27 / 100, p->link_cfg[0] * 27 % 100);
-            sb_printf(&b, "           status "); hexline(&b, p->status, 6); sb_printf(&b, "  (sink count, IRQ, lane 0-3 status, align)\n");
+            nv_sb_printf(&b, "           status "); hexline(&b, p->status, 6); nv_sb_printf(&b, "  (sink count, IRQ, lane 0-3 status, align)\n");
         }
-        sb_printf(&b, "         EDID: %s", nv_strerror(p->edid_rc));
+        nv_sb_printf(&b, "         EDID: %s", nv_strerror(p->edid_rc));
         if (p->edid_rc == NV_OK && p->edid_len >= 128) {
             const uint8_t *e = p->edid;
             uint16_t id = (uint16_t)(e[8] << 8 | e[9]);
             int w = e[56] | (e[58] & 0xf0) << 4, h = e[59] | (e[61] & 0xf0) << 4;
-            sb_printf(&b, ", %c%c%c %04x, preferred %dx%d\n", 'A' - 1 + ((id >> 10) & 0x1f), 'A' - 1 + ((id >> 5) & 0x1f),
+            nv_sb_printf(&b, ", %c%c%c %04x, preferred %dx%d\n", 'A' - 1 + ((id >> 10) & 0x1f), 'A' - 1 + ((id >> 5) & 0x1f),
                       'A' - 1 + (id & 0x1f), e[10] | e[11] << 8, w, h);
-            for (uint32_t r = 0; r < p->edid_len; r += 16) { sb_printf(&b, "           %03x: ", r); hexline(&b, e + r, 16); sb_printf(&b, "\n"); }
+            for (uint32_t r = 0; r < p->edid_len; r += 16) { nv_sb_printf(&b, "           %03x: ", r); hexline(&b, e + r, 16); nv_sb_printf(&b, "\n"); }
         } else {
-            sb_printf(&b, "\n");
+            nv_sb_printf(&b, "\n");
         }
     }
 
     if (d->state_supported && d->display_present) {
-        sb_printf(&b, "\nDisplay engine as the firmware left it (armed core channel state)\n");
-        sb_printf(&b, "  heads mask %x (%d heads), SOR mask %02x\n", d->head_mask, d->head_count, d->sor_mask);
+        nv_sb_printf(&b, "\nDisplay engine as the firmware left it (armed core channel state)\n");
+        nv_sb_printf(&b, "  heads mask %x (%d heads), SOR mask %02x\n", d->head_mask, d->head_count, d->sor_mask);
         for (int i = 0; i < NV_MAX_SORS; i++)
             if (d->sor_mask & (1u << i))
-                sb_printf(&b, "  SOR %d: control %08x -> heads %x, %s\n", i, d->sor[i].ctrl, d->sor[i].heads,
+                nv_sb_printf(&b, "  SOR %d: control %08x -> heads %x, %s\n", i, d->sor[i].ctrl, d->sor[i].heads,
                           d->sor[i].heads ? sor_proto(d->sor[i].proto) : "idle");
         for (int h = 0; h < NV_MAX_HEADS; h++) {
             if (!(d->head_mask & (1u << h))) continue;
             const struct nv_head_state *s = &d->head[h];
-            sb_printf(&b, "  head %d: %s, raster %ux%u, sync end %u,%u, blank %u-%u x %u-%u, pixel clock %u kHz, %d bpp\n",
+            nv_sb_printf(&b, "  head %d: %s, raster %ux%u, sync end %u,%u, blank %u-%u x %u-%u, pixel clock %u kHz, %d bpp\n",
                       h, s->active ? "ACTIVE" : "off", s->htotal, s->vtotal, s->hsync_end, s->vsync_end,
                       s->hblank_end, s->hblank_start, s->vblank_end, s->vblank_start, s->pixel_hz / 1000, s->depth);
-            sb_printf(&b, "          surface offset %08x (VRAM %lx), size %08x, storage %08x, params %08x, viewport in %08x out %08x\n",
+            nv_sb_printf(&b, "          surface offset %08x (VRAM %lx), size %08x, storage %08x, params %08x, viewport in %08x out %08x\n",
                       s->offset, (unsigned long)s->offset << 8, s->size, s->storage, s->params, s->viewport_in, s->viewport_out);
         }
     }
     if (d->nregs) {
-        sb_printf(&b, "\nRegister snapshot (read-only, for the modeset stage)\n");
+        nv_sb_printf(&b, "\nRegister snapshot (read-only, for the modeset stage)\n");
         for (int i = 0; i < d->nregs; i++)
-            sb_printf(&b, "  %06x = %08x  %s\n", d->regs[i].reg, d->regs[i].val, d->regs[i].what);
+            nv_sb_printf(&b, "  %06x = %08x  %s\n", d->regs[i].reg, d->regs[i].val, d->regs[i].what);
     }
     return b.n < cap ? b.n : cap;
 }

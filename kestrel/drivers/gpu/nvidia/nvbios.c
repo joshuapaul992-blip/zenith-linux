@@ -142,7 +142,7 @@ static void parse_output(struct nvbios *b, int idx, uint32_t e)
     o->heads     = (uint8_t)((conn & 0x00000f00) >> 8);
     o->i2c_index = (uint8_t)((conn & 0x000000f0) >> 4);
     o->type      = (uint8_t)(conn & 0x0000000f);
-    if (b->dcb_ver < 0x40) return;
+    if (b->dcb_ver < 0x40) goto hash;
     switch (o->type) {
     case DCB_OUTPUT_DP:
         switch (conf & 0x00e00000) {
@@ -160,10 +160,14 @@ static void parse_output(struct nvbios *b, int idx, uint32_t e)
     case DCB_OUTPUT_TMDS:
     case DCB_OUTPUT_LVDS:
         o->link = (uint8_t)((conf & 0x00000030) >> 4);
+        if (o->location) o->extdev = (uint8_t)((conf & 0x0000ff00) >> 8);
         break;
     default:
         break;
     }
+hash:
+    o->hasht = (uint16_t)(o->extdev << 8 | o->location << 4 | o->type);
+    o->hashm = (uint16_t)(o->heads << 8 | o->link << 6 | o->or);
 }
 
 static void parse_outputs(struct nvbios *b)

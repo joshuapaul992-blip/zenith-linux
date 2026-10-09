@@ -72,6 +72,10 @@ struct nvbios_output {          /* one DCB output entry */
     uint8_t  link;              /* sub-link mask (TMDS/DP) */
     uint8_t  dp_link_bw;        /* 0x06/0x0a/0x14/0x1e (x 270 MHz) */
     uint8_t  dp_link_nr;        /* lanes */
+    uint8_t  extdev;            /* external encoder (location != 0 only) */
+    uint16_t hasht, hashm;      /* nouveau's keys into the display/DP tables:
+                                   (extdev << 8 | location << 4 | type),
+                                   (heads << 8 | link << 6 | or) */
     uint32_t raw_conn, raw_conf;
 };
 
@@ -141,6 +145,58 @@ uint32_t nvbios_rd32(const struct nvbios *b, uint32_t addr);
 
 /* BIT table entry by id ('i' = version, 'I' = init, 'p' = PMU ...). */
 bool nvbios_bit_entry(const struct nvbios *b, char id, uint8_t *version, uint16_t *offset, uint16_t *length);
+
+/* ---- display, DP and PLL tables (nvbios_disp.c) ----------------------------- */
+
+/* Display ("U") table entry for one output: IED scripts. */
+struct nvbios_outp {
+    uint8_t  ver, hdr, cnt, len;    /* of the per-protocol config list that follows */
+    uint32_t data;                  /* entry address (0 = no match) */
+    uint16_t type;                  /* matched against nvbios_output.hasht */
+    uint32_t mask;                  /* ... and (0x100 << head) | (ffs(link) << 6) | or */
+    uint16_t script[3];             /* OffInt1, OffInt2, OffInt3 (disable path) */
+};
+
+struct nvbios_ocfg {                /* per-protocol config: clock-dependent scripts */
+    uint8_t  proto, flags;
+    uint16_t clkcmp[2];             /* OnInt2, OnInt3 clock comparison lists */
+};
+
+/* DP ("d") table entry for one output. */
+struct nvbios_dpout {
+    uint8_t  ver, hdr, cnt, len;
+    uint32_t data;
+    uint16_t type, mask;            /* hasht, hashm-style match keys */
+    uint8_t  flags;
+    uint16_t script[5];             /* BeforeLT, AfterLT, EnableSpread, DisableSpread, DisableLT */
+    uint16_t lnkcmp;                /* per-link-rate scripts */
+};
+
+struct nvbios_dpcfg { uint8_t pc, dc, pe, tx_pu; };
+
+struct nvbios_pll {
+    uint8_t  ver, type;
+    uint32_t reg, entry;
+    uint32_t refclk;                /* kHz; 0 = use the crystal */
+    uint8_t  min_p, max_p;
+    struct {
+        uint32_t min_freq, max_freq, min_inputfreq, max_inputfreq;   /* kHz */
+        uint8_t  min_m, max_m, min_n, max_n;
+    } vco1;
+};
+#define NVBIOS_PLL_VPLL0    0x80    /* + head */
+
+uint32_t nvbios_outp_match(const struct nvbios *b, uint16_t type, uint16_t mask, struct nvbios_outp *o);
+uint32_t nvbios_ocfg_match(const struct nvbios *b, const struct nvbios_outp *o, uint8_t proto, uint8_t flags,
+                           struct nvbios_ocfg *c);
+uint16_t nvbios_oclk_match(const struct nvbios *b, uint16_t cmp, uint32_t khz);
+uint8_t  nvbios_dp_version(const struct nvbios *b);
+uint32_t nvbios_dpout_match(const struct nvbios *b, uint16_t type, uint16_t mask, struct nvbios_dpout *o);
+uint32_t nvbios_dpcfg_match(const struct nvbios *b, const struct nvbios_dpout *o, uint8_t pc, uint8_t vs, uint8_t pe,
+                            struct nvbios_dpcfg *c);
+bool     nvbios_pll_parse(const struct nvbios *b, uint8_t type, struct nvbios_pll *p);
+/* gt215_pll_calc with fractional N: returns the achieved kHz or < 0. */
+int      nvbios_pll_calc(const struct nvbios_pll *p, uint32_t khz, int *N, int *fN, int *M, int *P);
 
 const char *nvbios_output_type_name(uint8_t type);
 const char *nvbios_conn_type_name(uint8_t type);

@@ -47,6 +47,58 @@ struct nv_platform {
     /* Optional: copy the PCI expansion ROM (config offset 0x30) into buf,
      * return the number of bytes copied (0 = not available). */
     uint32_t (*read_pci_rom)(void *buf, uint32_t max);
+    /* Optional, modeset only: called at each milestone, so the platform can
+     * save its log somewhere that survives a hang or a dark screen. */
+    void     (*checkpoint)(const char *stage);
+};
+
+/* ---- stage 2: modeset ------------------------------------------------------ */
+struct nv_mode {                        /* one video timing, DRM style */
+    uint32_t clock_khz;
+    uint16_t hdisplay, hsync_start, hsync_end, htotal;
+    uint16_t vdisplay, vsync_start, vsync_end, vtotal;
+    bool     nhsync, nvsync;
+    const char *source;                 /* "EDID preferred", "EDID DTD 2", "CEA 1080p60" ... */
+};
+
+struct nv_modeset_opts {
+    int      max_width, max_height;     /* largest mode to pick (0 = 1920x1200); the
+                                           frame buffer is written through PRAMIN */
+    bool     trace_scripts;             /* log every VBIOS script register write */
+    bool     takeover;                  /* also re-drive outputs the firmware lit */
+};
+
+/* One monitor this driver lights (or found lit and kept). */
+struct nv_output {
+    int      dcb;                       /* DCB output index */
+    int      head, sor, link;           /* link: 1 = sub-link A, 2 = B */
+    bool     kept;                      /* firmware-lit, left as it was */
+    bool     lit;                       /* scanning out after the modeset */
+    struct nv_mode mode;
+    uint64_t fb;                        /* VRAM address of the surface */
+    uint32_t pitch;                     /* bytes */
+    uint8_t  dp_bw, dp_nr;              /* trained link: rate (x 0.27 Gbps) and lanes */
+    bool     dp_ef;
+    int      train_rc;
+    const char *status;                 /* human readable, for the report */
+};
+
+struct nv_modeset {
+    bool     attempted;
+    int      result;                    /* NV_OK or the error that stopped it */
+    const char *stage;                  /* where it got to */
+    uint64_t base;                      /* our VRAM area: instance memory, push buffer ... */
+    uint64_t inst, push, sync, fb_next;
+    uint32_t put;                       /* push buffer write offset, bytes */
+    uint32_t crystal_khz;
+    uint32_t supervisors[3], chan_errors, updates;
+    uint32_t script_runs, script_writes, script_warnings;
+    uint32_t sor_arm[NV_MAX_SORS];      /* DCB index + 1 attached per SOR (0 = none) */
+    uint32_t sor_asy[NV_MAX_SORS];
+    int      nouts;
+    struct nv_output out[NV_MAX_HEADS];
+    /* per DCB output: DP link capabilities after nvkm_dp_enable() */
+    struct { uint8_t links, rates, rate[4], lttpr[8]; bool lt_done; uint8_t bw, nr; bool ef; } dp[NVBIOS_MAX_OUTPUTS];
 };
 
 struct nv_head_state {                  /* armed core-channel state, 0x640000 + head * 0x300 */
@@ -115,6 +167,8 @@ struct nv_device {
     /* per DCB output */
     struct nv_dp_probe dp[NVBIOS_MAX_OUTPUTS];
 
+    struct nv_modeset ms;               /* stage 2, see nv_modeset() */
+
     /* read-only snapshot of the registers a modeset touches (from nouveau's
      * gf119/gm200 display code), taken at probe time */
     int      nregs;
@@ -132,6 +186,7 @@ size_t nv_report(const struct nv_device *d, char *buf, size_t cap);
 /* Read `len` bytes of DPCD (native AUX) or EDID-style I2C (over AUX) on
  * AUX channel `ch`. Return 0 or a negative error. */
 int    nv_aux_dpcd_read(struct nv_device *d, int ch, uint32_t addr, uint8_t *buf, uint32_t len);
+int    nv_aux_dpcd_write(struct nv_device *d, int ch, uint32_t addr, const uint8_t *buf, uint32_t len);
 int    nv_aux_i2c_read(struct nv_device *d, int ch, uint8_t i2c_addr, uint8_t offset, uint8_t *buf, uint32_t len);
 
 #define NV_OK            0
@@ -142,7 +197,24 @@ int    nv_aux_i2c_read(struct nv_device *d, int ch, uint8_t i2c_addr, uint8_t of
 #define NV_ERR_NOSINK   -5
 #define NV_ERR_NOMEM    -6
 #define NV_ERR_NOBIOS   -7
+#define NV_ERR_NOSUPP   -8
+#define NV_ERR_STATE    -9
 
 const char *nv_strerror(int err);
+
+/* Stage 2 (nvdisp.c), experimental: take the display engine over from the
+ * firmware and light every DisplayPort monitor that is connected but dark,
+ * each on its own head with its own frame buffer in VRAM. Monitors the
+ * firmware lit are kept as they are unless opts->takeover. Needs nv_probe()
+ * to have succeeded. Logs every step; d->ms says how far it got. */
+int    nv_modeset(struct nv_device *d, const struct nv_modeset_opts *opts);
+size_t nv_modeset_report(const struct nv_device *d, char *buf, size_t cap);
+
+/* CPU access to VRAM through the BAR0 PRAMIN window (not re-entrant: the
+ * caller serialises, e.g. with interrupts off). */
+void   nv_vram_write(struct nv_device *d, uint64_t addr, const void *src, uint32_t len);
+void   nv_vram_fill(struct nv_device *d, uint64_t addr, uint32_t value, uint32_t len);
+uint32_t nv_vram_rd32(struct nv_device *d, uint64_t addr);
+void   nv_vram_wr32(struct nv_device *d, uint64_t addr, uint32_t value);
 
 #endif /* NVIDIA_PROBE_H */
