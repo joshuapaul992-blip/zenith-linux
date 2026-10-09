@@ -177,6 +177,14 @@ static int64_t sys_rename(uint64_t from, uint64_t to, uint64_t a3, uint64_t a4, 
     return vfs_rename((const char *)from, (const char *)to);
 }
 
+/* Permission bits are not enforced on open files; accept and ignore. */
+static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (fd >= MAX_FDS || !current_task()->fds[fd]) return -EBADF;
+    return 0;
+}
+
 static int64_t sys_chmod(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
@@ -225,6 +233,11 @@ static int64_t sys_getuid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, ui
 static int64_t sys_getgid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return current_task()->gid; }
 
+/* Single-user system: effective ids are the real ids, a process is its own
+ * process group. */
+static int64_t sys_getpgid(uint64_t pid, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return pid ? (int64_t)pid : current_task()->pid; }
+
 static int64_t sys_sched_yield(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; sched_yield(); return 0; }
 
@@ -241,16 +254,41 @@ static int64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t a3, uint64_t a
     return 0;
 }
 
+/* Linux clock ids: REALTIME 0, MONOTONIC 1, MONOTONIC_RAW 4, REALTIME_COARSE 5,
+ * MONOTONIC_COARSE 6, BOOTTIME 7. The coarse/raw variants are served by the
+ * same nanosecond clock (XLibre picks MONOTONIC_COARSE when it exists). */
+static int clock_kind(uint64_t clk)
+{
+    switch (clk) {
+    case 0: case 5:         return 0;   /* realtime */
+    case 1: case 4: case 6: case 7: return 1;   /* monotonic */
+    default:                return -1;
+    }
+}
+
 static int64_t sys_clock_gettime(uint64_t clk, uint64_t tsp, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    if (clk != CLOCK_MONOTONIC && clk != CLOCK_REALTIME) return -EINVAL;
+    int kind = clock_kind(clk);
+    if (kind < 0) return -EINVAL;
     if (bad_ptr(tsp)) return -EFAULT;
     struct timespec *ts = (struct timespec *)tsp;
-    if (clk == CLOCK_REALTIME) { time_realtime(&ts->tv_sec, &ts->tv_nsec); return 0; }
+    if (kind == 0) { time_realtime(&ts->tv_sec, &ts->tv_nsec); return 0; }
     uint64_t ns = time_ns();                            /* HPET/TSC, nanosecond resolution */
     ts->tv_sec = (int64_t)(ns / 1000000000ull);
     ts->tv_nsec = (int64_t)(ns % 1000000000ull);
+    return 0;
+}
+
+static int64_t sys_clock_getres(uint64_t clk, uint64_t tsp, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (clock_kind(clk) < 0) return -EINVAL;
+    if (!tsp) return 0;
+    if (bad_ptr(tsp)) return -EFAULT;
+    struct timespec *ts = (struct timespec *)tsp;
+    ts->tv_sec = 0;
+    ts->tv_nsec = 1;
     return 0;
 }
 
@@ -831,6 +869,10 @@ void syscall_init(void)
     REG(SYS_getuid, sys_getuid);       REG(SYS_getgid, sys_getgid);
     REG(SYS_getppid, sys_getppid);     REG(SYS_getdents64, sys_getdents64);
     REG(SYS_clock_gettime, sys_clock_gettime);
+    REG(SYS_clock_getres, sys_clock_getres);
+    REG(SYS_lstat, sys_stat);          /* no symlinks: lstat == stat */
+    REG(SYS_geteuid, sys_getuid);      REG(SYS_getegid, sys_getgid);
+    REG(SYS_getpgid, sys_getpgid);     REG(SYS_fchmod, sys_fchmod);
     REG(SYS_reboot, sys_reboot);
     /* placeholders: need user address spaces / signals */
     REG(SYS_mmap, sys_mmap);           REG(SYS_brk, sys_brk);

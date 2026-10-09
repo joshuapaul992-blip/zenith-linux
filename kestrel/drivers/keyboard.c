@@ -15,6 +15,7 @@
 #include <kernel/task.h>
 #include <kernel/klog.h>
 #include <kernel/tty.h>
+#include <kernel/kinput.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
@@ -79,6 +80,9 @@ static void kbd_irq(struct int_frame *f)
     (void)f;
     if (!(inb(KBD_STATUS) & 0x01)) return;
     uint8_t sc = inb(KBD_DATA);
+
+    /* A display server holds /dev/kinput: raw scancodes go there instead. */
+    if (kinput_grabbed()) { mods = 0; e0_prefix = false; kinput_ps2_byte(sc); return; }
 
     if (sc == 0xE0) { e0_prefix = true; return; }
     bool release = sc & 0x80;

@@ -22,6 +22,7 @@
 #include <kernel/time.h>
 #include <kernel/block.h>
 #include <kernel/posix.h>
+#include <kernel/kinput.h>
 #include "pci.h"
 #include "xhci.h"
 #include "usb_legacy.h"
@@ -89,6 +90,7 @@ static uint16_t usage_to_key(uint8_t u)
 
 static void on_key(const struct usb_key_event *ev)
 {
+    if (kinput_grabbed()) { kinput_usb_key(ev->usage, ev->pressed, ev->repeat); return; }
     if (!ev->pressed) return;                   /* Kestrel's queue carries presses */
     uint8_t mods = 0;
     if (ev->modifiers & HID_MOD_SHIFT) mods |= MOD_SHIFT;
@@ -122,6 +124,11 @@ static void draw_pointer(void)
 static void on_mouse(const struct usb_mouse_event *ev)
 {
     mouse_reports++;
+    if (kinput_grabbed()) {                     /* the display server draws its own cursor */
+        ptr_x = -1;
+        kinput_usb_mouse(ev->dx, ev->dy, ev->wheel, ev->buttons);
+        return;
+    }
     mouse_x += ev->dx;
     mouse_y += ev->dy;
     if (mouse_x < 0) mouse_x = 0;

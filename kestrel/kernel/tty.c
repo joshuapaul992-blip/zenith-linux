@@ -16,6 +16,7 @@
  * the shadow and the changed rectangle is then copied to VRAM, because
  * reading VRAM over PCIe is slow; without one, the same code works on VRAM. */
 #include <kernel/tty.h>
+#include <kernel/posix.h>
 #include <kernel/kestrel_font.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
@@ -102,7 +103,7 @@ static void publish(const struct kestrel_tty *t, int x, int y, int w, int h)
 
 void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, uint32_t bg_color)
 {
-    if (!t || !t->active) return;
+    if (!t || !t->active || t->graphics) return;
     const unsigned char *glyph = kestrel_font[(unsigned char)c];   /* char may be signed */
     const uint32_t fg = native_color(t, fg_color);
     const uint32_t bg = native_color(t, bg_color);
@@ -152,6 +153,7 @@ static void cell_set(struct kestrel_tty *t, int cx, int cy, unsigned char ch)
  * Callers hold the lock (interrupts off). */
 static void cursor_paint(struct kestrel_tty *t)
 {
+    if (t->graphics) return;
     int cx = t->cursor_drawn_col, cy = t->cursor_drawn_row;
     if (t->index == active_keyboard_tty) { cell_draw(t, cx, cy, true); return; }
     cell_draw(t, cx, cy, false);
@@ -196,7 +198,7 @@ void tty_cursor_tick(void)
     uint64_t now = uptime_ms();
     for (int i = 0; i < tty_count; i++) {
         struct kestrel_tty *t = &system_ttys[i];
-        if (!t->active || !t->cursor_enabled || now < t->next_blink) continue;
+        if (!t->active || t->graphics || !t->cursor_enabled || now < t->next_blink) continue;
         if (!tty_trylock(t)) continue;
         t->next_blink = now + TTY_BLINK_MS;
         if (t->cursor_visible) cursor_hide(t); else cursor_show(t);
@@ -227,6 +229,7 @@ static void scroll_locked(struct kestrel_tty *t)
     const size_t row_bytes = (size_t)t->max_cols * TTY_CELL_W * (size_t)t->bytes_pp;
     const int text_h = t->max_rows * TTY_CELL_H;
 
+    if (t->graphics) goto cells;                /* a graphics client owns the pixels */
     /* Shift pixel rows 16..text_h-1 of this monitor up to 0..text_h-17. One
      * scan line per copy: source and destination never overlap, so memcpy is
      * valid, and with this TTY's own pitch and text size the copy never
@@ -236,13 +239,14 @@ static void scroll_locked(struct kestrel_tty *t)
     for (int py = text_h - TTY_CELL_H; py < text_h; py++)        /* bottom text row: black */
         memset(row_ptr(t, py), 0x00, row_bytes);
 
+cells:
     memmove(t->cells, t->cells + t->max_cols, sizeof(struct tty_cell) * (size_t)t->max_cols * (size_t)(t->max_rows - 1));
     blank_row(t, t->max_rows - 1);
 
     if (t->cursor_visible && t->cursor_drawn_row > 0) t->cursor_drawn_row--;   /* moved with the pixels */
     else t->cursor_visible = false;
     t->cursor_row = t->max_rows - 1;
-    publish(t, 0, 0, t->max_cols * TTY_CELL_W, text_h);
+    if (!t->graphics) publish(t, 0, 0, t->max_cols * TTY_CELL_W, text_h);
 }
 
 void scroll_screen(struct kestrel_tty *t)
@@ -269,9 +273,11 @@ static void put_glyph(struct kestrel_tty *t, unsigned char ch)
 
 static void clear_locked(struct kestrel_tty *t)
 {
-    for (int py = 0; py < t->native_height; py++)       /* the whole monitor, not just the text */
-        memset(row_ptr(t, py), 0x00, (size_t)t->native_width * (size_t)t->bytes_pp);
-    publish(t, 0, 0, t->native_width, t->native_height);
+    if (!t->graphics) {
+        for (int py = 0; py < t->native_height; py++)   /* the whole monitor, not just the text */
+            memset(row_ptr(t, py), 0x00, (size_t)t->native_width * (size_t)t->bytes_pp);
+        publish(t, 0, 0, t->native_width, t->native_height);
+    }
     for (int y = 0; y < t->max_rows; y++) blank_row(t, y);
     t->cursor_col = t->cursor_row = 0;
     t->cursor_visible = false;
@@ -587,4 +593,57 @@ int tty_init_all(void)
     pit_add_tick_hook(tty_cursor_tick);
     input_active = true;
     return n;
+}
+
+/* ======================================================================== */
+/*  graphics clients (/dev/fbN, the X server)                                 */
+/* ======================================================================== */
+int tty_set_graphics(int index, bool on)
+{
+    struct kestrel_tty *t = tty_get(index);
+    if (!t || !t->active) return -ENODEV;
+    if (t->bytes_pp != 4) return -EINVAL;               /* 32-bpp monitors only */
+    if (!tty_lock(t)) return -EBUSY;
+    if (on && !t->graphics) {
+        cursor_hide(t);
+        t->graphics = true;
+    } else if (!on && t->graphics) {
+        t->graphics = false;                            /* repaint the text */
+        for (int py = 0; py < t->native_height; py++)
+            memset(row_ptr(t, py), 0x00, (size_t)t->native_width * (size_t)t->bytes_pp);
+        for (int cy = 0; cy < t->max_rows; cy++)
+            for (int cx = 0; cx < t->max_cols; cx++) {
+                const struct tty_cell *k = cell_at(t, cx, cy);
+                const unsigned char *glyph = kestrel_font[k->ch];
+                const uint32_t fg = native_color(t, k->fg), bg = native_color(t, k->bg);
+                for (int row = 0; row < KFONT_HEIGHT; row++) {
+                    uint8_t *line = row_ptr(t, cy * TTY_CELL_H + row);
+                    for (int col = 0; col < KFONT_WIDTH; col++)
+                        put_px(t, line, cx * TTY_CELL_W + col, (glyph[row] & (0x80u >> col)) ? fg : bg);
+                }
+            }
+        publish(t, 0, 0, t->native_width, t->native_height);
+        t->cursor_visible = false;
+        cursor_refresh(t);
+    }
+    tty_unlock(t);
+    return 0;
+}
+
+int tty_blit(int index, int x, int y, int w, int h, const void *src, uint32_t pitch)
+{
+    struct kestrel_tty *t = tty_get(index);
+    if (!t || !t->active || t->bytes_pp != 4) return -ENODEV;
+    const uint8_t *s = src;
+    if (x < 0) { s -= x * 4; w += x; x = 0; }
+    if (y < 0) { s -= (int64_t)y * pitch; h += y; y = 0; }
+    if (x + w > t->native_width)  w = t->native_width - x;
+    if (y + h > t->native_height) h = t->native_height - y;
+    if (w <= 0 || h <= 0) return 0;
+    if (!tty_lock(t)) return -EBUSY;
+    for (int py = 0; py < h; py++)
+        memcpy(row_ptr(t, y + py) + (size_t)x * 4, s + (size_t)py * pitch, (size_t)w * 4);
+    publish(t, x, y, w, h);
+    tty_unlock(t);
+    return 0;
 }

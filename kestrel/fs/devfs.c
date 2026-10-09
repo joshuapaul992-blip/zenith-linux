@@ -1,4 +1,8 @@
 /* fs/devfs.c -- /dev character devices (major/minor numbers follow Linux) */
+#include <kernel/kfb.h>
+#include <kernel/task.h>
+#include <kernel/display.h>
+#include <kernel/uvm.h>
 #include <kernel/vfs.h>
 #include <kernel/console.h>
 #include <kernel/keyboard.h>
@@ -152,41 +156,79 @@ static ssize_t kmsg_write(struct vnode *v, const void *buf, size_t n, uint64_t o
 static uint64_t kmsg_size(struct vnode *v) { (void)v; return klog_size(); }
 static const struct vnode_ops kmsg_ops = { .read = kmsg_read, .write = kmsg_write, .size = kmsg_size };
 
-/* ---- fb0: raw pixels of the linear frame buffer ------------------------- */
-#define FBIOGET_VSCREENINFO 0x4600
-struct fb_var_screeninfo_lite { uint32_t xres, yres, bits_per_pixel, line_length; uint64_t smem_start; };
+/* ---- fbN: one per monitor, for graphics clients (see kfb.h) ------------- */
+static int fb_owner[MAX_MONITORS];          /* pid holding KD_GRAPHICS, 0 = none */
 
-static ssize_t fb_read(struct vnode *v, void *buf, size_t n, uint64_t off)
+static bool user_range_ok(uint64_t p, uint64_t len)
 {
-    (void)v;
-    uint64_t sz = fb_size_bytes();
-    if (off >= sz) return 0;
-    if (n > sz - off) n = sz - off;
-    memcpy(buf, g_fb.back + off, n);
-    return (ssize_t)n;
+    struct tcb *t = current_task();
+    return !t->user || (len && uvm_mapped(t->pml4, p, len));
 }
-static ssize_t fb_write(struct vnode *v, const void *buf, size_t n, uint64_t off)
-{
-    (void)v;
-    uint64_t sz = fb_size_bytes();
-    if (off >= sz) return -ENOSPC;
-    if (n > sz - off) n = sz - off;
-    memcpy(g_fb.back + off, buf, n);
-    int y0 = (int)(off / g_fb.pitch), y1 = (int)((off + n + g_fb.pitch - 1) / g_fb.pitch);
-    fb_flush_rect(0, y0, (int)g_fb.width, y1 - y0);
-    return (ssize_t)n;
-}
+
 static int fb_ioctl(struct vnode *v, unsigned long req, void *arg)
 {
-    (void)v;
-    if (req != FBIOGET_VSCREENINFO) return -ENOTTY;
-    struct fb_var_screeninfo_lite *si = arg;
-    si->xres = g_fb.width; si->yres = g_fb.height; si->bits_per_pixel = g_fb.bpp;
-    si->line_length = g_fb.pitch; si->smem_start = g_fb.phys;
-    return 0;
+    struct kestrel_tty *t = v->ctx;
+    int idx = t->index;
+    const struct display_head *h = display_get(idx);
+    switch (req) {
+    case KFB_GET_INFO: {
+        if (!user_range_ok((uint64_t)arg, sizeof(struct kfb_info))) return -EFAULT;
+        struct kfb_info *i = arg;
+        memset(i, 0, sizeof *i);
+        i->width = (uint32_t)t->native_width; i->height = (uint32_t)t->native_height;
+        i->pitch = (uint32_t)t->native_width * 4; i->bpp = (uint32_t)t->bytes_pp * 8;
+        i->r_pos = t->r_pos; i->g_pos = t->g_pos; i->b_pos = t->b_pos; i->index = (uint8_t)idx;
+        if (h) { strlcpy(i->name, h->name, sizeof i->name); strlcpy(i->monitor, h->monitor, sizeof i->monitor); }
+        return 0;
+    }
+    case FBIOGET_VSCREENINFO: {
+        if (!user_range_ok((uint64_t)arg, sizeof(struct fb_var_screeninfo_lite))) return -EFAULT;
+        struct fb_var_screeninfo_lite *si = arg;
+        si->xres = (uint32_t)t->native_width; si->yres = (uint32_t)t->native_height;
+        si->bits_per_pixel = (uint32_t)t->bytes_pp * 8; si->line_length = (uint32_t)t->native_width * 4;
+        si->smem_start = h ? h->phys : 0;
+        return 0;
+    }
+    case KDSETMODE: {
+        uint64_t mode = (uint64_t)arg;
+        int pid = current_task()->pid;
+        if (mode == KD_GRAPHICS) {
+            if (fb_owner[idx] && fb_owner[idx] != pid) return -EBUSY;
+            int rc = tty_set_graphics(idx, true);
+            if (rc == 0) fb_owner[idx] = pid;
+            return rc;
+        }
+        if (mode == KD_TEXT) {
+            if (fb_owner[idx] && fb_owner[idx] != pid) return -EBUSY;
+            fb_owner[idx] = 0;
+            return tty_set_graphics(idx, false);
+        }
+        return -EINVAL;
+    }
+    case KFB_BLIT: {
+        if (!user_range_ok((uint64_t)arg, sizeof(struct kfb_blit))) return -EFAULT;
+        const struct kfb_blit *b = arg;
+        if (b->w <= 0 || b->h <= 0) return 0;
+        if (b->w > 16384 || b->h > 16384 || b->src_pitch < (uint32_t)b->w * 4) return -EINVAL;
+        if (!user_range_ok(b->src, (uint64_t)(b->h - 1) * b->src_pitch + (uint64_t)b->w * 4)) return -EFAULT;
+        return tty_blit(idx, b->x, b->y, b->w, b->h, (const void *)b->src, b->src_pitch);
+    }
+    default:
+        return -ENOTTY;
+    }
 }
-static uint64_t fb_dev_size(struct vnode *v) { (void)v; return fb_size_bytes(); }
-static const struct vnode_ops fb_ops = { .read = fb_read, .write = fb_write, .ioctl = fb_ioctl, .size = fb_dev_size };
+
+/* The owner closing its last descriptor (or exiting) gives the text back. */
+static void fb_release(struct file *f)
+{
+    struct kestrel_tty *t = f->vn->ctx;
+    if (fb_owner[t->index] == current_task()->pid) {
+        fb_owner[t->index] = 0;
+        tty_set_graphics(t->index, false);
+    }
+}
+
+static const struct vnode_ops fb_ops = { .ioctl = fb_ioctl, .release = fb_release };
 
 /* ------------------------------------------------------------------------- */
 static void add_dev(struct vnode *dir, const char *name, uint32_t mode, uint32_t rdev,
@@ -237,6 +279,10 @@ void devfs_init(const char *mountpoint)
         add_tty(r, name, 0620, MKDEV(4, (uint32_t)(i + 1)), &tty_ops, tty_get(i));
     }
     add_dev(r, "ttyS0",   0660, MKDEV(4, 64), &serial_ops);
-    add_dev(r, "fb0",     0660, MKDEV(29, 0), &fb_ops);
+    for (int i = 0; i < tty_count; i++) {              /* one per monitor */
+        char name[8];
+        snprintf(name, sizeof name, "fb%d", i);
+        add_tty(r, name, 0660, MKDEV(29, (uint32_t)i), &fb_ops, tty_get(i));
+    }
     vfs_mount(m, mountpoint);
 }

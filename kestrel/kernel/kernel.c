@@ -35,6 +35,7 @@
 #include <kernel/storage.h>
 #include <kernel/usbhost.h>
 #include <kernel/tty.h>
+#include <kernel/kinput.h>
 #include <kernel/display.h>
 #include <kernel/report.h>
 #include <kernel/kush.h>
@@ -380,6 +381,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     }
     syscall_init();
     vfs_init();
+    kinput_init();                  /* /dev/kinput, for the X server */
     storage_register_devices();     /* sataN + partitions in the block layer */
     current_task()->cwd = vfs_root();
 

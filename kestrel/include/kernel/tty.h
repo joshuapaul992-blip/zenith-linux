@@ -90,6 +90,9 @@ struct kestrel_tty {
     bool      line_ready;
 
     bool      active;
+    bool      graphics;                 /* a graphics client (X) owns the pixels:
+                                           text still updates the cells, but
+                                           nothing is drawn until it lets go   */
     volatile int lock;                  /* see "Locking" above                      */
 };
 
@@ -150,4 +153,11 @@ long tty_read_line(struct kestrel_tty *t, char *buf, size_t n);
 /* Write to the calling task's TTY (the g_con redirect: /dev/tty, stdout). */
 void tty_write_current(const char *s, size_t n);
 
+/* ---- graphics clients (the X server), through /dev/fbN ------------------- */
+/* Hand monitor `index` to a graphics client (on) or give it back to the
+ * terminal (off: the text is repainted from the cell model). */
+int  tty_set_graphics(int index, bool on);
+/* Copy a w x h rectangle of 32-bpp pixels (in this monitor's format) from
+ * `src` (pitch bytes per row) to (x, y) and show it. Clipped. */
+int  tty_blit(int index, int x, int y, int w, int h, const void *src, uint32_t pitch);
 #endif

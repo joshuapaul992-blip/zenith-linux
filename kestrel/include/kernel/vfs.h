@@ -38,6 +38,7 @@ struct vnode_ops {
     ssize_t (*fwrite)(struct file *f, const void *buf, size_t len);
     int     (*poll)(struct file *f, int events);   /* ready POLL* bits     */
     void    (*release)(struct file *f);            /* last close of f      */
+    int     (*fioctl)(struct file *f, unsigned long req, void *arg);  /* preferred over ioctl */
 };
 
 /* poll(2) bits */

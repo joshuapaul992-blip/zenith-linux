@@ -1,0 +1,42 @@
+--- a/Xext/xkeyboard/ddxLoad.c	2026-10-09 23:13:10.063134035 +0000
++++ b/Xext/xkeyboard/ddxLoad.c	2026-10-09 23:13:10.145304345 +0000
+@@ -133,6 +133,39 @@
+ 
+     snprintf(keymap, sizeof(keymap), "server-%s", display);
+ 
++#ifdef KESTREL_OS
++    /* Kestrel cannot start processes yet, so xkbcomp cannot run: use the
++     * keymap compiled for the default rules/model/layout when the system was
++     * built (<xkb_dir>/compiled/kestrel-default.xkm), copied to where the
++     * caller expects the compiler's output. The requested names are not
++     * honoured until xkbcomp (or an in-server compiler) runs on Kestrel. */
++    {
++        char src[PATH_MAX], dst[PATH_MAX], chunk[4096];
++        FILE *in, *outf;
++        size_t n;
++        int ok = 1;
++
++        (void) callback; (void) userdata;
++        OutputDirectory(xkm_output_dir, sizeof(xkm_output_dir));
++        snprintf(src, sizeof(src), "%s/compiled/kestrel-default.xkm", XkbBaseDirectory);
++        snprintf(dst, sizeof(dst), "%s%s.xkm", xkm_output_dir, keymap);
++        in = fopen(src, "rb");
++        outf = in ? fopen(dst, "wb") : NULL;
++        if (!in || !outf) {
++            LogMessage(X_ERROR, "XKB: no precompiled keymap (%s -> %s)\n", src, dst);
++            if (in) fclose(in);
++            return NULL;
++        }
++        while ((n = fread(chunk, 1, sizeof(chunk), in)) > 0)
++            if (fwrite(chunk, 1, n, outf) != n) ok = 0;
++        fclose(in);
++        if (fclose(outf) != 0) ok = 0;
++        if (!ok) return NULL;
++        LogMessage(X_INFO, "XKB: using the precompiled keymap %s\n", src);
++        return strdup(keymap);
++    }
++#endif
++
+     OutputDirectory(xkm_output_dir, sizeof(xkm_output_dir));
+ 
+ #ifdef WIN32

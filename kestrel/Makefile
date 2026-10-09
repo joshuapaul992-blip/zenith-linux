@@ -9,6 +9,7 @@
 #  make run-floppy   boot the floppy image in QEMU
 #  make usbimg       64 MiB USB stick image with GRUB + a Kestrel boot volume
 #  make run-usb      boot the stick from a QEMU xHCI port (kestrel.root=usb)
+#  make xlibre       build the X server for Kestrel (see ports/xlibre/build.sh)
 #  make debug        QEMU halted with a gdb stub on :1234
 #  make check        verify the Multiboot2 header with grub-file
 #  make fonts        regenerate drivers/font_*.c from the BDF sources
@@ -63,7 +64,7 @@ ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm
 C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c \
-           drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c \
+           drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
@@ -93,7 +94,7 @@ QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
 #   make iso KERNEL_CMDLINE="ahci.selftest=rw ahci.verify=5"
 KERNEL_CMDLINE ?=
 
-.PHONY: FORCE all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
+.PHONY: FORCE xlibre all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
 
 all: $(KERNEL)
 
@@ -184,12 +185,25 @@ $(BUILD)/user/hello: $(BUILD)/user/%: user/%.c
 	@echo "  USERCC  $<"
 	@$(USER_CC) $(USER_CFLAGS) $< -o $@
 
+# ---- X11 (ports/xlibre): optional, built by `make xlibre` ------------------
+#   make xlibre XLIBRE_SRC=<xserver checkout> XLIBRE_DEPS=<library tarballs>
+# installs into $(XLIBRE_ROOT); the rootfs staging below picks it up whenever
+# it exists (Xkestrel, xdemo, the precompiled keymap).
+XLIBRE_SRC  ?=
+XLIBRE_DEPS ?=
+XLIBRE_ROOT := $(BUILD)/xlibre-root
+xlibre:
+	@test -n "$(XLIBRE_SRC)" -a -n "$(XLIBRE_DEPS)" || \
+	    { echo "usage: make xlibre XLIBRE_SRC=<xserver checkout> XLIBRE_DEPS=<tarball dir>"; exit 1; }
+	@ports/xlibre/build.sh $(XLIBRE_SRC) $(XLIBRE_DEPS) $(BUILD)
+
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS)
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(wildcard $(XLIBRE_ROOT)/.stamp)
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
+	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi
 	@touch $@
 
 USBIMG := $(BUILD)/kestrel-usb.img

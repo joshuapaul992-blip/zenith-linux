@@ -1,0 +1,22 @@
+# meson cross file for XLibre on Kestrel (musl, Linux syscall ABI).
+# @SYSROOT@ is replaced by ports/xlibre/build-xserver.sh.
+[binaries]
+c = 'musl-gcc'
+ar = 'ar'
+strip = 'strip'
+pkg-config = 'pkg-config'
+
+[properties]
+pkg_config_libdir = ['@SYSROOT@/lib/pkgconfig', '@SYSROOT@/share/pkgconfig']
+sys_root = ''
+
+[built-in options]
+c_args = ['-I@SYSROOT@/include', '-fPIE', '-g', '-O2', '-DKESTREL_OS']
+c_link_args = ['-L@SYSROOT@/lib', '-static-pie']
+default_library = 'static'
+
+[host_machine]
+system = 'linux'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

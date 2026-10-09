@@ -479,6 +479,7 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
 
 int vfs_ioctl(struct file *f, unsigned long req, void *arg)
 {
+    if (f->vn->ops && f->vn->ops->fioctl) return f->vn->ops->fioctl(f, req, arg);
     if (!f->vn->ops || !f->vn->ops->ioctl) return -ENOTTY;
     return f->vn->ops->ioctl(f->vn, req, arg);
 }

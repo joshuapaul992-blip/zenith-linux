@@ -1453,6 +1453,10 @@ static void keyboard_report(struct usb_dev *d, struct hid_if *h, const uint8_t *
     if (rep[2] == HID_KEY_ERR_ROLLOVER) return;         /* too many keys: keep old state */
     uint8_t mods = rep[0];
 
+    for (int b = 0; b < 8; b++)                           /* modifier keys, as usages E0..E7 */
+        if ((mods ^ h->prev[0]) & (1u << b))
+            emit_key(d, (uint8_t)(0xE0 + b), mods, (mods >> b) & 1, false);
+
     for (int i = 2; i < 8; i++)                           /* releases */
         if (h->prev[i] > 3 && !in_report(rep + 2, h->prev[i])) {
             emit_key(d, h->prev[i], mods, false, false);
