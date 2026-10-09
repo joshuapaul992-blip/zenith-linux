@@ -43,6 +43,7 @@ struct tcb {
     void     *wait_chan;
     uint64_t  cpu_ticks, switches, start_tick;
     int       exit_code;
+    int       waiters;          /* task_wait() callers: not reaped yet   */
 
     /* POSIX process state */
     struct file  *fds[MAX_FDS];
@@ -50,6 +51,15 @@ struct tcb {
     uint32_t  uid, gid;
     uint32_t  umask;
     int       tty;              /* system_ttys[] index: /dev/tty, stdin/stdout */
+
+    /* user process (ring 3); all zero for kernel threads */
+    bool      user;
+    uint64_t  pml4;             /* own address space (uvm.h), 0 = kernel's */
+    uint64_t  brk_start, brk;   /* program break                          */
+    uint64_t  mmap_next;        /* next free address in the mmap region    */
+    uint64_t  fs_base;          /* TLS pointer (arch_prctl ARCH_SET_FS)    */
+    uint64_t  tid_address;      /* set_tid_address()                       */
+    uint8_t   fpu[512] __attribute__((aligned(16)));    /* fxsave area     */
 };
 
 void        sched_init(void);
@@ -67,6 +77,7 @@ void        sched_idle_loop(void) __attribute__((noreturn));
 void        sleep_on(void *chan);       /* call with interrupts disabled */
 void        wakeup(void *chan);
 void        task_sleep_ms(uint64_t ms);
+int         task_wait(int pid);         /* exit status, or -ECHILD        */
 
 int         task_snapshot(struct tcb *out, int max);
 const char *task_state_name(enum task_state s);

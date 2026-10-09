@@ -538,12 +538,32 @@ include/kernel/usyscall.h    int 0x80 wrappers used by init
 The calling convention is the Linux x86_64 one: the call number goes in `rax`, the arguments in `rdi rsi rdx r10 r8 r9`, and the result (a negative errno on failure) comes back in `rax`.
 
 Calls can enter through two paths:
-- `int $0x80` works today.
-- `syscall` is wired through `IA32_STAR/LSTAR/FMASK` and is ready for ring 3.
+- `int $0x80`, used by the in-kernel shell and tools.
+- `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, open, close, stat, fstat, lseek, ioctl, sched_yield, nanosleep, getpid, getppid, getuid, getgid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, chown, utimensat, getdents64, clock_gettime (`CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the HPET), reboot.
+**Implemented:** read, write, readv, writev, open, close, stat, fstat, lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getuid, getgid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, chown, utimensat, getdents64, clock_gettime (`CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the HPET), reboot.
 
-**Stubs returning `-ENOSYS`:** mmap, brk, fork, execve, wait4, kill, gettimeofday.
+**Accepted but inert (no signals yet):** rt_sigaction, rt_sigprocmask.
+
+**Stubs returning `-ENOSYS`:** fork, execve, wait4, kill, gettimeofday.
+
+`cat /proc/syscalls` lists every call with its status and call count.
+
+## User programs (ring 3)
+
+Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm/uvm.c`):
+- **Address spaces:** each process has its own PML4. The kernel half (`PML4[0..127]`, 0–64 TiB, which holds the identity map and all MMIO) shares its page tables with every process and is supervisor-only. The user half is `0x4000_0000_0000`–`0x7fff_ffff_ffff`: static-PIE images load at its start, anonymous `mmap` grows from `0x6000_0000_0000`, and a 1 MiB stack ends at `0x7fff_ff00_0000`.
+- **Programs:** ET_EXEC linked inside the user half, or ET_DYN (static-PIE) loaded at the image base. Programs that need a dynamic linker are refused.
+- **Start-up:** the initial stack follows the System V / Linux layout (argc, argv, envp, and auxv with `AT_PHDR`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM` and more), so a musl `crt1` starts unchanged.
+- **Per-process state:** SSE state (`fxsave`) and the TLS base (`FS_BASE`) are switched with the process. Faults in ring 3 kill the process with status 128 + signal; the kernel keeps running.
+- **Pointers:** user pointers passed to `read`/`write`/`readv`/`writev` and the memory calls must lie in mapped user memory, otherwise the call returns `-EFAULT`.
+
+`user/hello.c` is a freestanding self-test of all of this, installed as `/boot/bin/hello` on the USB stick:
+- From the shell: `run hello` (bare names are looked up in `/boot/bin`).
+- Unattended: boot with `kestrel.exec=/boot/bin/hello,arg1,arg2`. Output goes to the kernel log (serial and `REPORT.TXT`), followed by the exit status: 42 means every check passed.
+- Fault isolation: `hello crash` writes to kernel memory and must end with "killed (signal 11)".
+
+Not done yet: W^X page permissions, file-backed `mmap`, fork/execve, signals, threads, and a libc port. These are the next steps of the XLibre port.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -560,7 +580,7 @@ Calls can enter through two paths:
 
 The structure is laid out for these, in order:
 
-1. **User mode:** per-process PML4 (`tcb.cr3` exists), an ELF64 loader, `iretq`/`sysretq` to ring 3, and `copy_from_user` in `syscall.c`'s `bad_ptr()`.
+1. **User mode:** done (see "User programs"). Still missing: W^X and a fault-safe `copy_from_user`.
 2. **fork/execve/wait4** on top of that.
 3. **Signals.**
 4. **A real libc port** (musl, newlib). The ABI types are already Linux-compatible.

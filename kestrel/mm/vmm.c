@@ -8,11 +8,20 @@
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
 #include <kernel/klog.h>
+#include <kernel/uvm.h>
 
 #define PTE_PRESENT 0x001
 #define PTE_WRITE   0x002
 #define PTE_HUGE    0x080
 #define ADDR_MASK   0x000FFFFFFFFFF000ull
+
+/* Always edit the kernel's tables, whichever process' CR3 is loaded: the
+ * PDPTs under PML4[0..127] are shared by every address space (uvm.c). */
+static uint64_t *kpml4(void)
+{
+    uint64_t k = uvm_kernel_pml4();
+    return (uint64_t *)(k ? k : (read_cr3() & ADDR_MASK));
+}
 
 static uint64_t *table_for(uint64_t *parent, int idx)
 {
@@ -27,7 +36,7 @@ static uint64_t *table_for(uint64_t *parent, int idx)
 bool vmm_set_uncached(uint64_t phys, uint64_t size)
 {
     if (!vmm_identity_map(phys, size, VMM_WRITE | VMM_PCD | VMM_PWT)) return false;
-    uint64_t *pml4 = (uint64_t *)(read_cr3() & ADDR_MASK);
+    uint64_t *pml4 = kpml4();
     for (uint64_t a = phys & ~0x1FFFFFull; a < phys + size; a += 0x200000) {
         uint64_t *pdpt = (uint64_t *)(pml4[(a >> 39) & 511] & ADDR_MASK);
         uint64_t *pd = (uint64_t *)(pdpt[(a >> 30) & 511] & ADDR_MASK);
@@ -42,7 +51,7 @@ bool vmm_set_uncached(uint64_t phys, uint64_t size)
 
 bool vmm_identity_map(uint64_t phys, uint64_t size, uint64_t flags)
 {
-    uint64_t *pml4 = (uint64_t *)(read_cr3() & ADDR_MASK);
+    uint64_t *pml4 = kpml4();
     uint64_t start = phys & ~0x1FFFFFull;
     uint64_t end = (phys + size + 0x1FFFFF) & ~0x1FFFFFull;
 

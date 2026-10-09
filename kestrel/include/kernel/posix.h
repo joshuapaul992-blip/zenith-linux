@@ -21,6 +21,7 @@ typedef uint32_t gid_t;
 #define EINTR         4
 #define EIO           5
 #define EBADF         9
+#define ENOEXEC       8
 #define ECHILD       10
 #define EAGAIN       11
 #define ENOMEM       12

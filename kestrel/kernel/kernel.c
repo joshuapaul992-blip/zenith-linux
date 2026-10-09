@@ -13,6 +13,8 @@
  *                               per monitor, kernel worker threads
  *   Phase 4  idle               pid 0 halts until there is work
  */
+#include <kernel/exec.h>
+#include <kernel/uvm.h>
 #include <kernel/cpu.h>
 #include <kernel/arch.h>
 #include <kernel/multiboot2.h>
@@ -218,6 +220,14 @@ static int shell_main(void *arg)
     kush_main();
 }
 
+static int exec_waiter(void *arg)
+{
+    int pid = (int)(intptr_t)arg;
+    int st = exec_wait(pid);
+    kprintf("kestrel.exec: process %d finished with status %d%s\n", pid, st, st >= 128 ? " (killed)" : "");
+    return 0;
+}
+
 static int init_main(void *arg)
 {
     (void)arg;
@@ -333,6 +343,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     pic_init();
     pit_init(PIT_HZ);
     keyboard_init();
+    uvm_init();                 /* shared kernel PDPTs, before any address space */
     sched_init();
     sti();
     kprintf("arch: interrupts enabled, PIT at %d Hz\n", PIT_HZ);
@@ -381,6 +392,22 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
      * to the stick's "KESTREL RPT" volume, if there is one. */
     if (!strstr(g_boot.cmdline, "kestrel.report=0") && report_locate())
         report_save("written at boot");
+
+    /* kestrel.exec=/boot/bin/prog[,arg...]: run a ring-3 program at boot and
+     * log its exit status (automated tests; no keyboard needed). */
+    const char *ex = strstr(g_boot.cmdline, "kestrel.exec=");
+    if (ex) {
+        static char line[160];
+        char *args[EXEC_MAX_ARGS];
+        int n = 0;
+        size_t i = 0;
+        for (ex += 13; *ex && *ex != ' ' && i + 1 < sizeof line; ex++) line[i++] = *ex == ',' ? 0 : *ex;
+        line[i] = 0;
+        for (size_t k = 0; k < i && n < EXEC_MAX_ARGS; k += strlen(line + k) + 1) args[n++] = line + k;
+        int pid = n ? exec_spawn_io(args[0], n, args, "/dev/kmsg") : -EINVAL;   /* output into the log */
+        if (pid < 0) kprintf("kestrel.exec: %s: cannot start (%d)\n", n ? args[0] : "", pid);
+        else task_create("exec-wait", exec_waiter, (void *)(intptr_t)pid);
+    }
 
     if (!task_create("init", init_main, NULL)) panic("cannot start init");
     if (!(ch.flags & BOOTOPT_SAFE_MODE)) {

@@ -1,4 +1,5 @@
 /* arch/x86_64/idt.c -- IDT setup and the central interrupt dispatcher */
+#include <kernel/task.h>
 #include <kernel/arch.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
@@ -60,8 +61,26 @@ static const char *const exc_names[32] = {
     "VMM Communication", "Security", "Reserved",
 };
 
+/* A fault in ring 3 kills the process, not the kernel. Exit status is
+ * 128 + the signal Linux would deliver (SIGSEGV 11, SIGILL 4, SIGFPE 8,
+ * SIGBUS 7, SIGTRAP 5). */
+static void user_fault(struct int_frame *f)
+{
+    static const uint8_t sig[32] = { 8, 5, 0, 5, 11, 11, 4, 4, 0, 0, 0, 7, 7, 11, 11, 0, 8, 7, 0, 8 };
+    struct tcb *t = current_task();
+    int s = sig[f->vector] ? sig[f->vector] : 11;
+    kprintf("\nprocess %d (%s): %s at RIP=%016lx", t->pid, t->name, exc_names[f->vector], f->rip);
+    if (f->vector == 14)
+        kprintf(", address %016lx (%s, %s)", read_cr2(), (f->error & 1) ? "protection" : "not present",
+                (f->error & 2) ? "write" : "read");
+    kprintf(", RSP=%016lx: killed (signal %d)\n", f->rsp, s);
+    sti();
+    task_exit(128 + s);
+}
+
 static void exception(struct int_frame *f)
 {
+    if ((f->cs & 3) == 3) { user_fault(f); return; }
     kprintf("\n=== CPU EXCEPTION %lu: %s ===\n", f->vector, exc_names[f->vector]);
     kprintf(" RIP=%016lx  CS=%04lx  RFLAGS=%016lx  ERR=%lx\n", f->rip, f->cs, f->rflags, f->error);
     kprintf(" RAX=%016lx RBX=%016lx RCX=%016lx RDX=%016lx\n", f->rax, f->rbx, f->rcx, f->rdx);

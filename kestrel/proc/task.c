@@ -12,6 +12,7 @@
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/vfs.h>
+#include <kernel/uvm.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp);
 extern void thread_trampoline(void);
@@ -60,8 +61,9 @@ static void reap_zombies(void)
 {
     for (int i = 1; i < MAX_TASKS; i++) {
         struct tcb *t = &tasks[i];
-        if (t->state != TASK_ZOMBIE || t == cur) continue;
+        if (t->state != TASK_ZOMBIE || t == cur || t->waiters) continue;
         for (int fd = 0; fd < MAX_FDS; fd++) if (t->fds[fd]) vfs_close(t->fds[fd]);
+        if (t->pml4) { uvm_destroy(t->pml4); t->pml4 = 0; }
         kfree(t->kstack);
         t->state = TASK_UNUSED;
     }
@@ -136,6 +138,16 @@ void schedule(void)
     uint64_t ktop = ((uintptr_t)next->kstack + next->kstack_size) & ~0xFull;
     tss_set_kernel_stack(ktop);
     syscall_kernel_rsp = ktop;
+    /* user processes own SSE state (the kernel is built without SSE) and a
+     * TLS base; kernel threads never touch either */
+    if (prev->user) {
+        __asm__ volatile("fxsave %0" : "=m"(prev->fpu));
+        prev->fs_base = rdmsr(MSR_FS_BASE);
+    }
+    if (next->user) {
+        __asm__ volatile("fxrstor %0" :: "m"(next->fpu));
+        wrmsr(MSR_FS_BASE, next->fs_base);
+    }
     if (next->cr3 != prev->cr3) write_cr3(next->cr3);
     context_switch(&prev->rsp, next->rsp);
 }
@@ -205,6 +217,21 @@ void task_exit(int code)
     wakeup(cur);                                /* anyone waiting on us */
     schedule();
     panic("zombie task %d was rescheduled", cur->pid);
+}
+
+int task_wait(int pid)
+{
+    uint64_t f = irq_save();
+    struct tcb *t = NULL;
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid) { t = &tasks[i]; break; }
+    if (!t || t == cur) { irq_restore(f); return -ECHILD; }
+    t->waiters++;
+    while (t->state != TASK_ZOMBIE) sleep_on(t);
+    int code = t->exit_code;
+    t->waiters--;
+    irq_restore(f);
+    return code;
 }
 
 void sched_idle_loop(void)

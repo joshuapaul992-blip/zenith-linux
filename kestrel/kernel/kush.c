@@ -14,6 +14,7 @@
  *   REPL      prompt "kestrel:/# ", read a line, split into words, run the
  *             matching built-in, repeat.
  */
+#include <kernel/exec.h>
 #include <kernel/kush.h>
 #include <kernel/recovery.h>
 #include <kernel/tty.h>
@@ -271,6 +272,22 @@ static int cmd_gpu(struct kush_session *sh, int argc, char **argv)
     return 0;
 }
 
+/* run PROGRAM [ARGS...]: start a ring-3 ELF program on this terminal and
+ * wait for it. A bare name is looked up in /boot/bin (the boot volume). */
+static int cmd_run(struct kush_session *sh, int argc, char **argv)
+{
+    if (argc < 2) { tty_puts(sh->tty, "usage: run PROGRAM [ARGS...]\n"); return 2; }
+    char path[128];
+    if (strchr(argv[1], '/')) strlcpy(path, argv[1], sizeof path);
+    else snprintf(path, sizeof path, "/boot/bin/%s", argv[1]);
+    int pid = exec_spawn(path, argc - 1, argv + 1);
+    if (pid < 0) { tty_printf(sh->tty, "run: %s: %s\n", path, pid == -ENOENT ? "not found" : "cannot start"); return 127; }
+    int st = exec_wait(pid);
+    if (st >= 128) tty_printf(sh->tty, "[%s: process %d killed by signal %d]\n", argv[1], pid, st - 128);
+    else if (st) tty_printf(sh->tty, "[%s: exit status %d]\n", argv[1], st);
+    return st;
+}
+
 static int cmd_reboot(struct kush_session *sh, int argc, char **argv)
 {
     (void)argc;
@@ -295,6 +312,7 @@ static const struct kush_cmd commands[] = {
     { "log",      "",       "recent kernel messages",                          cmd_log },
     { "report",   "",       "write REPORT.TXT + VBIOS.ROM to the boot stick",  cmd_report },
     { "gpu",      "",       "NVIDIA GPU: chip, VBIOS tables, outputs, monitors", cmd_gpu },
+    { "run",      "PROG",   "run a ring-3 program (from /boot/bin)",           cmd_run },
     { "font",     "",       "show all 256 glyphs of kestrel_font",             cmd_font },
     { "reboot",   "",       "restart the machine",                             cmd_reboot },
     { "poweroff", "",       "power off (emulators) or halt",                   cmd_reboot },

@@ -56,6 +56,7 @@ static inline uint64_t rdtsc(void) {
 #define MSR_STAR    0xC0000081
 #define MSR_LSTAR   0xC0000082
 #define MSR_FMASK   0xC0000084
+#define MSR_FS_BASE 0xC0000100
 #define MSR_GS_BASE 0xC0000101
 
 __attribute__((noreturn)) static inline void cpu_halt_forever(void) {

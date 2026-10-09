@@ -14,6 +14,7 @@
 #include <kernel/bootinfo.h>
 #include <kernel/time.h>
 #include <kernel/storage.h>
+#include <kernel/uvm.h>
 
 extern void syscall_entry(void);
 
@@ -23,7 +24,20 @@ static uint64_t counts[SYS_MAX];
 
 /* Minimal pointer validation. With per-process page tables this becomes
  * copy_from_user()/copy_to_user() with a fault-fixup table. */
-static int bad_ptr(uint64_t p) { return p < 4096; }
+static int bad_ptr(uint64_t p)
+{
+    struct tcb *t = current_task();
+    if (p < 4096) return 1;
+    return t->user && !uvm_mapped(t->pml4, p, 1);
+}
+
+/* [p, p+len) must be mapped user memory for a user process. */
+static int bad_buf(uint64_t p, uint64_t len)
+{
+    struct tcb *t = current_task();
+    if (p < 4096) return 1;
+    return t->user && len && !uvm_mapped(t->pml4, p, len);
+}
 
 static struct file **fd_slot(int fd)
 {
@@ -38,7 +52,7 @@ static int64_t sys_read(uint64_t fd, uint64_t buf, uint64_t len, uint64_t a4, ui
     (void)a4; (void)a5; (void)a6;
     struct file **f = fd_slot((int)fd);
     if (!f) return -EBADF;
-    if (bad_ptr(buf)) return -EFAULT;
+    if (bad_buf(buf, len)) return -EFAULT;
     return vfs_read(*f, (void *)buf, len);
 }
 
@@ -47,7 +61,7 @@ static int64_t sys_write(uint64_t fd, uint64_t buf, uint64_t len, uint64_t a4, u
     (void)a4; (void)a5; (void)a6;
     struct file **f = fd_slot((int)fd);
     if (!f) return -EBADF;
-    if (bad_ptr(buf)) return -EFAULT;
+    if (bad_buf(buf, len)) return -EFAULT;
     return vfs_write(*f, (const void *)buf, len);
 }
 
@@ -279,6 +293,153 @@ static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, u
     return -EINVAL;
 }
 
+/* ---- user memory (ring-3 processes only) ------------------------------- */
+#define PROT_WRITE      0x2
+#define MAP_PRIVATE     0x02
+#define MAP_FIXED       0x10
+#define MAP_ANONYMOUS   0x20
+#define MAP_FAILED_VAL  ((uint64_t)-1)
+
+static uint64_t pg_up(uint64_t a) { return (a + UVM_PAGE - 1) & ~(UVM_PAGE - 1); }
+
+static int64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    if (!t->user) return -ENOSYS;
+    if (!addr || addr < t->brk_start || addr >= UVM_MMAP_BASE) return (int64_t)t->brk;
+    if (pg_up(addr) > pg_up(t->brk)) {
+        if (!uvm_map(t->pml4, pg_up(t->brk), pg_up(addr) - pg_up(t->brk), UVM_W)) return (int64_t)t->brk;
+    } else if (pg_up(addr) < pg_up(t->brk)) {
+        uvm_unmap(t->pml4, pg_up(addr), pg_up(t->brk) - pg_up(addr));
+    }
+    t->brk = addr;
+    return (int64_t)t->brk;
+}
+
+/* Anonymous private memory only for now; file mappings come with the
+ * X server's needs (fonts are read(), not mmap()ed, in our build). */
+static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t off)
+{
+    (void)prot; (void)off;
+    struct tcb *t = current_task();
+    if (!t->user) return -ENOSYS;
+    if (!len) return -EINVAL;
+    if (!(flags & MAP_ANONYMOUS) || (int)fd != -1) return -ENODEV;
+    len = pg_up(len);
+    uint64_t va;
+    if (flags & MAP_FIXED) {
+        if (addr & (UVM_PAGE - 1) || !uvm_range_ok(addr, len)) return -EINVAL;
+        uvm_unmap(t->pml4, addr, len);                  /* fresh zero pages */
+        va = addr;
+    } else {
+        va = t->mmap_next;
+        if (!uvm_range_ok(va, len + UVM_PAGE) || va + len + UVM_PAGE > UVM_STACK_TOP - UVM_STACK_SIZE) return -ENOMEM;
+        t->mmap_next = va + len + UVM_PAGE;             /* + one unmapped guard page */
+    }
+    if (!uvm_map(t->pml4, va, len, UVM_W)) { uvm_unmap(t->pml4, va, len); return -ENOMEM; }
+    return (int64_t)va;
+}
+
+static int64_t sys_munmap(uint64_t addr, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    if (!t->user) return -ENOSYS;
+    if (addr & (UVM_PAGE - 1) || !len || !uvm_range_ok(addr, pg_up(len))) return -EINVAL;
+    uvm_unmap(t->pml4, addr, pg_up(len));
+    return 0;
+}
+
+/* Accepted and ignored until W^X is enforced: every user page is RW. */
+static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)prot; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    if (!t->user) return -ENOSYS;
+    if (addr & (UVM_PAGE - 1) || !uvm_range_ok(addr, pg_up(len))) return -EINVAL;
+    return uvm_mapped(t->pml4, addr, pg_up(len)) ? 0 : -ENOMEM;
+}
+
+static int64_t sys_madvise(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return 0; }
+
+#define ARCH_SET_FS 0x1002
+#define ARCH_GET_FS 0x1003
+
+static int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    if (!t->user) return -ENOSYS;
+    switch (code) {
+    case ARCH_SET_FS:
+        if (addr >= UVM_USER_END) return -EPERM;        /* must stay canonical, user half */
+        t->fs_base = addr;
+        wrmsr(MSR_FS_BASE, addr);
+        return 0;
+    case ARCH_GET_FS:
+        if (bad_buf(addr, 8)) return -EFAULT;
+        *(uint64_t *)addr = t->fs_base;
+        return 0;
+    default:
+        return -EINVAL;
+    }
+}
+
+static int64_t sys_set_tid_address(uint64_t ptr, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    current_task()->tid_address = ptr;
+    return current_task()->pid;                         /* one thread per process: tid = pid */
+}
+
+static int64_t sys_gettid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return current_task()->pid; }
+
+/* No signals yet: handlers are accepted and never invoked, masks are empty. */
+static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t old, uint64_t size, uint64_t a5, uint64_t a6)
+{
+    (void)act; (void)a5; (void)a6;
+    if (sig < 1 || sig > 64) return -EINVAL;
+    if (old) { if (bad_buf(old, size + 24)) return -EFAULT; memset((void *)old, 0, size + 24); }
+    return 0;
+}
+
+static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t old, uint64_t size, uint64_t a5, uint64_t a6)
+{
+    (void)how; (void)set; (void)a5; (void)a6;
+    if (old) { if (bad_buf(old, size)) return -EFAULT; memset((void *)old, 0, size); }
+    return 0;
+}
+
+struct iovec { uint64_t base, len; };
+
+static int64_t rw_vec(uint64_t fd, uint64_t iov, uint64_t cnt, bool wr)
+{
+    struct file **f = fd_slot((int)fd);
+    if (!f) return -EBADF;
+    if (cnt > 1024) return -EINVAL;
+    if (cnt && bad_buf(iov, cnt * sizeof(struct iovec))) return -EFAULT;
+    const struct iovec *v = (const struct iovec *)iov;
+    int64_t total = 0;
+    for (uint64_t i = 0; i < cnt; i++) {
+        if (!v[i].len) continue;
+        if (bad_buf(v[i].base, v[i].len)) return total ? total : -EFAULT;
+        ssize_t n = wr ? vfs_write(*f, (const void *)v[i].base, v[i].len) : vfs_read(*f, (void *)v[i].base, v[i].len);
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint64_t)n < v[i].len) break;
+    }
+    return total;
+}
+
+static int64_t sys_readv(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return rw_vec(fd, iov, cnt, false); }
+
+static int64_t sys_writev(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return rw_vec(fd, iov, cnt, true); }
+
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -304,7 +465,14 @@ void syscall_init(void)
     REG(SYS_clock_gettime, sys_clock_gettime);
     REG(SYS_reboot, sys_reboot);
     /* placeholders: need user address spaces / signals */
-    REG(SYS_mmap, sys_enosys);         REG(SYS_brk, sys_enosys);
+    REG(SYS_mmap, sys_mmap);           REG(SYS_brk, sys_brk);
+    REG(SYS_munmap, sys_munmap);       REG(SYS_mprotect, sys_mprotect);
+    REG(SYS_madvise, sys_madvise);     REG(SYS_arch_prctl, sys_arch_prctl);
+    REG(SYS_set_tid_address, sys_set_tid_address);
+    REG(SYS_gettid, sys_gettid);
+    REG(SYS_rt_sigaction, sys_rt_sigaction);
+    REG(SYS_rt_sigprocmask, sys_rt_sigprocmask);
+    REG(SYS_readv, sys_readv);         REG(SYS_writev, sys_writev);
     REG(SYS_fork, sys_enosys);         REG(SYS_execve, sys_enosys);
     REG(SYS_wait4, sys_enosys);        REG(SYS_kill, sys_enosys);
     REG(SYS_gettimeofday, sys_enosys);

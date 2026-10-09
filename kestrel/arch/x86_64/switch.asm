@@ -53,3 +53,39 @@ thread_trampoline:
 .spin:
     hlt
     jmp     .spin
+
+; -----------------------------------------------------------------------------
+; void enter_user(uint64_t rip, uint64_t rsp)   -- noreturn
+;
+; First entry of a user process into ring 3 (proc/exec.c). Builds an iretq
+; frame (SS=user data, CS=user code, IF set) and clears every general
+; register so no kernel value leaks into the process. FS base (TLS) is a
+; per-task MSR value restored by the scheduler, so FS itself is not loaded.
+; -----------------------------------------------------------------------------
+global enter_user
+enter_user:
+    cli
+    mov     ax, 0x1B                    ; user data | RPL3
+    mov     ds, ax
+    mov     es, ax
+    push    0x1B                        ; ss
+    push    rsi                         ; rsp
+    push    0x202                       ; rflags: IF
+    push    0x23                        ; cs: user code | RPL3
+    push    rdi                         ; rip
+    xor     eax, eax
+    xor     ebx, ebx
+    xor     ecx, ecx
+    xor     edx, edx
+    xor     esi, esi
+    xor     edi, edi
+    xor     ebp, ebp
+    xor     r8d, r8d
+    xor     r9d, r9d
+    xor     r10d, r10d
+    xor     r11d, r11d
+    xor     r12d, r12d
+    xor     r13d, r13d
+    xor     r14d, r14d
+    xor     r15d, r15d
+    iretq

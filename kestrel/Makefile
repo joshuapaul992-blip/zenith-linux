@@ -76,8 +76,8 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            kernel/coreutils/ls.c kernel/coreutils/fileops.c kernel/coreutils/copy.c \
            kernel/coreutils/text.c kernel/coreutils/perms.c kernel/coreutils/sysinfo.c \
            kernel/coreutils/neofetch.c \
-           mm/pmm.c mm/heap.c mm/vmm.c \
-           proc/task.c \
+           mm/pmm.c mm/heap.c mm/vmm.c mm/uvm.c \
+           proc/task.c proc/exec.c \
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
            lib/string.c lib/printf.c
@@ -162,9 +162,29 @@ floppy: $(FLOPPY)
 #      For UEFI machines an EFI System Partition holds EFI/BOOT/BOOTX64.EFI
 #      (GRUB x86_64-efi with the same memdisk), when GRUB's EFI files and
 #      mtools are installed. A FAT volume "KESTREL RPT" receives REPORT.TXT.
+# ---- ring-3 programs (user/), installed into the boot volume's /bin -------
+# Freestanding static-PIE for now; musl-linked programs come next.
+USER_CC     ?= $(HOSTCC)
+USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-protector \
+               -fno-asynchronous-unwind-tables -nostdlib -static-pie -Wl,--no-dynamic-linker
+USER_PROGS  := $(BUILD)/user/hello
+
+$(BUILD)/user/%: user/%.c
+	@mkdir -p $(dir $@)
+	@echo "  USERCC  $<"
+	@$(USER_CC) $(USER_CFLAGS) $< -o $@
+
+ROOTFS_STAGE := $(BUILD)/rootfs
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS)
+	@rm -rf $(ROOTFS_STAGE)
+	@mkdir -p $(ROOTFS_STAGE)/bin
+	@cp -r rootfs/. $(ROOTFS_STAGE)/
+	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
+	@touch $@
+
 USBIMG := $(BUILD)/kestrel-usb.img
 USBIMG_FLAGS ?=
-$(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(shell find rootfs -type f) $(BUILD)/cmdline.stamp
+$(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).stamp $(BUILD)/cmdline.stamp
 	@test -n "$(GRUB_MKIMAGE)" || { echo "error: grub-mkimage not found"; exit 1; }
 	@rm -rf $(BUILD)/usbdir
 	@mkdir -p $(BUILD)/usbdir/boot/grub
@@ -187,7 +207,7 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(shell find roo
 	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BUILD)/usb-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI; \
 	else echo "  (no GRUB x86_64-efi files or mtools: BIOS-only stick)"; fi
 	@echo "  USBIMG  $@"
-	@$(PYTHON) tools/mkusbimg.py $@ --rootfs rootfs --boot-img $(GRUB_LIB)/i386-pc/boot.img \
+	@$(PYTHON) tools/mkusbimg.py $@ --rootfs $(ROOTFS_STAGE) --boot-img $(GRUB_LIB)/i386-pc/boot.img \
 	    --core-img $(BUILD)/usb-core.img $$(test -f $(BUILD)/usb-esp.img && echo --esp-img $(BUILD)/usb-esp.img) \
 	    $(USBIMG_FLAGS)
 
