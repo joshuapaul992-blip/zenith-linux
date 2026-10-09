@@ -15,6 +15,7 @@
 #include <kernel/string.h>
 #include <kernel/bootinfo.h>
 #include <kernel/posix.h>
+#include <kernel/storage.h>
 
 #define LINE_MAX    160
 #define C_TITLE     "\033[30;47m"
@@ -240,6 +241,7 @@ static void cmd_scan(void)
 static void reboot(void)
 {
     rputs("restarting...\n");
+    storage_shutdown();
     cli();
     outb(0xCF9, 0x02);                  /* PCI reset control: system reset */
     outb(0xCF9, 0x06);
@@ -254,6 +256,7 @@ static void reboot(void)
 static void poweroff(void)
 {
     rputs("powering off...\n");
+    storage_shutdown();
     cli();
     outw(0x604, 0x2000);                /* QEMU q35/pc ACPI PM1a */
     outw(0xB004, 0x2000);               /* Bochs, old QEMU */

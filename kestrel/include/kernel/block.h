@@ -1,6 +1,6 @@
 /* include/kernel/block.h -- block device registry and partition discovery
  *
- * Every disk driver (AHCI, USB mass storage) registers its disks here; the
+ * Every disk driver (AHCI, NVMe, USB mass storage) registers its disks here; the
  * layer gives them stable kernel names ("sata0", "usb0"), reads MBR or GPT
  * partition tables into child devices ("usb0p1"), publishes all of them as
  * /dev nodes, bounds-checks every request and notices removed devices.
@@ -19,7 +19,7 @@
 #define BLK_NAME_MAX    16
 #define BLK_MAX         48
 
-enum blk_kind { BLK_DISK_SATA, BLK_DISK_USB, BLK_PART };
+enum blk_kind { BLK_DISK_SATA, BLK_DISK_USB, BLK_DISK_NVME, BLK_PART };
 
 struct blkdev;
 struct blkdev_ops {

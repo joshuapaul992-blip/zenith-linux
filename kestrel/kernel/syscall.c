@@ -13,6 +13,7 @@
 #include <kernel/klog.h>
 #include <kernel/bootinfo.h>
 #include <kernel/time.h>
+#include <kernel/storage.h>
 
 extern void syscall_entry(void);
 
@@ -258,6 +259,7 @@ static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, u
     (void)a4; (void)a5; (void)a6;
     if (m1 != 0xfee1deadu || m2 != 672274793u) return -EINVAL;
     kprintf("reboot: cmd=%lx\n", cmd);
+    storage_shutdown();                                 /* NVMe: clean shutdown before the reset */
     cli();
     switch (cmd) {
     case 0x01234567u:                                   /* RESTART: 8042 reset line */

@@ -26,6 +26,7 @@ make run-floppy
 make run-pci    # QEMU q35: 200 GiB SATA disk on AHCI, NVMe behind a root port, xHCI (+ USB keyboard
                 #           and mouse) behind two bridges
 make iso KERNEL_CMDLINE="ahci.selftest=rw"   # bake a kernel command line into the ISO
+make iso KERNEL_CMDLINE="nvme.selftest=rw"   # NVMe read/compare/write-restore self-test at boot
 make test-pci   # host unit test of the PCI enumerator against a simulated config space
 make check      # grub-file --is-x86-multiboot2
 make debug      # QEMU paused with a gdb stub on :1234
@@ -177,6 +178,53 @@ Tested in QEMU (ICH9 AHCI) under SeaBIOS and OVMF with a 200 GiB disk. The tests
 
 `tools/mkdisk.py` builds the sparse test image.
 
+## NVMe driver (`drivers/nvme/`)
+
+`nvme.h` and `nvme.c` are standalone in the same way as the AHCI driver. Kestrel connects them in `kernel/storage.c`: it finds class 01.08 with prog-if 02 through the PCI scan, takes BAR0 (64-bit), enables MMIO decoding and bus mastering, disables INTx and maps the registers uncached.
+
+- **Register layouts:** a packed `struct nvme_regs` (CAP, VS, INTMS/INTMC, CC, CSTS, NSSR, AQA, ASQ, ACQ, CMB and boot-partition registers, doorbells at 0x1000). Field macros cover CAP (MQES, CQR, TO, DSTRD, CSS, MPSMIN/MPSMAX), CC (EN, CSS, MPS, AMS, SHN, IOSQES, IOCQES) and CSTS (RDY, CFS, SHST). Also defined: the 64-byte submission queue entry, the 16-byte completion queue entry, and the Identify Controller and Identify Namespace structures. Every offset is checked at compile time.
+- **Controller bring-up** (NVMe 1.4 §7.6.1):
+  1. Read CAP. Require the NVM command set and 4 KiB pages (`MPSMIN = 0`). Take the doorbell stride (`4 << DSTRD`) and the ready timeout (`CAP.TO`, in 500 ms units).
+  2. Disable: clear `CC.EN` and wait for `CSTS.RDY = 0`. If an enable is still in progress, it is allowed to finish first.
+  3. Write AQA, ASQ and ACQ with the admin rings (up to 32 entries each, clamped to `MQES + 1`).
+  4. Write CC: NVM command set, 4 KiB pages, round robin, 64-byte SQEs and 16-byte CQEs. Then set `EN` and wait for `RDY = 1`, failing early on `CSTS.CFS`. Mask interrupts through INTMS, since the driver polls.
+  5. Identify Controller: model, serial, firmware, NN, VWC, RTD3E, MDTS and the minimum SQE/CQE sizes.
+  6. Set Features (Number of Queues), then Create I/O Completion Queue and Create I/O Submission Queue. Queue 1 holds up to 64 entries and is physically contiguous; the CQ is created with interrupts off.
+  7. Namespaces come from the active namespace list (CNS 02h), or from a scan of every NSID up to NN on NVMe 1.0 controllers. Each one gets an Identify Namespace, which gives its size and active LBA format. Formats with metadata are skipped.
+- **Doorbells:** `SQyTDBL` sits at `0x1000 + 2y × stride` and `CQyHDBL` at `0x1000 + (2y + 1) × stride`.
+- **Completions:** each queue tracks its head and an expected phase tag, which starts at 1 and flips whenever the head wraps. A CQE is new when its phase bit matches. The driver then checks the command identifier, takes the SQ head from DW2 and rings the CQ head doorbell. A completion with another CID belongs to an abandoned command and is discarded.
+- **I/O:** `nvme_read()`, `nvme_write()` and `nvme_flush()` are synchronous. Requests are split at the controller's MDTS, capped by `NVME_MAX_TRANSFER` (default 1 MiB), and NLB is 16 bits. A per-controller lock serialises namespaces that share the I/O queue.
+- **PRPs** (§4.3): every 4 KiB page of the caller's buffer is translated on its own through `virt_to_phys()`, so the buffer only has to be dword aligned.
+  - PRP1 points at the first byte, which may sit at an offset in its page.
+  - A transfer that ends in the next page puts that page in PRP2.
+  - Anything longer makes PRP2 point at a PRP list. A list page holds 512 entries; when more follow, its last entry points at the next list page.
+- **Errors:**
+  - A status in the CQE is logged with its SCT, SC and DNR.
+  - A timeout (5 s) or `CSTS.CFS` resets the controller and rebuilds its queues, because only a reset guarantees that the abandoned command's DMA has stopped.
+- **Shutdown:** `nvme_shutdown_all()` deletes the I/O queues, sets `CC.SHN` to normal and waits for `CSTS.SHST` to report completion, for between 5 and 60 s depending on RTD3E. `reboot(2)` and the recovery console's `reboot`/`poweroff` call it first.
+- **Block layer:** each namespace becomes `nvme0`, `nvme1`, … with MBR/GPT partitions (`nvme0p1`), so boot volume discovery with `kestrel.root=any` also looks at NVMe disks.
+
+With `nvme.selftest=1` on the kernel command line, the boot runs a self-test on every namespace:
+- It reads the first 8 MiB in one call and logs the CRC-32.
+- It reads the same range again in chunk sizes from 1 block to `max_blocks + 1`, into a buffer 4 bytes past a page boundary, and compares the two copies.
+- It checks that a buffer that isn't dword aligned, and a range past the end, are both rejected.
+- `nvme.selftest=rw` adds a write, read-back and restore of the last 16 blocks.
+
+Tested in QEMU 8.2 (`-device nvme`, NVMe 1.4) under SeaBIOS and OVMF, with two controllers:
+- the default `mdts=7` (512 KiB per command), and `mdts=0` (no limit, so the driver's own cap applies)
+- 512-byte and 4 KiB namespaces, including a sparse NSID (1 and 3)
+- builds with `NVME_MAX_TRANSFER` at 1 MiB and 3 MiB, the latter with chained PRP lists from a misaligned buffer
+- the CRC-32 of the data read matching the image on the host, and the image unchanged after the write test
+- a clean shutdown on `poweroff`
+
+QEMU accepts at most 1024 mappings per command. On a controller with `mdts=0`, a 4 MiB build therefore fails misaligned transfers that span 1025 pages, with Internal Error (SC 06h). This is a limit of the emulator, and the default 1 MiB cap stays well below it.
+
+Not implemented yet:
+- interrupts (MSI-X); completions are polled
+- more than one I/O queue pair, or more than one command in flight
+- SGLs, metadata and end-to-end protection
+- Write Zeroes, Dataset Management (TRIM) and namespace management
+
 ## xHCI USB driver (`drivers/usb/`)
 
 `xhci.h`, `usb.h` and `xhci.c` are standalone in the same way as the other drivers. Kestrel connects them in `kernel/usbhost.c`.
@@ -247,7 +295,7 @@ The function returns the number of ports still in progress. `xhci_init()` runs i
   - On a stall or transaction error, it resets the host endpoint.
   - Control transfers, bulk transfers and settling are serialised by a controller lock.
 
-**5. Block layer** (`kernel/block.c`). Disks are named by kind (`usb0`, `sata0`) and their partitions are named `usb0p1`, ….
+**5. Block layer** (`kernel/block.c`). Disks are named by kind (`usb0`, `sata0`, `nvme0`) and their partitions are named `usb0p1`, ….
 - **MBR:** primary and logical partitions (EBR chain with loop guard).
 - **GPT:** header and entry-array CRC32 are checked; if the primary GPT is invalid, the backup is used.
 - Requests are bounds-checked and serialised per disk.
@@ -338,6 +386,7 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               kestrel_font.c kestrel_font[256][16] for the terminal, from tools/sheet2font.py
               pci/           standalone PCI enumerator (pci.h, pci.c, test/pci_sim_test.c)
               ahci/          standalone AHCI SATA driver (ahci.h, ahci.c)
+              nvme/          standalone NVMe driver: admin + I/O queue pair, PRP lists (nvme.h, nvme.c)
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
@@ -361,7 +410,8 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               kush.c         kush shell: line editor, quoting, redirection, $?, built-ins
               coreutils/     pwd cd ls mkdir rmdir touch rm cp mv cat head tail grep echo
                              chmod chown date uname neofetch (+ cu_lib.c helpers, table.c)
-              storage.c      PCI -> AHCI glue, boot-time MBR verify, /dev/sdX
+              storage.c      PCI -> AHCI and NVMe glue, boot-time MBR verify, /dev/sdX, nvmeN,
+                             NVMe self-test and shutdown
               usbhost.c      PCI -> xHCI glue, key injection, mouse pointer, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
               time.c         HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts

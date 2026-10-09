@@ -1,16 +1,24 @@
 /* kernel/storage.c -- glue between the PCI enumerator, the standalone AHCI
- * driver and the rest of Kestrel.
+ * and NVMe drivers and the rest of Kestrel.
  *
- *   storage_init()              boot: find AHCI controllers via PCI, enable
- *                               MMIO + bus mastering, map ABAR uncached, bring
- *                               the HBA up, run the MBR verify loop on every
- *                               disk (and the write self-test on request)
- *   storage_register_devices()  after the VFS exists: /dev/sda, /dev/sdb ...
+ *   storage_init()              boot: find AHCI and NVMe controllers via PCI,
+ *                               enable MMIO + bus mastering, map the register
+ *                               BARs uncached, bring the controllers up, run
+ *                               the MBR verify loop on every SATA disk (and the
+ *                               self-tests on request)
+ *   storage_register_devices()  after the VFS exists: /dev/sda, /dev/sdb ...,
+ *                               sataN and nvmeN in the block layer
+ *   storage_shutdown()          before reboot/power-off: NVMe normal shutdown
  *
  * Kernel command line options:
  *   ahci.selftest=rw    non-destructive write/read-back/restore on the last
  *                       sector of each disk (off by default)
  *   ahci.verify=N       MBR read passes in the verify loop (default 3)
+ *   nvme.selftest=1     read the first 8 MiB of every namespace in one call
+ *                       and again in odd-sized chunks into a misaligned
+ *                       buffer, compare, log the CRC-32 (off by default)
+ *   nvme.selftest=rw    the same, plus write/read-back/restore of the last
+ *                       16 blocks
  */
 #include <kernel/storage.h>
 #include <kernel/mm.h>
@@ -21,8 +29,12 @@
 #include <kernel/cpu.h>
 #include <kernel/block.h>
 #include <kernel/posix.h>
+#include <kernel/time.h>
+#include <kernel/task.h>
+#include <kernel/crc32.h>
 #include "pci.h"
 #include "ahci.h"
+#include "nvme.h"
 
 /* ---- platform hooks for the AHCI driver -------------------------------- */
 
@@ -49,6 +61,22 @@ static const struct ahci_platform kestrel_platform = {
     /* virt_to_phys: identity (default); delay_us: port 0x80 (default) */
 };
 
+/* Waiting for an NVMe controller that another namespace's request holds:
+ * give the CPU away once the scheduler runs. */
+static void nvme_yield(void)
+{
+    if (irqs_enabled()) sched_yield(); else cpu_relax();
+}
+
+static const struct nvme_platform kestrel_nvme = {
+    .dma_alloc = dma_alloc,
+    .map_mmio  = map_mmio,
+    .delay_us  = udelay,
+    .yield     = nvme_yield,
+    .log_putc  = klog_putc,
+    /* virt_to_phys: identity (default) */
+};
+
 /* ---- command line helpers ---------------------------------------------- */
 static const char *cmdline_value(const char *key)
 {
@@ -60,7 +88,7 @@ static const char *cmdline_value(const char *key)
 }
 
 /* ---- boot-time bring-up -------------------------------------------------- */
-void storage_init(void)
+static void ahci_bringup(void)
 {
     size_t n = pci_match_count(PCI_MATCH_AHCI);
     if (!n) { kprintf("storage: no AHCI controller found\n"); return; }
@@ -95,6 +123,121 @@ void storage_init(void)
         ahci_verify_mbr(d, passes);
         if (selftest) ahci_selftest_rw(d);
     }
+}
+
+/* Reads the start of the namespace twice -- once in a single call (split
+ * into max-transfer commands with PRP lists), once in odd chunk sizes into a
+ * buffer 4 bytes past a page boundary, so PRP1 carries an offset and every
+ * list straddles pages -- and compares the copies. With `rw`, the last 16
+ * blocks are saved, overwritten, read back and restored. */
+static void nvme_selftest(struct nvme_namespace *ns, int index, bool rw)
+{
+    uint32_t bs = ns->block_size;
+    uint64_t nblk64 = (8u << 20) / bs;
+    if (nblk64 > ns->blocks) nblk64 = ns->blocks;
+    uint32_t nblk = (uint32_t)nblk64;
+    size_t bytes = (size_t)nblk * bs;
+    size_t frames = bytes / PAGE_SIZE + 2;
+    uint64_t a_pa = pmm_alloc_contig(frames), b_pa = pmm_alloc_contig(frames);
+    if (!a_pa || !b_pa) {
+        kprintf("nvme selftest: ns%d: out of memory\n", index);
+        if (a_pa) pmm_free_contig(a_pa, frames);
+        if (b_pa) pmm_free_contig(b_pa, frames);
+        return;
+    }
+    uint8_t *a = (uint8_t *)a_pa, *b = (uint8_t *)b_pa + 4;
+    int failures = 0;
+
+    uint64_t t0 = time_us();
+    int rc = nvme_read(ns, 0, nblk, a);
+    uint64_t us = time_us() - t0;
+    if (rc != NVME_OK) { kprintf("nvme selftest: ns%d: single read failed: %s\n", index, nvme_strerror(rc)); failures++; }
+    else kprintf("nvme selftest: ns%d: %u blocks (%lu KiB) in one call: %lu us, crc32 %08x\n",
+                 index, nblk, (uint64_t)bytes >> 10, us, crc32(0, a, bytes));
+
+    static const uint32_t sizes[] = { 1, 7, 8, 9, 255, 256, 257, 0 /* max_blocks */, 3, 0 /* max_blocks + 1 */ };
+    uint32_t lba = 0, cmds = 0;
+    for (int k = 0; rc == NVME_OK && lba < nblk; k = (k + 1) % 10, cmds++) {
+        uint32_t n = sizes[k] ? sizes[k] : ns->max_blocks + (k == 9);
+        if (n > nblk - lba) n = nblk - lba;
+        rc = nvme_read(ns, lba, n, b + (size_t)lba * bs);
+        if (rc != NVME_OK) { kprintf("nvme selftest: ns%d: chunked read at %u+%u failed: %s\n", index, lba, n, nvme_strerror(rc)); failures++; }
+        lba += n;
+    }
+    if (rc == NVME_OK) {
+        if (memcmp(a, b, bytes)) { kprintf("nvme selftest: ns%d: chunked read differs\n", index); failures++; }
+        else kprintf("nvme selftest: ns%d: %u chunked calls into a misaligned buffer match\n", index, cmds);
+    }
+
+    /* argument checks: a 2-byte aligned buffer and a range past the end */
+    if (nvme_read(ns, 0, 1, (uint8_t *)b_pa + 2) != NVME_ERR_ALIGN) { kprintf("nvme selftest: ns%d: misaligned buffer accepted\n", index); failures++; }
+    if (nvme_read(ns, ns->blocks - 1, 2, a) != NVME_ERR_RANGE) { kprintf("nvme selftest: ns%d: read past the end accepted\n", index); failures++; }
+
+    if (rw && nblk >= 48) {
+        uint32_t cnt = 16;
+        uint64_t last = ns->blocks - cnt;
+        uint8_t *save = a, *pat = b, *back = a + (size_t)cnt * bs;     /* reuse the buffers */
+        for (size_t i = 0; i < (size_t)cnt * bs; i++) pat[i] = (uint8_t)(i * 7 + (i >> 9) + 0x5A);
+        rc = nvme_read(ns, last, cnt, save);
+        if (rc == NVME_OK) rc = nvme_write(ns, last, cnt, pat);
+        if (rc == NVME_OK) rc = nvme_read(ns, last, cnt, back);
+        bool same = rc == NVME_OK && !memcmp(pat, back, (size_t)cnt * bs);
+        int rc2 = nvme_write(ns, last, cnt, save);
+        if (rc2 == NVME_OK) rc2 = nvme_flush(ns);
+        if (rc2 == NVME_OK) rc2 = nvme_read(ns, last, cnt, back);
+        bool restored = rc2 == NVME_OK && !memcmp(save, back, (size_t)cnt * bs);
+        kprintf("nvme selftest: ns%d: write/read-back of blocks %lu-%lu: %s, restore: %s\n", index,
+                last, last + cnt - 1, same ? "ok" : "FAILED", restored ? "ok" : "FAILED");
+        failures += !same + !restored;
+    }
+    kprintf("nvme selftest: ns%d: %s\n", index, failures ? "FAILED" : "passed");
+    pmm_free_contig(a_pa, frames);
+    pmm_free_contig(b_pa, frames);
+}
+
+static void nvme_bringup(void)
+{
+    size_t n = pci_match_count(PCI_MATCH_NVME);
+    if (!n) { kprintf("storage: no NVMe controller found\n"); return; }
+
+    for (size_t i = 0; i < n; i++) {
+        struct pci_device *dev = pci_match_get(PCI_MATCH_NVME, i);
+        const struct pci_bar *bar = &dev->bars[0];          /* MLBAR/MUBAR: BAR0 (+BAR1) */
+        if (dev->prog_if != 0x02) {
+            kprintf("storage: %02x:%02x.%x is class 01.08 prog-if %02x, not NVM Express, skipped\n",
+                    dev->bus, dev->device, dev->function, dev->prog_if);
+            continue;
+        }
+        if ((bar->kind != PCI_BAR_MEM32 && bar->kind != PCI_BAR_MEM64) || !bar->base) {
+            kprintf("storage: NVMe at %02x:%02x.%x has no memory BAR0, skipped\n",
+                    dev->bus, dev->device, dev->function);
+            continue;
+        }
+        kprintf("storage: NVMe %04x:%04x at %02x:%02x.%x, BAR0 %lx (%lu KiB)\n",
+                dev->vendor_id, dev->device_id, dev->bus, dev->device, dev->function,
+                bar->base, bar->size >> 10);
+        pci_enable(dev, false, true, true);
+        pci_write32(dev->bus, dev->device, dev->function, PCI_REG_COMMAND,
+                    pci_read16(dev->bus, dev->device, dev->function, PCI_REG_COMMAND) | PCI_CMD_INTX_DISABLE);
+        int rc = nvme_init(bar->base, &kestrel_nvme);
+        if (rc < 0) kprintf("storage: NVMe at %02x:%02x.%x: %s\n", dev->bus, dev->device, dev->function, nvme_strerror(rc));
+    }
+
+    const char *st = cmdline_value("nvme.selftest");
+    if (st && *st && *st != '0' && *st != ' ')
+        for (int i = 0; i < nvme_namespace_count(); i++)
+            nvme_selftest(nvme_namespace_get(i), i, strncmp(st, "rw", 2) == 0);
+}
+
+void storage_init(void)
+{
+    ahci_bringup();
+    nvme_bringup();
+}
+
+void storage_shutdown(void)
+{
+    nvme_shutdown_all();
 }
 
 /* ---- /dev/sdX: read-only byte-addressable view of each disk --------------- */
@@ -150,11 +293,30 @@ static int sata_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
 }
 static const struct blkdev_ops sata_ops = { .read = sata_read };
 
+/* ---- block layer: "nvmeN" disks, one per namespace ------------------------ */
+static int nvme_blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
+{
+    switch (nvme_read(b->ctx, lba, count, buf)) {
+    case NVME_OK:          return 0;
+    case NVME_ERR_TIMEOUT: return -ETIMEDOUT;
+    case NVME_ERR_NODEV:   return -ENODEV;
+    case NVME_ERR_RANGE:   return -ERANGE;
+    case NVME_ERR_ALIGN:   return -EINVAL;
+    default:               return -EIO;
+    }
+}
+static const struct blkdev_ops nvme_ops = { .read = nvme_blk_read };
+
 void storage_register_devices(void)
 {
     for (int i = 0; i < ahci_disk_count(); i++) {
         struct ahci_disk *d = ahci_disk_get(i);
         struct blkdev *b = blk_register_disk("sata", BLK_DISK_SATA, d->model, d->sector_size, d->sectors, &sata_ops, d);
+        if (b) blk_scan_partitions(b);
+    }
+    for (int i = 0; i < nvme_namespace_count(); i++) {
+        struct nvme_namespace *ns = nvme_namespace_get(i);
+        struct blkdev *b = blk_register_disk("nvme", BLK_DISK_NVME, ns->model, ns->block_size, ns->blocks, &nvme_ops, ns);
         if (b) blk_scan_partitions(b);
     }
     for (int i = 0; i < ahci_disk_count() && i < 26; i++) {
@@ -169,10 +331,16 @@ void storage_register_devices(void)
 
 size_t storage_summary(char *buf, size_t cap)
 {
-    if (!ahci_disk_count()) return (size_t)snprintf(buf, cap, "no SATA disks");
-    struct ahci_disk *d = ahci_disk_get(0);
-    uint64_t mib = d->sectors * d->sector_size >> 20;
-    return (size_t)snprintf(buf, cap, "%d disk(s); sda: %s, %lu %s on port %d",
-                            ahci_disk_count(), d->model,
-                            mib >= 10240 ? mib >> 10 : mib, mib >= 10240 ? "GiB" : "MiB", d->port);
+    size_t n;
+    if (!ahci_disk_count()) n = (size_t)snprintf(buf, cap, "no SATA disks");
+    else {
+        struct ahci_disk *d = ahci_disk_get(0);
+        uint64_t mib = d->sectors * d->sector_size >> 20;
+        n = (size_t)snprintf(buf, cap, "%d disk(s); sda: %s, %lu %s on port %d",
+                             ahci_disk_count(), d->model,
+                             mib >= 10240 ? mib >> 10 : mib, mib >= 10240 ? "GiB" : "MiB", d->port);
+    }
+    if (nvme_namespace_count() && n < cap)
+        n += (size_t)snprintf(buf + n, cap - n, "; %d NVMe namespace(s)", nvme_namespace_count());
+    return n;
 }
