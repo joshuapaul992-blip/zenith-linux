@@ -33,6 +33,7 @@ struct int_frame;
 #define SYS_readv          19
 #define SYS_writev         20
 #define SYS_access         21
+#define SYS_select         23
 #define SYS_pipe           22
 #define SYS_sched_yield    24
 #define SYS_madvise        28
@@ -87,6 +88,7 @@ struct int_frame;
 #define SYS_clock_gettime 228
 #define SYS_clock_getres  229
 #define SYS_exit_group    231
+#define SYS_pselect6      270
 #define SYS_utimensat     280
 #define SYS_accept4       288
 #define SYS_dup3          292

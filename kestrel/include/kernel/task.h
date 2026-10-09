@@ -83,5 +83,6 @@ int         task_wait(int pid);         /* exit status, or -ECHILD        */
 int         task_snapshot(struct tcb *out, int max);
 const char *task_state_name(enum task_state s);
 uint64_t    sched_context_switches(void);
+void        sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle);
 
 #endif

@@ -145,10 +145,10 @@ out:
  * argc) argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL. */
 static uint64_t build_stack(struct tcb *t, const struct spawn_args *a, uint64_t entry, uint64_t phdr_va, int phnum)
 {
-    static const char *const envp[] = { "PATH=/boot/bin", "HOME=/", "TERM=kestrel" };
+    static const char *const envp[] = { "PATH=/boot/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0" };
     const int nenv = (int)(sizeof envp / sizeof *envp);
     uint64_t sp = UVM_STACK_TOP;
-    uint64_t argv_va[EXEC_MAX_ARGS], env_va[3];
+    uint64_t argv_va[EXEC_MAX_ARGS], env_va[sizeof envp / sizeof *envp];
 
 #define PUSH_BYTES(src, n) do { sp -= (n); memcpy((void *)sp, (src), (n)); } while (0)
     for (int i = a->argc - 1; i >= 0; i--) { PUSH_BYTES(a->argv[i], strlen(a->argv[i]) + 1); argv_va[i] = sp; }

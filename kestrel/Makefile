@@ -10,6 +10,7 @@
 #  make usbimg       64 MiB USB stick image with GRUB + a Kestrel boot volume
 #  make run-usb      boot the stick from a QEMU xHCI port (kestrel.root=usb)
 #  make xlibre       build the X server for Kestrel (see ports/xlibre/build.sh)
+#  make icewm        build the IceWM window manager (see ports/icewm/build.sh)
 #  make debug        QEMU halted with a gdb stub on :1234
 #  make check        verify the Multiboot2 header with grub-file
 #  make fonts        regenerate drivers/font_*.c from the BDF sources
@@ -94,7 +95,7 @@ QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
 #   make iso KERNEL_CMDLINE="ahci.selftest=rw ahci.verify=5"
 KERNEL_CMDLINE ?=
 
-.PHONY: FORCE xlibre all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
+.PHONY: FORCE xlibre icewm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
 
 all: $(KERNEL)
 
@@ -197,13 +198,22 @@ xlibre:
 	    { echo "usage: make xlibre XLIBRE_SRC=<xserver checkout> XLIBRE_DEPS=<tarball dir>"; exit 1; }
 	@ports/xlibre/build.sh $(XLIBRE_SRC) $(XLIBRE_DEPS) $(BUILD)
 
+# IceWM (ports/icewm), after `make xlibre`:
+#   make icewm ICEWM_SRC=<unpacked icewm 3.x release>
+ICEWM_SRC  ?=
+ICEWM_ROOT := $(BUILD)/icewm-root
+icewm:
+	@test -n "$(ICEWM_SRC)" || { echo "usage: make icewm ICEWM_SRC=<unpacked icewm release>"; exit 1; }
+	@ports/icewm/build.sh $(ICEWM_SRC) $(BUILD)
+
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(wildcard $(XLIBRE_ROOT)/.stamp)
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp)
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
 	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi
+	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@touch $@
 
 USBIMG := $(BUILD)/kestrel-usb.img

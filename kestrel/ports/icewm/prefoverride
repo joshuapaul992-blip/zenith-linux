@@ -1,0 +1,28 @@
+# /boot/etc/icewm/prefoverride -- Kestrel settings, applied after the theme.
+#
+# The X server has only its built-in core fonts ("fixed" and "cursor"), so
+# every font IceWM draws with is "fixed" until real font files are installed.
+ActiveButtonFontName="fixed"
+ActiveTaskBarFontName="fixed"
+ActiveWorkspaceFontName="fixed"
+ApmFontName="fixed"
+ClockFontName="fixed"
+InputFontName="fixed"
+LabelFontName="fixed"
+ListBoxFontName="fixed"
+MenuFontName="fixed"
+NormalButtonFontName="fixed"
+NormalTaskBarFontName="fixed"
+NormalWorkspaceFontName="fixed"
+QuickSwitchFontName="fixed"
+StatusFontName="fixed"
+TempFontName="fixed"
+TitleFontName="fixed"
+ToolButtonFontName="fixed"
+ToolTipFontName="fixed"
+
+# Applets for subsystems Kestrel does not have (network interfaces in
+# /proc/net, batteries, mail spools).
+TaskBarShowNetStatus=0
+TaskBarShowApm=0
+TaskBarShowMailboxStatus=0

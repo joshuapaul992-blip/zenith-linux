@@ -604,6 +604,77 @@ static int64_t sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeout, uint64_t 
     }
 }
 
+/* select(2) and pselect6(2) on top of the same readiness checks as poll:
+ * fd_set is a bitmap of 1024 descriptors; only fds below MAX_FDS can be open.
+ * The timeout is not written back (Linux does; callers may not rely on it). */
+static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int64_t tmo_ms)
+{
+    if (n > 1024) return -EINVAL;
+    uint64_t bytes = (n + 7) / 8;
+    uint8_t *sets[3] = { (uint8_t *)rp, (uint8_t *)wp, (uint8_t *)ep };
+    uint8_t in[3][MAX_FDS / 8];
+    for (int k = 0; k < 3; k++) {
+        if (!sets[k] || !bytes) continue;
+        if (bad_buf((uint64_t)sets[k], bytes)) return -EFAULT;
+        for (uint64_t fd = MAX_FDS; fd < n; fd++)       /* can never be open */
+            if (sets[k][fd / 8] & (1u << (fd % 8))) return -EBADF;
+        memcpy(in[k], sets[k], bytes < sizeof in[k] ? bytes : sizeof in[k]);
+    }
+    uint64_t lim = n < MAX_FDS ? n : MAX_FDS;
+    static const int want[3] = { POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI };
+    uint64_t deadline = tmo_ms > 0 ? time_ms() + (uint64_t)tmo_ms : 0;
+    for (;;) {
+        int ready = 0;
+        uint8_t out[3][MAX_FDS / 8] = { { 0 } };
+        for (uint64_t fd = 0; fd < lim; fd++) {
+            for (int k = 0; k < 3; k++) {
+                if (!sets[k] || !(in[k][fd / 8] & (1u << (fd % 8)))) continue;
+                struct file **f = fd_slot((int)fd);
+                if (!f) return -EBADF;
+                if (vfs_poll(*f, want[k]) & want[k]) {
+                    out[k][fd / 8] |= (uint8_t)(1u << (fd % 8));
+                    ready++;
+                }
+            }
+        }
+        if (ready || tmo_ms == 0 || (tmo_ms > 0 && time_ms() >= deadline)) {
+            for (int k = 0; k < 3; k++) {
+                if (!sets[k] || !bytes) continue;
+                memset(sets[k], 0, bytes);
+                memcpy(sets[k], out[k], bytes < sizeof out[k] ? bytes : sizeof out[k]);
+            }
+            return ready;
+        }
+        task_sleep_ms(1);
+    }
+}
+
+static int64_t sys_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, uint64_t tvp, uint64_t a6)
+{
+    (void)a6;
+    int64_t tmo = -1;
+    if (tvp) {
+        if (bad_buf(tvp, 16)) return -EFAULT;
+        const int64_t *tv = (const int64_t *)tvp;     /* struct timeval */
+        if (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000) return -EINVAL;
+        tmo = tv[0] * 1000 + (tv[1] + 999) / 1000;
+    }
+    return do_select(n, rp, wp, ep, tmo);
+}
+
+static int64_t sys_pselect6(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, uint64_t tsp, uint64_t sig)
+{
+    (void)sig;                                          /* no signals to mask */
+    int64_t tmo = -1;
+    if (tsp) {
+        if (bad_buf(tsp, 16)) return -EFAULT;
+        const int64_t *ts = (const int64_t *)tsp;     /* struct timespec */
+        if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000) return -EINVAL;
+        tmo = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
+    }
+    return do_select(n, rp, wp, ep, tmo);
+}
+
 static int64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
@@ -846,6 +917,14 @@ static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_
     return rc;
 }
 
+/* Ring-3 processes cannot create processes yet (no fork/clone), so a
+ * process never has children to wait for. */
+static int64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_t ru, uint64_t a5, uint64_t a6)
+{
+    (void)pid; (void)status; (void)options; (void)ru; (void)a5; (void)a6;
+    return -ECHILD;
+}
+
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -884,6 +963,7 @@ void syscall_init(void)
     REG(SYS_rt_sigprocmask, sys_rt_sigprocmask);
     REG(SYS_readv, sys_readv);         REG(SYS_writev, sys_writev);
     REG(SYS_fcntl, sys_fcntl);         REG(SYS_poll, sys_poll);
+    REG(SYS_select, sys_select);       REG(SYS_pselect6, sys_pselect6);
     REG(SYS_dup, sys_dup);             REG(SYS_dup2, sys_dup2);
     REG(SYS_dup3, sys_dup3);           REG(SYS_pipe, sys_pipe);
     REG(SYS_pipe2, sys_pipe2);         REG(SYS_access, sys_access);
@@ -897,7 +977,7 @@ void syscall_init(void)
     REG(SYS_getsockname, sys_getsockname); REG(SYS_getpeername, sys_getpeername);
     REG(SYS_setsockopt, sys_setsockopt);   REG(SYS_getsockopt, sys_getsockopt);
     REG(SYS_fork, sys_enosys);         REG(SYS_execve, sys_enosys);
-    REG(SYS_wait4, sys_enosys);        REG(SYS_kill, sys_enosys);
+    REG(SYS_wait4, sys_wait4);        REG(SYS_kill, sys_enosys);
     REG(SYS_gettimeofday, sys_enosys);
 
     /* SYSCALL/SYSRET fast path (used once ring-3 processes exist) */

@@ -89,6 +89,20 @@ static size_t gen_interrupts(char *buf, size_t cap, void *ctx)
     return n;
 }
 
+/* Linux layout, in USER_HZ (100) units: user nice system idle iowait irq
+ * softirq steal guest guest_nice. One CPU. */
+static size_t gen_stat(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    uint64_t u, s, i;
+    sched_cpu_times(&u, &s, &i);
+    u = u * 100 / PIT_HZ; s = s * 100 / PIT_HZ; i = i * 100 / PIT_HZ;
+    P("cpu  %lu 0 %lu %lu 0 0 0 0 0 0\n", u, s, i);
+    P("cpu0 %lu 0 %lu %lu 0 0 0 0 0 0\n", u, s, i);
+    P("ctxt %lu\nbtime 0\nprocs_running 1\nprocs_blocked 0\n", sched_context_switches());
+    return n;
+}
+
 static size_t gen_cmdline(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
@@ -145,6 +159,7 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "version",     gen_version, NULL);
     pseudo_file(r, "uptime",      gen_uptime, NULL);
     pseudo_file(r, "meminfo",     gen_meminfo, NULL);
+    pseudo_file(r, "stat",        gen_stat, NULL);
     pseudo_file(r, "cpuinfo",     gen_cpuinfo, NULL);
     pseudo_file(r, "mounts",      gen_mounts, NULL);
     pseudo_file(r, "filesystems", gen_filesystems, NULL);

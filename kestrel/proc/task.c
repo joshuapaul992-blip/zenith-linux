@@ -31,6 +31,15 @@ void sched_set_preemption(bool on) { preempt = on; }
 bool sched_preemption(void) { return preempt; }
 uint64_t sched_context_switches(void) { return nswitches; }
 
+/* Whole-system CPU time in timer ticks, for /proc/stat: ticks spent in the
+ * idle thread, in ring-3 processes (including their system calls) and in
+ * kernel threads. */
+static uint64_t ticks_user, ticks_system, ticks_idle;
+void sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle)
+{
+    *user = ticks_user; *system = ticks_system; *idle = ticks_idle;
+}
+
 const char *task_state_name(enum task_state s)
 {
     static const char *n[] = { "unused", "ready", "running", "blocked", "sleeping", "zombie" };
@@ -164,6 +173,9 @@ void sched_tick(void)
     if (!running) return;
     uint64_t now = pit_ticks();
     cur->cpu_ticks++;
+    if (cur->pid == 0) ticks_idle++;
+    else if (cur->user) ticks_user++;
+    else ticks_system++;
     for (int i = 1; i < MAX_TASKS; i++)
         if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_tick <= now) {
             tasks[i].state = TASK_READY;

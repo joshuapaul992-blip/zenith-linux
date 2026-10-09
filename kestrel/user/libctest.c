@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/random.h>
 
 static int failures;
@@ -109,6 +110,14 @@ int main(int argc, char **argv)
     CHECK(ms >= 45 && ms < 1000, "poll timeout of 50 ms is honoured");
     CHECK(write(pfd[1], "ping", 4) == 4, "write to pipe");
     CHECK(poll(&pl, 1, -1) == 1 && (pl.revents & POLLIN), "poll: readable after a write");
+    {   /* select(2): IceWM's event loop */
+        fd_set rs, ws;
+        FD_ZERO(&rs); FD_ZERO(&ws);
+        FD_SET(pfd[0], &rs); FD_SET(pfd[1], &ws);
+        struct timeval tv = { 0, 0 };
+        int n = select(pfd[1] + 1, &rs, &ws, NULL, &tv);
+        CHECK(n == 2 && FD_ISSET(pfd[0], &rs) && FD_ISSET(pfd[1], &ws), "select: pipe readable and writable");
+    }
     char pb[8] = { 0 };
     CHECK(read(pfd[0], pb, sizeof pb) == 4 && !memcmp(pb, "ping", 4), "read from pipe");
     CHECK(fcntl(pfd[0], F_SETFL, O_NONBLOCK) == 0 && (fcntl(pfd[0], F_GETFL) & O_NONBLOCK), "fcntl(F_SETFL, O_NONBLOCK)");

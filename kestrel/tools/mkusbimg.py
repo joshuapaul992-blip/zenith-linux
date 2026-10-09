@@ -132,7 +132,8 @@ def ustar_from_dir(root):
                 path = os.path.join(dirpath, name)
                 arc = os.path.normpath(os.path.join(rel, name))
                 ti = tar.gettarinfo(path, arcname=arc)
-                ti.uid = ti.gid = 0; ti.uname = ti.gname = "root"; ti.mode = 0o444
+                ti.uid = ti.gid = 0; ti.uname = ti.gname = "root"
+                ti.mode = 0o555 if os.stat(path).st_mode & 0o111 else 0o444   # keep "executable"
                 with open(path, "rb") as f:
                     tar.addfile(ti, f)
     data = buf.getvalue()

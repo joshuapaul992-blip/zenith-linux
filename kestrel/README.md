@@ -504,7 +504,7 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
               devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor
                              (KFB_GET_INFO, KDSETMODE, KFB_BLIT) (+ block devices)
               tarfs.c        read-only ustar file system on a block device (the /boot volume)
-              procfs.c       /proc: version uptime meminfo cpuinfo mounts filesystems tasks
+              procfs.c       /proc: version uptime meminfo stat cpuinfo mounts filesystems tasks
                              interrupts cmdline kmsg syscalls
               sysfs.c        /sys: kernel/ class/graphics/fb0/ firmware/ devices/system/cpu/ power/
 kernel/       kernel.c       initialisation sequence, init and worker threads
@@ -532,6 +532,8 @@ lib/crc32.c                  CRC-32 (GPT, volume header, payload)
 tools/mkusbimg.py            bootable USB stick image builder
 ports/xlibre/                X server port: sysroot/server build scripts, hw-kestrel DDX, patches,
                              xdemo test client
+ports/icewm/                 IceWM build script and Kestrel configuration
+ports/toolchain/             musl-g++ (C++ with libsupc++), pkg-config and CMake wrappers
 rootfs/                      contents of the boot volume payload
 ui/bootmgr.c                 boot manager, F8 screen, tools
 include/kernel/posix.h       errno, O_* flags, struct stat, dirent64, utsname (Linux ABI layout)
@@ -546,11 +548,11 @@ Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), access, umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getpgid, getuid, getgid, geteuid, getegid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
+**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), select, pselect6 (no signal mask), access, umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getpgid, wait4 (always `-ECHILD`: processes cannot have children yet), getuid, getgid, geteuid, getegid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
 
 **Accepted but inert (no signals yet):** rt_sigaction, rt_sigprocmask.
 
-**Stubs returning `-ENOSYS`:** fork, execve, wait4, kill, gettimeofday.
+**Stubs returning `-ENOSYS`:** fork, execve, kill, gettimeofday.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -566,9 +568,11 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 `user/hello.c` is a freestanding self-test of all of this, installed as `/boot/bin/hello` on the USB stick:
 - From the shell: `run hello` (bare names are looked up in `/boot/bin`).
 - Unattended: boot with `kestrel.exec=/boot/bin/hello,arg1,arg2`. Output goes to the kernel log (serial and `REPORT.TXT`), followed by the exit status: 42 means every check passed.
+- Several programs: `+` separates them, and an entry of the form `Ns` waits N seconds before starting the rest, e.g. `kestrel.exec=/boot/bin/Xkestrel,:0+2s+/boot/bin/icewm`.
+- Environment: every program starts with `PATH=/boot/bin`, `HOME=/`, `TERM=kestrel` and `DISPLAY=:0`.
 - Fault isolation: `hello crash` writes to kernel memory and must end with "killed (signal 11)".
 
-**musl libc:** programs linked with the stock x86_64 musl (`musl-gcc -static-pie`) run unchanged, because Kestrel uses the Linux syscall numbers and ABI. `user/libctest.c` (installed as `/boot/bin/libctest`) checks 37 things a ported program relies on: stdio, malloc (brk and mmap paths), floating-point formatting, files and directories, time, pipes, `poll` timeouts, `O_NONBLOCK`, `dup`, EOF/`POLLHUP` and `getrandom`. Exit status 0 means every check passed. A ring-3 program that calls an unimplemented syscall is named in the kernel log (first three calls per number).
+**musl libc:** programs linked with the stock x86_64 musl (`musl-gcc -static-pie`) run unchanged, because Kestrel uses the Linux syscall numbers and ABI. `user/libctest.c` (installed as `/boot/bin/libctest`) checks 38 things a ported program relies on: stdio, malloc (brk and mmap paths), floating-point formatting, files and directories, time, pipes, `poll` timeouts, `select`, `O_NONBLOCK`, `dup`, EOF/`POLLHUP` and `getrandom`. Exit status 0 means every check passed. A ring-3 program that calls an unimplemented syscall is named in the kernel log (first three calls per number).
 
 **Pipes and poll:** pipes have a 16 KiB buffer and follow POSIX blocking rules; with no signals, a write to a pipe without readers returns `-EPIPE`. `poll` re-checks readiness every millisecond until something is ready or the timeout expires. Files and devices without their own poll hook are always ready.
 
@@ -632,7 +636,41 @@ Exiting the server returns its monitors to their text terminals.
 
 As the X protocol requires, the pointer stays hidden until some client defines a cursor; normally that is the window manager's job, and xdemo does it for its test.
 
-**Not yet:** a window manager and other clients, MIT-SHM (needs shared memory), keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
+**Not yet:** more clients, MIT-SHM (needs shared memory), keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
+
+## IceWM (`ports/icewm/`)
+
+[IceWM](https://ice-wm.org/) 3.4 runs on Xkestrel as the window manager. It draws the window frames and title-bar buttons (moving a window by its title bar has been checked; resizing, maximising and closing are untested). Its taskbar has the start menu, workspaces, a task list, a CPU graph from `/proc/stat`, a memory meter from `/proc/meminfo` and a clock.
+
+**Building**, after `make xlibre`:
+
+```sh
+make icewm ICEWM_SRC=<unpacked icewm 3.x release>   # e.g. Ubuntu's icewm_3.4.5.orig.tar.xz
+make usbimg      # stages bin/icewm, share/icewm, etc/icewm into /boot
+```
+
+**C++ on musl** (`ports/toolchain/`): IceWM is C++11, and there is no C++ standard library built for musl on the build host. `install.sh` builds `musl-g++` from what is there:
+- the host g++ with musl's C headers and start files (the `musl-gcc` specs);
+- the host's libstdc++ *headers*, for header-only parts such as `<utility>`, `<algorithm>`, `<new>` and `<typeinfo>`;
+- the host's `libsupc++`, for `new`/`delete`, RTTI, `dynamic_cast`, static-local guards and pure virtual calls;
+- `libsupcxx-compat.c`, for the four glibc-only symbols that `libsupc++` references.
+
+The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++ (iostreams, `std::string`, `<regex>`, threads) are not available. IceWM's window manager needs none of them. `install.sh` also writes `kestrel-pkg-config` (the sysroot, static link flags) and a CMake toolchain file.
+
+**Configuration** (`ports/icewm/build.sh`):
+- X core fonts, XPM and PNG images.
+- No Xft/fontconfig, i18n, session management, RandR, Xinerama, FriBidi, freedesktop menus or sound.
+- `/boot/etc/icewm/prefoverride` sets every font to the server's built-in `fixed` font and turns off the network, battery and mail applets.
+- `/boot/etc/icewm/programs` and `menu` hold the Kestrel menus.
+- The sysroot gained libXext, libXrender, libXfixes, libXdamage, libXcomposite, libXpm and libpng.
+
+**Kernel support it needed:** `select`/`pselect6`, `wait4` (no children), `/proc/stat`, and execute bits on boot-volume files (IceWM only lists programs it can see are executable).
+
+**Trying it:**
+- `kestrel.exec=/boot/bin/Xkestrel,:0+2s+/boot/bin/icewm+3s+/boot/bin/xdemo`.
+- Checked in QEMU: IceWM frames the xdemo window, Ctrl+Esc opens the start menu, and dragging the title bar moves the window.
+
+**Not yet:** starting programs from the menu. That needs fork/exec; until then choosing an entry fails with "Function not implemented". Also missing: icewmbg (backgrounds), icewm-session and other fonts than `fixed`.
 
 ## Memory map at boot
 

@@ -5,7 +5,8 @@
 # SYSROOT (headers, lib*.a, pkg-config files). SRC_DIR holds the upstream
 # release tarballs (*.orig.tar.* from Ubuntu's source packages work:
 # `apt-get source --download-only xorgproto xtrans libxau libxdmcp xcb-proto
-# libxcb libx11 libxkbfile libfontenc libxfont pixman zlib`).
+# libxcb libx11 libxkbfile libfontenc libxfont pixman zlib libxext libxrender
+# libxfixes libxdamage libxcomposite libxpm libpng1.6`).
 set -eu
 SRC=$(cd "$1" && pwd)
 SYSROOT=$(mkdir -p "$2" && cd "$2" && pwd)
@@ -82,6 +83,15 @@ autotools  libxkbfile
 autotools  libfontenc
 autotools  libxfont --disable-devel-docs --disable-freetype --disable-bzip2
 mesonbuild pixman -Dgtk=disabled -Dlibpng=disabled -Dopenmp=disabled -Dtests=disabled
+
+# client libraries for window managers and toolkits (IceWM)
+autotools  libxext --disable-specs --without-xmlto --without-fop
+autotools  libxrender
+autotools  libxfixes
+autotools  libxdamage
+autotools  libxcomposite --disable-doc --without-xmlto
+autotools  libxpm --disable-open-zfile --disable-stat-zfile
+autotools  libpng1.6 --disable-tools
 
 # libsha1 (ours)
 if [ ! -f "$WORK/libsha1.done" ]; then
