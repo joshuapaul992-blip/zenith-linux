@@ -393,20 +393,31 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     if (!strstr(g_boot.cmdline, "kestrel.report=0") && report_locate())
         report_save("written at boot");
 
-    /* kestrel.exec=/boot/bin/prog[,arg...]: run a ring-3 program at boot and
-     * log its exit status (automated tests; no keyboard needed). */
+    /* kestrel.exec=/boot/bin/prog[,arg...][+/boot/bin/prog2[,arg...]...]:
+     * run ring-3 programs at boot (several at once, e.g. a server and its
+     * client) with their output in the kernel log, and log each exit status.
+     * For unattended tests; no keyboard needed. */
     const char *ex = strstr(g_boot.cmdline, "kestrel.exec=");
     if (ex) {
-        static char line[160];
-        char *args[EXEC_MAX_ARGS];
-        int n = 0;
+        static char line[256];
         size_t i = 0;
-        for (ex += 13; *ex && *ex != ' ' && i + 1 < sizeof line; ex++) line[i++] = *ex == ',' ? 0 : *ex;
+        for (ex += 13; *ex && *ex != ' ' && i + 1 < sizeof line; ex++) line[i++] = *ex;
         line[i] = 0;
-        for (size_t k = 0; k < i && n < EXEC_MAX_ARGS; k += strlen(line + k) + 1) args[n++] = line + k;
-        int pid = n ? exec_spawn_io(args[0], n, args, "/dev/kmsg") : -EINVAL;   /* output into the log */
-        if (pid < 0) kprintf("kestrel.exec: %s: cannot start (%d)\n", n ? args[0] : "", pid);
-        else task_create("exec-wait", exec_waiter, (void *)(intptr_t)pid);
+        for (char *prog = line; prog && *prog; ) {
+            char *next = strchr(prog, '+');
+            if (next) *next++ = 0;
+            char *args[EXEC_MAX_ARGS];
+            int n = 0;
+            for (char *p = prog; p && n < EXEC_MAX_ARGS; ) {
+                args[n++] = p;
+                p = strchr(p, ',');
+                if (p) *p++ = 0;
+            }
+            int pid = exec_spawn_io(args[0], n, args, "/dev/kmsg");     /* output into the log */
+            if (pid < 0) kprintf("kestrel.exec: %s: cannot start (%d)\n", args[0], pid);
+            else task_create("exec-wait", exec_waiter, (void *)(intptr_t)pid);
+            prog = next;
+        }
     }
 
     if (!task_create("init", init_main, NULL)) panic("cannot start init");

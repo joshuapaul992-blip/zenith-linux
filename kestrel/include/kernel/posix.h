@@ -40,6 +40,17 @@ typedef uint32_t gid_t;
 #define EROFS        30
 #define EXDEV        18
 #define EPIPE        32
+#define ENXIO         6
+#define ENOTSOCK     88
+#define EPROTOTYPE   91
+#define EPROTONOSUPPORT 93
+#define EOPNOTSUPP   95
+#define EAFNOSUPPORT 97
+#define EADDRINUSE   98
+#define ENOTCONN    107
+#define ECONNREFUSED 111
+#define EISCONN     106
+#define ECONNRESET  104
 #define ERANGE       34
 #define ETIMEDOUT   110
 #define ENOMEDIUM   123
@@ -70,6 +81,7 @@ typedef uint32_t gid_t;
 #define S_IFCHR  0020000
 #define S_IFREG  0100000
 #define S_IFLNK  0120000
+#define S_IFSOCK 0140000
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)

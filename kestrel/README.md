@@ -541,7 +541,7 @@ Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), access, umask, getrandom, stat, fstat, lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getuid, getgid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, chown, utimensat, getdents64, clock_gettime (`CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the HPET), reboot.
+**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), access, umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getuid, getgid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, chown, utimensat, getdents64, clock_gettime (`CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the HPET), reboot.
 
 **Accepted but inert (no signals yet):** rt_sigaction, rt_sigprocmask.
 
@@ -567,7 +567,18 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 
 **Pipes and poll:** pipes have a 16 KiB buffer and follow POSIX blocking rules; with no signals, a write to a pipe without readers returns `-EPIPE`. `poll` re-checks readiness every millisecond until something is ready or the timeout expires. Files and devices without their own poll hook are always ready.
 
-Not done yet: W^X page permissions, file-backed `mmap`, fork/execve, signals, threads, and sockets. These are the next steps of the XLibre port.
+**Unix-domain sockets** (`fs/unixsock.c`): `AF_UNIX` / `SOCK_STREAM`, the way X11 connects clients locally.
+- **Names:** a path in the file system (a socket node, e.g. `/tmp/.X11-unix/X0`) or Linux's abstract namespace (`sun_path[0] == 0`), which xtrans tries first.
+- **Connecting:** `connect` completes at once by queueing a socket on the listener, and `accept` hands it out.
+- **Data:** each direction has a 64 KiB buffer, with blocking, `O_NONBLOCK`/`MSG_DONTWAIT`, `MSG_PEEK`, EOF, `EPIPE`, `FIONREAD` and `poll` readiness as on Linux.
+- **Credentials:** `SO_PEERCRED` reports the pid/uid/gid of the process that created the peer.
+- **Not yet:** descriptor passing (`SCM_RIGHTS`; a `sendmsg` with control data is refused, not dropped), and `SOCK_DGRAM`/`SOCK_SEQPACKET`.
+
+`user/socktest.c` (`/boot/bin/socktest`) checks all of this, in one process or as two:
+- `socktest`: 20 checks in one process.
+- `socktest server` with `socktest client`: a real server and client, started together with `kestrel.exec=/boot/bin/socktest,server+/boot/bin/socktest,client` (`+` separates programs).
+
+Not done yet: W^X page permissions, file-backed `mmap`, fork/execve, signals, threads, and `SCM_RIGHTS`. These come as the XLibre port needs them.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 

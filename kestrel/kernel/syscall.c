@@ -15,6 +15,7 @@
 #include <kernel/time.h>
 #include <kernel/storage.h>
 #include <kernel/uvm.h>
+#include <kernel/socket.h>
 
 extern void syscall_entry(void);
 
@@ -608,6 +609,205 @@ static int64_t sys_getrandom(uint64_t buf, uint64_t len, uint64_t flags, uint64_
     return (int64_t)len;
 }
 
+/* ---- AF_UNIX sockets (fs/unixsock.c) ------------------------------------ */
+static int64_t sock_fd(int fd, struct file **out)
+{
+    struct file **f = fd_slot(fd);
+    if (!f) return -EBADF;
+    if (!usock_is(*f)) return -ENOTSOCK;
+    *out = *f;
+    return 0;
+}
+
+static int64_t install(struct file *f, bool cloexec)
+{
+    int fd = fd_alloc(current_task(), 0, f, cloexec);
+    if (fd < 0) vfs_close(f);
+    return fd;
+}
+
+static int64_t sys_socket(uint64_t dom, uint64_t type, uint64_t proto, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct file *f;
+    int rc = usock_create((int)dom, (int)type, (int)proto, &f);
+    return rc ? rc : install(f, type & SOCK_CLOEXEC);
+}
+
+static int64_t sys_socketpair(uint64_t dom, uint64_t type, uint64_t proto, uint64_t sv, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (dom != AF_UNIX) return -EAFNOSUPPORT;
+    if (proto) return -EPROTONOSUPPORT;
+    if (bad_buf(sv, 8)) return -EFAULT;
+    struct file *a, *b;
+    int rc = usock_pair((int)type, &a, &b);
+    if (rc) return rc;
+    int64_t x = install(a, type & SOCK_CLOEXEC);
+    if (x < 0) { vfs_close(b); return x; }
+    int64_t y = install(b, type & SOCK_CLOEXEC);
+    if (y < 0) { vfs_close(current_task()->fds[x]); current_task()->fds[x] = NULL; return y; }
+    ((int *)sv)[0] = (int)x;
+    ((int *)sv)[1] = (int)y;
+    return 0;
+}
+
+static int64_t sys_bind(uint64_t fd, uint64_t addr, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (bad_buf(addr, len)) return -EFAULT;
+    return usock_bind(f, (const struct sockaddr_un *)addr, (uint32_t)len);
+}
+
+static int64_t sys_listen(uint64_t fd, uint64_t backlog, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    return rc ? rc : usock_listen(f, (int)backlog);
+}
+
+static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (bad_buf(addr, len)) return -EFAULT;
+    return usock_connect(f, (const struct sockaddr_un *)addr, (uint32_t)len);
+}
+
+static int64_t sys_accept4(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (flags & ~(uint64_t)(SOCK_NONBLOCK | SOCK_CLOEXEC)) return -EINVAL;
+    uint32_t len = 0;
+    if (addr) {
+        if (bad_buf(lenp, 4)) return -EFAULT;
+        len = *(uint32_t *)lenp;
+        if (bad_buf(addr, len)) return -EFAULT;
+    }
+    struct file *nf;
+    rc = usock_accept(f, (int)flags, &nf, addr ? (struct sockaddr_un *)addr : NULL, addr ? &len : NULL);
+    if (rc) return rc;
+    if (addr) *(uint32_t *)lenp = len;
+    return install(nf, flags & SOCK_CLOEXEC);
+}
+
+static int64_t sys_accept(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; return sys_accept4(fd, addr, lenp, 0, a5, a6); }
+
+static int64_t sys_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t addr, uint64_t alen)
+{
+    (void)alen;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (addr) return -EISCONN;                          /* stream sockets only */
+    if (bad_buf(buf, len)) return -EFAULT;
+    return usock_send(f, (const void *)buf, len, (int)flags);
+}
+
+static int64_t sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t addr, uint64_t alenp)
+{
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (bad_buf(buf, len)) return -EFAULT;
+    rc = usock_recv(f, (void *)buf, len, (int)flags);
+    if (rc >= 0 && addr && !bad_buf(alenp, 4)) *(uint32_t *)alenp = 0;
+    return rc;
+}
+
+struct msghdr_k {
+    uint64_t name; uint32_t namelen, pad0;
+    uint64_t iov, iovlen, control, controllen;
+    int32_t  flags, pad1;
+};
+
+/* Data only for now: a message carrying ancillary data (SCM_RIGHTS
+ * descriptor passing, used by MIT-SHM/DRI3) is refused, never dropped. */
+static int64_t msg_io(uint64_t fd, uint64_t msg, uint64_t flags, bool send)
+{
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (bad_buf(msg, sizeof(struct msghdr_k))) return -EFAULT;
+    struct msghdr_k *m = (struct msghdr_k *)msg;
+    if (send && m->controllen) return -EOPNOTSUPP;
+    if (m->iovlen > 1024) return -EINVAL;
+    if (m->iovlen && bad_buf(m->iov, m->iovlen * sizeof(struct iovec))) return -EFAULT;
+    const struct iovec *v = (const struct iovec *)m->iov;
+    int64_t total = 0;
+    for (uint64_t i = 0; i < m->iovlen; i++) {
+        if (!v[i].len) continue;
+        if (bad_buf(v[i].base, v[i].len)) return total ? total : -EFAULT;
+        long n = send ? usock_send(f, (const void *)v[i].base, v[i].len, (int)flags | (total ? MSG_DONTWAIT : 0))
+                      : usock_recv(f, (void *)v[i].base, v[i].len, (int)flags | (total ? MSG_DONTWAIT : 0));
+        if (n < 0) return total ? total : n;
+        total += n;
+        if ((uint64_t)n < v[i].len) break;
+    }
+    if (!send) { m->controllen = 0; m->flags = 0; if (m->name) m->namelen = 0; }
+    return total;
+}
+
+static int64_t sys_sendmsg(uint64_t fd, uint64_t msg, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return msg_io(fd, msg, flags, true); }
+
+static int64_t sys_recvmsg(uint64_t fd, uint64_t msg, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return msg_io(fd, msg, flags, false); }
+
+static int64_t sys_shutdown(uint64_t fd, uint64_t how, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (how > SHUT_RDWR) return -EINVAL;
+    return usock_shutdown(f, (int)how);
+}
+
+static int64_t sock_name(uint64_t fd, uint64_t addr, uint64_t lenp, bool peer)
+{
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (bad_buf(lenp, 4)) return -EFAULT;
+    uint32_t len = *(uint32_t *)lenp;
+    if (len && bad_buf(addr, len)) return -EFAULT;
+    struct sockaddr_un tmp;
+    uint32_t got = sizeof tmp;
+    if ((rc = usock_name(f, peer, &tmp, &got))) return rc;
+    memcpy((void *)addr, &tmp, got < len ? got : len);
+    *(uint32_t *)lenp = got;
+    return 0;
+}
+
+static int64_t sys_getsockname(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sock_name(fd, addr, lenp, false); }
+
+static int64_t sys_getpeername(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sock_name(fd, addr, lenp, true); }
+
+/* Options are accepted and ignored (SO_REUSEADDR, buffer sizes, ...). */
+static int64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_t val, uint64_t len, uint64_t a6)
+{
+    (void)level; (void)opt; (void)val; (void)len; (void)a6;
+    struct file *f;
+    return sock_fd((int)fd, &f);
+}
+
+static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_t val, uint64_t lenp, uint64_t a6)
+{
+    (void)a6;
+    struct file *f; int64_t rc = sock_fd((int)fd, &f);
+    if (rc) return rc;
+    if (bad_buf(lenp, 4)) return -EFAULT;
+    uint32_t len = *(uint32_t *)lenp;
+    if (bad_buf(val, len)) return -EFAULT;
+    rc = usock_getsockopt(f, (int)level, (int)opt, (void *)val, &len);
+    if (!rc) *(uint32_t *)lenp = len;
+    return rc;
+}
+
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -646,6 +846,14 @@ void syscall_init(void)
     REG(SYS_dup3, sys_dup3);           REG(SYS_pipe, sys_pipe);
     REG(SYS_pipe2, sys_pipe2);         REG(SYS_access, sys_access);
     REG(SYS_umask, sys_umask);         REG(SYS_getrandom, sys_getrandom);
+    REG(SYS_socket, sys_socket);       REG(SYS_socketpair, sys_socketpair);
+    REG(SYS_bind, sys_bind);           REG(SYS_listen, sys_listen);
+    REG(SYS_connect, sys_connect);     REG(SYS_accept, sys_accept);
+    REG(SYS_accept4, sys_accept4);     REG(SYS_sendto, sys_sendto);
+    REG(SYS_recvfrom, sys_recvfrom);   REG(SYS_sendmsg, sys_sendmsg);
+    REG(SYS_recvmsg, sys_recvmsg);     REG(SYS_shutdown, sys_shutdown);
+    REG(SYS_getsockname, sys_getsockname); REG(SYS_getpeername, sys_getpeername);
+    REG(SYS_setsockopt, sys_setsockopt);   REG(SYS_getsockopt, sys_getsockopt);
     REG(SYS_fork, sys_enosys);         REG(SYS_execve, sys_enosys);
     REG(SYS_wait4, sys_enosys);        REG(SYS_kill, sys_enosys);
     REG(SYS_gettimeofday, sys_enosys);

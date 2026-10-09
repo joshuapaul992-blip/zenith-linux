@@ -67,7 +67,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
-           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c lib/crc32.c \
+           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c fs/unixsock.c lib/crc32.c \
            drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
            kernel/display.c kernel/tty.c kernel/report.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
@@ -171,7 +171,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest
+MUSL_PROGS  := libctest socktest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

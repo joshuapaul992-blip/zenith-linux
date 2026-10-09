@@ -21,7 +21,7 @@
 #define VFS_NAME_MAX 64
 #define VFS_PATH_MAX 256
 
-enum vtype { VNON = 0, VREG, VDIR, VCHR };
+enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK };
 
 struct vnode;
 struct mount;
@@ -99,6 +99,7 @@ int           vfs_mount(struct mount *m, const char *path);
 /* ---- path operations (relative paths use the current task's cwd) ------- */
 int     vfs_lookup(const char *path, struct vnode **out);
 int     vfs_mkdir(const char *path, mode_t mode);
+int     vfs_mksock(const char *path, mode_t mode, struct vnode **out);   /* bind(2) */
 int     vfs_unlink(const char *path);
 int     vfs_rmdir(const char *path);
 int     vfs_rename(const char *from, const char *to);

@@ -30,7 +30,7 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
     if (!vn) return NULL;
     strlcpy(vn->name, name, sizeof vn->name);
     vn->type  = t;
-    vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : S_IFREG);
+    vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : t == VSOCK ? S_IFSOCK : S_IFREG);
     vn->ino   = next_ino++;
     vn->ops   = ops;
     vn->fs    = fs;
@@ -181,6 +181,22 @@ int vfs_mkdir(const char *path, mode_t mode)
     struct vnode *d = vfs_node_new(parent->fs, name, VDIR, mode & 0777, &ramfs_ops);
     if (!d) return -ENOMEM;
     vfs_node_add(parent, d);
+    return 0;
+}
+
+/* A socket's name in the file system: a node with no operations that
+ * connect(2) finds by path (fs/unixsock.c keeps the socket itself). */
+int vfs_mksock(const char *path, mode_t mode, struct vnode **out)
+{
+    struct vnode *parent; char name[VFS_NAME_MAX];
+    int r = walk(path, NULL, &parent, name);
+    if (r < 0) return r;
+    if (child_named(parent, name)) return -EADDRINUSE;
+    if ((r = check_writable_dir(parent)) < 0) return r;
+    struct vnode *s = vfs_node_new(parent->fs, name, VSOCK, mode & 0777, NULL);
+    if (!s) return -ENOMEM;
+    vfs_node_add(parent, s);
+    *out = s;
     return 0;
 }
 
@@ -372,6 +388,7 @@ int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
     }
 
     int acc = flags & O_ACCMODE;
+    if (vn->type == VSOCK) return -ENXIO;                   /* sockets are connect()ed, not opened */
     if (vn->type == VDIR && acc != O_RDONLY) return -EISDIR;
     if ((flags & O_DIRECTORY) && vn->type != VDIR) return -ENOTDIR;
     if (acc != O_RDONLY && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
@@ -414,7 +431,7 @@ ssize_t vfs_write(struct file *f, const void *buf, size_t len)
 
 off_t vfs_lseek(struct file *f, off_t off, int whence)
 {
-    if (f->vn->type == VCHR && !(f->vn->ops && f->vn->ops->size)) return -ESPIPE;   /* ttys, null... */
+    if (f->vn->type == VSOCK || (f->vn->type == VCHR && !(f->vn->ops && f->vn->ops->size))) return -ESPIPE;   /* ttys, null... */
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->off
                  : whence == SEEK_END ? (int64_t)node_size(f->vn) : -1;
     if (base < 0 || base + off < 0) return -EINVAL;
