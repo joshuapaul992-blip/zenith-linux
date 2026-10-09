@@ -1,0 +1,3 @@
+Minimal stand-ins for generated AROS system headers, used ONLY to
+syntax/type-check nouveau.hidd sources with the host compiler when the
+AROS cross toolchain cannot be built. Not a substitute for an AROS build.

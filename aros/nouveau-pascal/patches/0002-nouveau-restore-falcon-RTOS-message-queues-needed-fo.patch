@@ -1,0 +1,410 @@
+From 52e7a3ced87160757397c1b80a3b13d9ab15c2da Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 03:14:27 +0000
+Subject: [PATCH 2/3] nouveau: restore falcon RTOS message queues (needed for
+ Pascal)
+
+On GP102-GP108 secure boot runs the ACR on SEC2, which is itself an
+LS-managed falcon running NVIDIA's RTOS. FECS and GPCCS are started by
+posting ACR_CMD_BOOTSTRAP_FALCON to that RTOS through the falcon
+message queue, on every GR init and not only on reset.
+
+The message queue was stubbed with NOT_IMPLEMENTED_STOP, so a Pascal
+card hung forever in nvkm_msgqueue_ctor() as soon as the SEC2 firmware
+was loaded. cmd_write() also skipped cmd_queue_open(), which takes the
+queue lock and computes the write position, so commands would have been
+written at a stale offset with an unlocked semaphore released.
+
+With completions available in drm-compat, msgqueue.h,
+msgqueue_0148cdec.c (SEC2) and msgqueue_0137c63d.c (PMU) are back to
+the upstream 5.4.302 sources. msgqueue.c keeps one AROS change: the
+queue-full retry loop polls with udelay() instead of jiffies.
+
+patches/drm-aros.diff is refreshed for these files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LaFFmUWBSJL732ja1ybwuh
+---
+ .../drm/nouveau/nvkm/falcon/msgqueue.c        |  30 ++--
+ .../drm/nouveau/nvkm/falcon/msgqueue.h        |   2 -
+ .../nouveau/nvkm/falcon/msgqueue_0137c63d.c   |  10 +-
+ .../nouveau/nvkm/falcon/msgqueue_0148cdec.c   |   6 -
+ workbench/hidds/nouveau/patches/drm-aros.diff | 169 ++----------------
+ 5 files changed, 30 insertions(+), 187 deletions(-)
+
+diff --git a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.c b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.c
+index 2ed2b6ad..a901b367 100644
+--- a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.c
++++ b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.c
+@@ -252,22 +252,28 @@ cmd_write(struct nvkm_msgqueue *priv, struct nvkm_msgqueue_hdr *cmd,
+ {
+ 	const struct nvkm_subdev *subdev = priv->falcon->owner;
+ 	static unsigned timeout = 2000;
+-NOT_IMPLEMENTED_STOP
+-#if 0
++#if !defined(__AROS__)
+ 	unsigned long end_jiffies = jiffies + msecs_to_jiffies(timeout);
++#else
++	unsigned long usecs = timeout * 1000;
++#endif
+ 	int ret = -EAGAIN;
+ 	bool commit = true;
+ 
++#if !defined(__AROS__)
+ 	while (ret == -EAGAIN && time_before(jiffies, end_jiffies))
+ 		ret = cmd_queue_open(priv, queue, cmd->size);
++#else
++	while ((ret = cmd_queue_open(priv, queue, cmd->size)) == -EAGAIN &&
++	       usecs != 0) {
++		usecs -= 1000;
++		udelay(1000);
++	}
++#endif
+ 	if (ret) {
+ 		nvkm_error(subdev, "pmu_queue_open_write failed\n");
+ 		return ret;
+ 	}
+-#else
+-	int ret = -EAGAIN;
+-	bool commit = true;
+-#endif
+ 
+ 	ret = cmd_queue_push(priv, queue, cmd, cmd->size);
+ 	if (ret) {
+@@ -331,12 +337,9 @@ nvkm_msgqueue_post(struct nvkm_msgqueue *priv, enum msgqueue_msg_priority prio,
+ 	struct nvkm_msgqueue_queue *queue;
+ 	int ret;
+ 
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	if (wait_init && !wait_for_completion_timeout(&priv->init_done,
+ 					 msecs_to_jiffies(1000)))
+ 		return -ETIMEDOUT;
+-#endif
+ 
+ 	queue = priv->func->cmd_queue(priv, prio);
+ 	if (IS_ERR(queue))
+@@ -379,11 +382,8 @@ msgqueue_msg_handle(struct nvkm_msgqueue *priv, struct nvkm_msgqueue_hdr *hdr)
+ 			seq->callback(priv, hdr);
+ 	}
+ 
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	if (seq->completion)
+ 		complete(seq->completion);
+-#endif
+ 
+ 	msgqueue_seq_release(priv, seq);
+ 
+@@ -565,10 +565,7 @@ nvkm_msgqueue_reinit(struct nvkm_msgqueue *queue)
+ 		return 0;
+ 
+ 	queue->init_msg_received = false;
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	reinit_completion(&queue->init_done);
+-#endif
+ 
+ 	return 0;
+ }
+@@ -586,10 +583,7 @@ nvkm_msgqueue_ctor(const struct nvkm_msgqueue_func *func,
+ 	for (i = 0; i < NVKM_MSGQUEUE_NUM_SEQUENCES; i++)
+ 		queue->seq[i].id = i;
+ 
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	init_completion(&queue->init_done);
+-#endif
+ 
+ 
+ }
+diff --git a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.h b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.h
+index 4302db54..13b54f8d 100644
+--- a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.h
++++ b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue.h
+@@ -188,9 +188,7 @@ struct nvkm_msgqueue {
+ 	const struct nvkm_msgqueue_func *func;
+ 	u32 fw_version;
+ 	bool init_msg_received;
+-#if !defined(__AROS__)
+ 	struct completion init_done;
+-#endif
+ 
+ 	struct mutex seq_lock;
+ 	struct nvkm_msgqueue_seq seq[NVKM_MSGQUEUE_NUM_SEQUENCES];
+diff --git a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0137c63d.c b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0137c63d.c
+index e3571c9a..fec02731 100644
+--- a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0137c63d.c
++++ b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0137c63d.c
+@@ -209,10 +209,7 @@ acr_init_wpr_callback(struct nvkm_msgqueue *queue,
+ 	}
+ 
+ 	nvkm_debug(subdev, "ACR WPR init complete\n");
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	complete_all(&queue->init_done);
+-#endif
+ }
+ 
+ static int
+@@ -271,8 +268,6 @@ enum {
+ static int
+ acr_boot_falcon(struct nvkm_msgqueue *priv, enum nvkm_secboot_falcon falcon)
+ {
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	DECLARE_COMPLETION_ONSTACK(completed);
+ 	/*
+ 	 * flags      - Flag specifying RESET or no RESET.
+@@ -297,7 +292,7 @@ NOT_IMPLEMENTED_STOP
+ 
+ 	if (!wait_for_completion_timeout(&completed, msecs_to_jiffies(1000)))
+ 		return -ETIMEDOUT;
+-#endif
++
+ 	return 0;
+ }
+ 
+@@ -331,8 +326,6 @@ acr_boot_multiple_falcons_callback(struct nvkm_msgqueue *priv,
+ static int
+ acr_boot_multiple_falcons(struct nvkm_msgqueue *priv, unsigned long falcon_mask)
+ {
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	DECLARE_COMPLETION_ONSTACK(completed);
+ 	/*
+ 	 * flags      - Flag specifying RESET or no RESET.
+@@ -363,7 +356,6 @@ NOT_IMPLEMENTED_STOP
+ 
+ 	if (!wait_for_completion_timeout(&completed, msecs_to_jiffies(1000)))
+ 		return -ETIMEDOUT;
+-#endif
+ 
+ 	return 0;
+ }
+diff --git a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0148cdec.c b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0148cdec.c
+index 7229d941..9424803b 100644
+--- a/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0148cdec.c
++++ b/workbench/hidds/nouveau/drm/nouveau/nvkm/falcon/msgqueue_0148cdec.c
+@@ -141,10 +141,7 @@ init_callback(struct nvkm_msgqueue *_queue, struct nvkm_msgqueue_hdr *hdr)
+ 			   id, queue->index, queue->offset, queue->size);
+ 	}
+ 
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	complete_all(&_queue->init_done);
+-#endif
+ 
+ 	return 0;
+ }
+@@ -201,8 +198,6 @@ enum {
+ static int
+ acr_boot_falcon(struct nvkm_msgqueue *priv, enum nvkm_secboot_falcon falcon)
+ {
+-NOT_IMPLEMENTED_STOP
+-#if 0
+ 	DECLARE_COMPLETION_ONSTACK(completed);
+ 	/*
+ 	 * flags      - Flag specifying RESET or no RESET.
+@@ -227,7 +222,6 @@ NOT_IMPLEMENTED_STOP
+ 
+ 	if (!wait_for_completion_timeout(&completed, msecs_to_jiffies(1000)))
+ 		return -ETIMEDOUT;
+-#endif
+ 
+ 	return 0;
+ }
+diff --git a/workbench/hidds/nouveau/patches/drm-aros.diff b/workbench/hidds/nouveau/patches/drm-aros.diff
+index 8ab52598..fad2d4ba 100644
+--- a/workbench/hidds/nouveau/patches/drm-aros.diff
++++ b/workbench/hidds/nouveau/patches/drm-aros.diff
+@@ -7091,169 +7091,34 @@ diff -ur ./drm-5.4.302/nouveau/nvkm/engine/gr/gf100.c ./drm/nouveau/nvkm/engine/
+  
+  	nvkm_error(subdev,
+  		   "wait for idle timeout (en: %d, ctxsw: %d, busy: %d)\n",
+-diff -ur ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue_0137c63d.c ./drm/nouveau/nvkm/falcon/msgqueue_0137c63d.c
+---- ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue_0137c63d.c	2025-12-03 12:45:22.000000000 +0100
+-+++ ./drm/nouveau/nvkm/falcon/msgqueue_0137c63d.c	2026-07-22 17:58:29.000000000 +0200
+-@@ -209,7 +209,10 @@
+- 	}
+- 
+- 	nvkm_debug(subdev, "ACR WPR init complete\n");
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	complete_all(&queue->init_done);
+-+#endif
+- }
+- 
+- static int
+-@@ -268,6 +271,8 @@
+- static int
+- acr_boot_falcon(struct nvkm_msgqueue *priv, enum nvkm_secboot_falcon falcon)
+- {
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	DECLARE_COMPLETION_ONSTACK(completed);
+- 	/*
+- 	 * flags      - Flag specifying RESET or no RESET.
+-@@ -292,7 +297,7 @@
+- 
+- 	if (!wait_for_completion_timeout(&completed, msecs_to_jiffies(1000)))
+- 		return -ETIMEDOUT;
+--
+-+#endif
+- 	return 0;
+- }
+- 
+-@@ -326,6 +331,8 @@
+- static int
+- acr_boot_multiple_falcons(struct nvkm_msgqueue *priv, unsigned long falcon_mask)
+- {
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	DECLARE_COMPLETION_ONSTACK(completed);
+- 	/*
+- 	 * flags      - Flag specifying RESET or no RESET.
+-@@ -356,6 +363,7 @@
+- 
+- 	if (!wait_for_completion_timeout(&completed, msecs_to_jiffies(1000)))
+- 		return -ETIMEDOUT;
+-+#endif
+- 
+- 	return 0;
+- }
+-diff -ur ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue_0148cdec.c ./drm/nouveau/nvkm/falcon/msgqueue_0148cdec.c
+---- ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue_0148cdec.c	2025-12-03 12:45:22.000000000 +0100
+-+++ ./drm/nouveau/nvkm/falcon/msgqueue_0148cdec.c	2026-07-22 17:58:29.000000000 +0200
+-@@ -141,7 +141,10 @@
+- 			   id, queue->index, queue->offset, queue->size);
+- 	}
+- 
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	complete_all(&_queue->init_done);
+-+#endif
+- 
+- 	return 0;
+- }
+-@@ -198,6 +201,8 @@
+- static int
+- acr_boot_falcon(struct nvkm_msgqueue *priv, enum nvkm_secboot_falcon falcon)
+- {
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	DECLARE_COMPLETION_ONSTACK(completed);
+- 	/*
+- 	 * flags      - Flag specifying RESET or no RESET.
+-@@ -222,6 +227,7 @@
+- 
+- 	if (!wait_for_completion_timeout(&completed, msecs_to_jiffies(1000)))
+- 		return -ETIMEDOUT;
+-+#endif
+- 
+- 	return 0;
+- }
+ diff -ur ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue.c ./drm/nouveau/nvkm/falcon/msgqueue.c
+ --- ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue.c	2025-12-03 12:45:22.000000000 +0100
+-+++ ./drm/nouveau/nvkm/falcon/msgqueue.c	2026-07-22 17:58:29.000000000 +0200
+-@@ -252,6 +252,8 @@
+++++ ./drm/nouveau/nvkm/falcon/msgqueue.c	2026-10-09 03:14:04.000000000 +0000
++@@ -252,12 +252,24 @@
+  {
+  	const struct nvkm_subdev *subdev = priv->falcon->owner;
+  	static unsigned timeout = 2000;
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+++#if !defined(__AROS__)
+  	unsigned long end_jiffies = jiffies + msecs_to_jiffies(timeout);
+- 	int ret = -EAGAIN;
+- 	bool commit = true;
+-@@ -262,6 +264,10 @@
+- 		nvkm_error(subdev, "pmu_queue_open_write failed\n");
+- 		return ret;
+- 	}
+ +#else
+-+	int ret = -EAGAIN;
+-+	bool commit = true;
+-+#endif
+- 
+- 	ret = cmd_queue_push(priv, queue, cmd, cmd->size);
+- 	if (ret) {
+-@@ -325,9 +331,12 @@
+- 	struct nvkm_msgqueue_queue *queue;
+- 	int ret;
+- 
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	if (wait_init && !wait_for_completion_timeout(&priv->init_done,
+- 					 msecs_to_jiffies(1000)))
+- 		return -ETIMEDOUT;
+-+#endif
+- 
+- 	queue = priv->func->cmd_queue(priv, prio);
+- 	if (IS_ERR(queue))
+-@@ -370,8 +379,11 @@
+- 			seq->callback(priv, hdr);
+- 	}
+- 
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	if (seq->completion)
+- 		complete(seq->completion);
+++	unsigned long usecs = timeout * 1000;
+ +#endif
++ 	int ret = -EAGAIN;
++ 	bool commit = true;
+  
+- 	msgqueue_seq_release(priv, seq);
+- 
+-@@ -553,7 +565,10 @@
+- 		return 0;
+- 
+- 	queue->init_msg_received = false;
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	reinit_completion(&queue->init_done);
+-+#endif
+- 
+- 	return 0;
+- }
+-@@ -571,7 +586,10 @@
+- 	for (i = 0; i < NVKM_MSGQUEUE_NUM_SEQUENCES; i++)
+- 		queue->seq[i].id = i;
+- 
+-+NOT_IMPLEMENTED_STOP
+-+#if 0
+- 	init_completion(&queue->init_done);
+-+#endif
+- 
+- 
+- }
+-diff -ur ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue.h ./drm/nouveau/nvkm/falcon/msgqueue.h
+---- ./drm-5.4.302/nouveau/nvkm/falcon/msgqueue.h	2025-12-03 12:45:22.000000000 +0100
+-+++ ./drm/nouveau/nvkm/falcon/msgqueue.h	2026-07-22 17:58:29.000000000 +0200
+-@@ -188,7 +188,9 @@
+- 	const struct nvkm_msgqueue_func *func;
+- 	u32 fw_version;
+- 	bool init_msg_received;
+ +#if !defined(__AROS__)
+- 	struct completion init_done;
++ 	while (ret == -EAGAIN && time_before(jiffies, end_jiffies))
++ 		ret = cmd_queue_open(priv, queue, cmd->size);
+++#else
+++	while ((ret = cmd_queue_open(priv, queue, cmd->size)) == -EAGAIN &&
+++	       usecs != 0) {
+++		usecs -= 1000;
+++		udelay(1000);
+++	}
+ +#endif
+- 
+- 	struct mutex seq_lock;
+- 	struct nvkm_msgqueue_seq seq[NVKM_MSGQUEUE_NUM_SEQUENCES];
++ 	if (ret) {
++ 		nvkm_error(subdev, "pmu_queue_open_write failed\n");
++ 		return ret;
+ diff -ur ./drm-5.4.302/nouveau/nvkm/subdev/bios/init.c ./drm/nouveau/nvkm/subdev/bios/init.c
+ --- ./drm-5.4.302/nouveau/nvkm/subdev/bios/init.c	2025-12-03 12:45:22.000000000 +0100
+ +++ ./drm/nouveau/nvkm/subdev/bios/init.c	2026-07-22 17:58:29.000000000 +0200
+-- 
+2.43.0
+

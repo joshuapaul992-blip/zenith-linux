@@ -1,0 +1,198 @@
+From 64c5885639939d0e8c9f654da2a84a6cf65c8827 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 03:14:27 +0000
+Subject: [PATCH 3/3] nouveau.hidd: fall back to software rendering without
+ acceleration
+
+Maxwell 2 and Pascal cards need NVIDIA-signed firmware for the graphics
+engine. Without it nvkm leaves GR out and display still works, but the
+hidd ignored the failed acceleration setup (a BOOL was tested for < 0)
+and went on submitting 2D commands although the GPU channel or its
+engine objects were never set up.
+
+Record the result in carddata->accel_enabled. When it is FALSE, skip
+the GART scratch buffer and initial pattern, route Clear, FillRect and
+CopyBox to the software implementation, and refuse to create a Gallium
+object so Mesa falls back to its software renderer. Image transfers
+already take the CPU path when no GART buffer exists.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LaFFmUWBSJL732ja1ybwuh
+---
+ workbench/hidds/nouveau/nouveau_bitmapclass.c | 12 +++
+ .../hidds/nouveau/nouveau_galliumclass.c      |  6 +-
+ workbench/hidds/nouveau/nouveau_hiddclass.c   | 81 ++++++++++---------
+ workbench/hidds/nouveau/nouveau_intern.h      |  1 +
+ 4 files changed, 59 insertions(+), 41 deletions(-)
+
+diff --git a/workbench/hidds/nouveau/nouveau_bitmapclass.c b/workbench/hidds/nouveau/nouveau_bitmapclass.c
+index 1190b432..5bfcbc0a 100644
+--- a/workbench/hidds/nouveau/nouveau_bitmapclass.c
++++ b/workbench/hidds/nouveau/nouveau_bitmapclass.c
+@@ -295,6 +295,12 @@ VOID METHOD(NouveauBitMap, Hidd_BitMap, Clear)
+     struct CardData * carddata = &(SD(cl)->carddata);
+     BOOL ret = FALSE;
+     
++    if (!carddata->accel_enabled)
++    {
++        OOP_DoSuperMethod(cl, o, (OOP_Msg)msg);
++        return;
++    }
++
+     LOCK_ENGINE
+ 
+     LOCK_BITMAP
+@@ -345,6 +351,12 @@ VOID METHOD(NouveauBitMap, Hidd_BitMap, FillRect)
+     struct CardData * carddata = &(SD(cl)->carddata);
+     BOOL ret = FALSE;
+     
++    if (!carddata->accel_enabled)
++    {
++        OOP_DoSuperMethod(cl, o, (OOP_Msg)msg);
++        return;
++    }
++
+     LOCK_ENGINE
+ 
+     LOCK_BITMAP
+diff --git a/workbench/hidds/nouveau/nouveau_galliumclass.c b/workbench/hidds/nouveau/nouveau_galliumclass.c
+index bedbb0b2..df44737d 100644
+--- a/workbench/hidds/nouveau/nouveau_galliumclass.c
++++ b/workbench/hidds/nouveau/nouveau_galliumclass.c
+@@ -103,8 +103,10 @@ OOP_Object *METHOD(NouveauGallium, Root, New)
+     o = (OOP_Object *)OOP_DoSuperMethod(cl, o, (OOP_Msg) msg);
+     if(o)
+     {
+-        /* Check if chipset support hardware 3D via gallium */
+-        if ((SD(cl)->carddata.dev == NULL) || (SD(cl)->carddata.dev->chipset < 0x30))
++        /* Check if chipset support hardware 3D via gallium and if the
++           graphics engine is running (it needs firmware on newer cards) */
++        if ((SD(cl)->carddata.dev == NULL) || (SD(cl)->carddata.dev->chipset < 0x30)
++            || !SD(cl)->carddata.accel_enabled)
+         {
+             OOP_MethodID dispose_mid;
+             dispose_mid = OOP_GetMethodID(IID_Root, moRoot_Dispose);
+diff --git a/workbench/hidds/nouveau/nouveau_hiddclass.c b/workbench/hidds/nouveau/nouveau_hiddclass.c
+index 248589de..06560970 100644
+--- a/workbench/hidds/nouveau/nouveau_hiddclass.c
++++ b/workbench/hidds/nouveau/nouveau_hiddclass.c
+@@ -508,7 +508,6 @@ OOP_Object * METHOD(Nouveau, Root, New)
+     struct CardData * carddata = &(SD(cl)->carddata);
+     struct DisplayHandover *handover;
+     struct pci_dev *pdev;
+-    LONG ret;
+     ULONG selectedcrtcid;
+ 
+     pdev = nouveau_init_findcard();
+@@ -699,46 +698,49 @@ OOP_Object * METHOD(Nouveau, Root, New)
+             nouveau_bo_new(carddata->dev, NOUVEAU_BO_VRAM | NOUVEAU_BO_MAP, 0, 64 * 64 * 4, NULL, &gfxdata->cursor);
+             /* TODO: Check return, how to handle */
+ 
+-            /* Initialize acceleration objects */
+-        
+-            ret = HIDDNouveauAccelCommonInit(carddata);
+-            if (ret < 0)
+-            {
+-                /* TODO: Check ret, how to handle ? */
+-            }
+-
+-            /* Allocate GART scratch buffer */
+-            if (carddata->dev->gart_size > GART_BUFFER_SIZE)
+-                gartsize = GART_BUFFER_SIZE;
+-            else
+-                /* always leave 512kb for other things like the fifos */
+-                gartsize = carddata->dev->gart_size - 512 * 1024;
+-
+-            /* This can fail */
+-            nouveau_bo_new(carddata->dev, NOUVEAU_BO_GART | NOUVEAU_BO_MAP, 0, gartsize, NULL, &carddata->GART);
++            /* Initialize acceleration objects. This fails when the card has
++               no usable graphics engine, e.g. a Maxwell 2 or Pascal card
++               without its signed firmware in DEVS:Firmware/nvidia. The
++               display still works then, with all drawing done by the CPU. */
++            carddata->accel_enabled = HIDDNouveauAccelCommonInit(carddata);
++            if (!carddata->accel_enabled)
++                bug("[Nouveau] Acceleration not available, using software rendering\n");
+ 
+             InitSemaphore(&carddata->gartsemaphore);
+-            
+-            /* Set initial pattern (else 16-bit ROPs are not working) */
+-            switch(carddata->Architecture)
++
++            if (carddata->accel_enabled)
+             {
+-            case(NV_ARCH_03):
+-            case(NV_ARCH_04):
+-            case(NV_ARCH_10):
+-            case(NV_ARCH_20):
+-            case(NV_ARCH_30):
+-            case(NV_ARCH_40):
+-                HIDDNouveauNV04SetPattern(carddata, ~0, ~0, ~0, ~0);
+-                break;
+-            case(NV_TESLA):
+-                HIDDNouveauNV50SetPattern(carddata, ~0, ~0, ~0, ~0);
+-                break;
+-            case(NV_FERMI):
+-            case(NV_KEPLER):
+-            case(NV_MAXWELL):
+-            case(NV_PASCAL):
+-                HIDDNouveauNVC0SetPattern(carddata, ~0, ~0, ~0, ~0);
+-                break;
++                /* Allocate GART scratch buffer */
++                if (carddata->dev->gart_size > GART_BUFFER_SIZE)
++                    gartsize = GART_BUFFER_SIZE;
++                else
++                    /* always leave 512kb for other things like the fifos */
++                    gartsize = carddata->dev->gart_size - 512 * 1024;
++
++                /* This can fail */
++                nouveau_bo_new(carddata->dev, NOUVEAU_BO_GART | NOUVEAU_BO_MAP, 0, gartsize, NULL, &carddata->GART);
++
++                /* Set initial pattern (else 16-bit ROPs are not working) */
++                switch(carddata->Architecture)
++                {
++                case(NV_ARCH_03):
++                case(NV_ARCH_04):
++                case(NV_ARCH_10):
++                case(NV_ARCH_20):
++                case(NV_ARCH_30):
++                case(NV_ARCH_40):
++                    HIDDNouveauNV04SetPattern(carddata, ~0, ~0, ~0, ~0);
++                    break;
++                case(NV_TESLA):
++                    HIDDNouveauNV50SetPattern(carddata, ~0, ~0, ~0, ~0);
++                    break;
++                case(NV_FERMI):
++                case(NV_KEPLER):
++                case(NV_MAXWELL):
++                case(NV_PASCAL):
++                    HIDDNouveauNVC0SetPattern(carddata, ~0, ~0, ~0, ~0);
++                    break;
++                }
+             }
+ 
+             /* Create compositor object */
+@@ -834,7 +836,8 @@ VOID METHOD(Nouveau, Hidd_Gfx, CopyBox)
+     OOP_Class * srcclass = OOP_OCLASS(msg->src);
+     OOP_Class * destclass = OOP_OCLASS(msg->dest);
+ 
+-    if (IS_NOUVEAU_BM_CLASS(srcclass) && IS_NOUVEAU_BM_CLASS(destclass))
++    if (IS_NOUVEAU_BM_CLASS(srcclass) && IS_NOUVEAU_BM_CLASS(destclass)
++        && SD(cl)->carddata.accel_enabled)
+     {
+         /* FIXME: add checks for pixel format, etc */
+         struct HIDDNouveauBitMapData * srcdata = OOP_INST_DATA(srcclass, msg->src);
+diff --git a/workbench/hidds/nouveau/nouveau_intern.h b/workbench/hidds/nouveau/nouveau_intern.h
+index 32d72fdf..a544738c 100644
+--- a/workbench/hidds/nouveau/nouveau_intern.h
++++ b/workbench/hidds/nouveau/nouveau_intern.h
+@@ -148,6 +148,7 @@ struct CardData
+     struct nouveau_object   *NvCOPY;
+     struct nouveau_bo       *scratch;
+ 
++    BOOL accel_enabled;                             /* GPU channel and engine objects are usable */
+     BOOL ce_enabled;
+     struct nouveau_object   *ce_channel;
+     struct nouveau_pushbuf  *ce_pushbuf;
+-- 
+2.43.0
+
