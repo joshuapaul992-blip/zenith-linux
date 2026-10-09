@@ -1,7 +1,7 @@
 From 64c5885639939d0e8c9f654da2a84a6cf65c8827 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Fri, 9 Oct 2026 03:14:27 +0000
-Subject: [PATCH 3/3] nouveau.hidd: fall back to software rendering without
+Subject: [PATCH 3/4] nouveau.hidd: fall back to software rendering without
  acceleration
 
 Maxwell 2 and Pascal cards need NVIDIA-signed firmware for the graphics

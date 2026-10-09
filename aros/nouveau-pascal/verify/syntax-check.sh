@@ -19,17 +19,18 @@ LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT
 status=0
 
-for f in falcon_root msgqueue_0148cdec msgqueue_0137c63d; do
+for f in nvkm/falcon/falcon_root.c nvkm/falcon/msgqueue_0148cdec.c \
+         nvkm/falcon/msgqueue_0137c63d.c nouveau_dp.c; do
     if gcc -fsyntax-only -std=gnu99 -D_POSIX_C_SOURCE=200809L -D__AROS__ \
         -Werror=implicit-function-declaration \
         -Werror=incompatible-pointer-types -Werror=int-conversion \
         -include "$HERE/shim/prelude.h" -I"$HERE/shim" \
         -I"$NV/include" -I"$NV/drm/nouveau" -I"$NV/drm/nouveau/include" \
         -I"$NV/drm/nouveau/include/nvkm" -I"$NV/drm/nouveau/nvkm" \
-        "$NV/drm/nouveau/nvkm/falcon/$f.c" 2>"$LOG"; then
-        echo "ok    nvkm/falcon/$f.c"
+        "$NV/drm/nouveau/$f" 2>"$LOG"; then
+        echo "ok    $f"
     else
-        echo "FAIL  nvkm/falcon/$f.c"
+        echo "FAIL  $f"
         grep "error" "$LOG" | sed "s|$NV/||"
         status=1
     fi

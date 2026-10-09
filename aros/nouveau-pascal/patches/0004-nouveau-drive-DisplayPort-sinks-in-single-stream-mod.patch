@@ -1,0 +1,77 @@
+From 709f9c81e81d2d74643fb733762ed5ce8dbce653 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 9 Oct 2026 03:33:44 +0000
+Subject: [PATCH 4/4] nouveau: drive DisplayPort sinks in single-stream mode
+
+nouveau_mst defaulted to 1, so a DP 1.2+ monitor that advertises
+DP_MST_CAP (daisy-chain capable monitors, MST hubs and docks) was put
+into multi-stream mode. The MST topology code that follows is stubbed:
+drm_dp_mst_wait_tx_reply(), drm_dp_validate_guid() and
+nv50_mstc_get_modes() are NOT_IMPLEMENTED_STOP, so detection would stop
+forever on the work queue process that also runs display supervisor
+and SEC2 message handling.
+
+Default nouveau_mst to 0 on AROS, as nouveau.mst=0 does on Linux.
+nv50_mstm_detect() then leaves MST off and such sinks are driven like
+any other single-stream DP monitor. This matters most for cards that
+only have DisplayPort outputs, such as Pascal Quadros.
+
+patches/drm-aros.diff is refreshed for nouveau_dp.c.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LaFFmUWBSJL732ja1ybwuh
+---
+ workbench/hidds/nouveau/drm/nouveau/nouveau_dp.c |  6 ++++--
+ workbench/hidds/nouveau/patches/drm-aros.diff    | 10 ++++++----
+ 2 files changed, 10 insertions(+), 6 deletions(-)
+
+diff --git a/workbench/hidds/nouveau/drm/nouveau/nouveau_dp.c b/workbench/hidds/nouveau/drm/nouveau/nouveau_dp.c
+index 4a88af06..2f15c4fc 100644
+--- a/workbench/hidds/nouveau/drm/nouveau/nouveau_dp.c
++++ b/workbench/hidds/nouveau/drm/nouveau/nouveau_dp.c
+@@ -34,10 +34,12 @@
+ 
+ #if !defined(__AROS__)
+ MODULE_PARM_DESC(mst, "Enable DisplayPort multi-stream (default: enabled)");
+-#endif
+ static int nouveau_mst = 1;
+-#if !defined(__AROS__)
+ module_param_named(mst, nouveau_mst, int, 0400);
++#else
++/* MST sideband messaging is not implemented in drm_dp_mst_topology.c, so
++   drive MST-capable sinks in single-stream mode (nouveau.mst=0 on Linux) */
++static int nouveau_mst = 0;
+ #endif
+ 
+ static void
+diff --git a/workbench/hidds/nouveau/patches/drm-aros.diff b/workbench/hidds/nouveau/patches/drm-aros.diff
+index fad2d4ba..de794646 100644
+--- a/workbench/hidds/nouveau/patches/drm-aros.diff
++++ b/workbench/hidds/nouveau/patches/drm-aros.diff
+@@ -5788,17 +5788,19 @@ diff -ur ./drm-5.4.302/nouveau/nouveau_dma.c ./drm/nouveau/nouveau_dma.c
+  	return 0;
+ diff -ur ./drm-5.4.302/nouveau/nouveau_dp.c ./drm/nouveau/nouveau_dp.c
+ --- ./drm-5.4.302/nouveau/nouveau_dp.c	2025-12-03 12:45:22.000000000 +0100
+-+++ ./drm/nouveau/nouveau_dp.c	2026-07-22 18:37:35.000000000 +0200
+-@@ -32,9 +32,13 @@
+++++ ./drm/nouveau/nouveau_dp.c	2026-10-09 03:33:12.000000000 +0000
++@@ -32,9 +32,15 @@
+  #include <nvif/class.h>
+  #include <nvif/cl5070.h>
+  
+ +#if !defined(__AROS__)
+  MODULE_PARM_DESC(mst, "Enable DisplayPort multi-stream (default: enabled)");
+-+#endif
+  static int nouveau_mst = 1;
+-+#if !defined(__AROS__)
+  module_param_named(mst, nouveau_mst, int, 0400);
+++#else
+++/* MST sideband messaging is not implemented in drm_dp_mst_topology.c, so
+++   drive MST-capable sinks in single-stream mode (nouveau.mst=0 on Linux) */
+++static int nouveau_mst = 0;
+ +#endif
+  
+  static void
+-- 
+2.43.0
+
