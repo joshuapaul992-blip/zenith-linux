@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+"""Build a bootable Kestrel USB stick image (raw disk).
+
+Layout (MBR, the default):
+  LBA 0       GRUB boot.img; bytes 3..22 carry the option-B marker
+              "KESTREL_BOOT" + u64 LBA of the volume header
+  LBA 1..     GRUB core.img (kernel + grub.cfg inside its memdisk)
+  LBA 2048..  partition 1, type 0x4B (option A): Kestrel volume header,
+              then the ustar payload built from --rootfs
+
+GPT layout (--layout gpt): protective MBR + GPT; partition 1 is a BIOS boot
+partition holding core.img, partition 2 has the Kestrel type GUID
+("KESTREL-BOOT-VOL" as raw bytes) and a unique partition GUID equal to the
+volume UUID.
+
+Test knobs: --no-marker (option A only), --plain-type (partition type 0x83
+so that only option B finds it), --no-grub (data-only stick),
+--corrupt-payload (flip one payload byte after the CRC is computed).
+"""
+import argparse, io, os, struct, tarfile, time, uuid, zlib
+
+SECTOR = 512
+MAGIC = b"KESTREL_BOOT"
+GPT_TYPE = b"KESTREL-BOOT-VOL"
+BIOS_BOOT_GUID = uuid.UUID("21686148-6449-6e6f-744e-656564454649")
+PAYLOAD_OFFSET = 4096
+
+
+def crc32(b, crc=0):
+    return zlib.crc32(b, crc) & 0xFFFFFFFF
+
+
+def ustar_from_dir(root):
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames.sort()
+            rel = os.path.relpath(dirpath, root)
+            if rel != ".":
+                ti = tar.gettarinfo(dirpath, arcname=rel)
+                ti.uid = ti.gid = 0; ti.uname = ti.gname = "root"; ti.mode = 0o755
+                tar.addfile(ti)
+            for name in sorted(filenames):
+                path = os.path.join(dirpath, name)
+                arc = os.path.normpath(os.path.join(rel, name))
+                ti = tar.gettarinfo(path, arcname=arc)
+                ti.uid = ti.gid = 0; ti.uname = ti.gname = "root"; ti.mode = 0o444
+                with open(path, "rb") as f:
+                    tar.addfile(ti, f)
+    data = buf.getvalue()
+    return data + b"\0" * (-len(data) % SECTOR)
+
+
+def volume_header(vol_uuid, label, payload):
+    hdr = struct.pack("<12sHHI16s32sQQIIQ", MAGIC, 1, 512, 0, vol_uuid.bytes,
+                      label.encode()[:32].ljust(32, b"\0"), PAYLOAD_OFFSET, len(payload),
+                      crc32(payload), 1, int(time.time()))
+    hdr = hdr.ljust(512, b"\0")
+    c = crc32(hdr)
+    return hdr[:16] + struct.pack("<I", c) + hdr[20:]
+
+
+def mbr_entry(boot, ptype, start, count):
+    return struct.pack("<B3sB3sII", boot, b"\xfe\xff\xff", ptype, b"\xfe\xff\xff", start, count)
+
+
+def gpt_guid_bytes(u):
+    return u.bytes_le
+
+
+def write_gpt(img, total, parts, disk_guid):
+    """parts: list of (type_guid_bytes, unique_guid_bytes, first, last, name)"""
+    entries = bytearray(128 * 128)
+    for i, (t, g, first, last, name) in enumerate(parts):
+        entries[i * 128:(i + 1) * 128] = struct.pack("<16s16sQQQ72s", t, g, first, last, 0,
+                                                     name.encode("utf-16-le")[:72].ljust(72, b"\0"))
+    ecrc = crc32(bytes(entries))
+
+    def header(my, alt, entries_lba):
+        h = struct.pack("<8sIIIIQQQQ16sQIII", b"EFI PART", 0x00010000, 92, 0, 0, my, alt, 34,
+                        total - 34, disk_guid, entries_lba, 128, 128, ecrc)
+        h = h[:16] + struct.pack("<I", crc32(h)) + h[20:]
+        return h.ljust(SECTOR, b"\0")
+
+    img[1 * SECTOR:2 * SECTOR] = header(1, total - 1, 2)
+    img[2 * SECTOR:34 * SECTOR] = entries
+    img[(total - 33) * SECTOR:(total - 1) * SECTOR] = entries
+    img[(total - 1) * SECTOR:total * SECTOR] = header(total - 1, 1, total - 33)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("out")
+    ap.add_argument("--rootfs", required=True, help="directory packed into the ustar payload")
+    ap.add_argument("--boot-img", help="GRUB i386-pc boot.img")
+    ap.add_argument("--core-img", help="GRUB i386-pc core.img (with memdisk)")
+    ap.add_argument("--size", type=int, default=64, help="image size in MiB (default 64)")
+    ap.add_argument("--layout", choices=["mbr", "gpt"], default="mbr")
+    ap.add_argument("--uuid", default=None, help="volume UUID (default: random)")
+    ap.add_argument("--label", default="KESTREL")
+    ap.add_argument("--no-grub", action="store_true")
+    ap.add_argument("--no-marker", action="store_true", help="omit the sector-0 marker (option A only)")
+    ap.add_argument("--plain-type", action="store_true", help="partition type 0x83 / Linux data (option B only)")
+    ap.add_argument("--corrupt-payload", action="store_true")
+    a = ap.parse_args()
+
+    total = a.size * 1024 * 1024 // SECTOR
+    img = bytearray(total * SECTOR)
+    vol_uuid = uuid.UUID(a.uuid) if a.uuid else uuid.uuid4()
+    payload = ustar_from_dir(a.rootfs)
+    header = volume_header(vol_uuid, a.label, payload)
+
+    core = b""
+    if not a.no_grub:
+        boot = open(a.boot_img, "rb").read()
+        core = open(a.core_img, "rb").read()
+        core += b"\0" * (-len(core) % SECTOR)
+        assert len(boot) == SECTOR
+        img[0:440] = boot[0:440]                  # code only; table + signature are ours
+    core_sectors = len(core) // SECTOR
+
+    if a.layout == "mbr":
+        part_start = max(2048, ((1 + core_sectors + 2047) // 2048) * 2048)
+        core_lba = 1
+    else:
+        core_lba = 34
+        part_start = max(2048, ((core_lba + core_sectors + 2047) // 2048) * 2048)
+    part_count = total - part_start - (34 if a.layout == "gpt" else 0)
+    need = (PAYLOAD_OFFSET + len(payload)) // SECTOR
+    if need > part_count:
+        raise SystemExit(f"payload ({len(payload)} bytes) does not fit; use a larger --size")
+
+    if core:
+        img[core_lba * SECTOR:core_lba * SECTOR + len(core)] = core
+        if core_lba != 1:
+            # grub-setup's job: kernel_sector in boot.img, first blocklist in diskboot
+            img[0x5C:0x64] = struct.pack("<Q", core_lba)
+            off = core_lba * SECTOR + 0x1F4
+            img[off:off + 8] = struct.pack("<Q", core_lba + 1)
+
+    hdr_off = part_start * SECTOR
+    img[hdr_off:hdr_off + SECTOR] = header
+    p = hdr_off + PAYLOAD_OFFSET
+    img[p:p + len(payload)] = payload
+    if a.corrupt_payload:
+        img[p + len(payload) // 2] ^= 0xFF
+
+    if not a.no_marker:
+        img[3:15] = MAGIC
+        img[15:23] = struct.pack("<Q", part_start)
+
+    if a.layout == "mbr":
+        ptype = 0x83 if a.plain_type else 0x4B
+        img[446:462] = mbr_entry(0x80, ptype, part_start, part_count)
+    else:
+        img[446:462] = mbr_entry(0x00, 0xEE, 1, min(total - 1, 0xFFFFFFFF))
+        ktype = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4").bytes_le if a.plain_type else GPT_TYPE
+        parts = [(gpt_guid_bytes(BIOS_BOOT_GUID), uuid.uuid4().bytes_le, 34, part_start - 1, "BIOS boot")] if core else []
+        parts.append((ktype, vol_uuid.bytes_le, part_start, part_start + part_count - 1, a.label))
+        write_gpt(img, total, parts, uuid.uuid4().bytes_le)
+    img[510:512] = b"\x55\xaa"
+
+    with open(a.out, "wb") as f:
+        f.write(img)
+    print(f"{a.out}: {a.size} MiB {a.layout.upper()}, GRUB core {core_sectors} sectors, "
+          f"Kestrel partition at LBA {part_start} ({'0x83/linux' if a.plain_type else 'kestrel'} type), "
+          f"payload {len(payload)} bytes crc {crc32(payload):08x}, uuid {vol_uuid}"
+          f"{', no sector-0 marker' if a.no_marker else ''}{', CORRUPTED payload' if a.corrupt_payload else ''}")
+
+
+if __name__ == "__main__":
+    main()

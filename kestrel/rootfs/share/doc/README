@@ -1,0 +1,4 @@
+Kestrel boot volume
+===================
+This tree is packed by tools/mkusbimg.py into the ustar payload of the
+Kestrel partition (MBR type 0x4b or GPT type "KESTREL-BOOT-VOL").

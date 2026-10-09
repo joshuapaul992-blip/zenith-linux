@@ -1,0 +1,3 @@
+Welcome to Kestrel. This message of the day was read from the boot volume
+(/boot/etc/motd): the USB stick was found by its KESTREL_BOOT markers, its
+payload CRC verified, and its ustar archive mounted read-only on /boot.
