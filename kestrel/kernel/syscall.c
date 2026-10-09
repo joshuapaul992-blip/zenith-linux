@@ -77,6 +77,7 @@ static int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode, uint64_t a
     int r = vfs_open((const char *)path, (int)flags, (mode_t)mode, &f);
     if (r < 0) return r;
     t->fds[fd] = f;
+    t->fd_cloexec[fd] = (flags & O_CLOEXEC) != 0;
     return fd;
 }
 
@@ -440,6 +441,173 @@ static int64_t sys_readv(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t a4, u
 static int64_t sys_writev(uint64_t fd, uint64_t iov, uint64_t cnt, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a4; (void)a5; (void)a6; return rw_vec(fd, iov, cnt, true); }
 
+/* ---- descriptors: fcntl, dup, pipe, poll ------------------------------- */
+#define F_DUPFD         0
+#define F_GETFD         1
+#define F_SETFD         2
+#define F_GETFL         3
+#define F_SETFL         4
+#define F_DUPFD_CLOEXEC 1030
+#define FD_CLOEXEC      1
+
+static int fd_alloc(struct tcb *t, int min, struct file *f, bool cloexec)
+{
+    for (int fd = min < 0 ? 0 : min; fd < MAX_FDS; fd++)
+        if (!t->fds[fd]) { t->fds[fd] = f; t->fd_cloexec[fd] = cloexec; return fd; }
+    return -EMFILE;
+}
+
+static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    struct file **f = fd_slot((int)fd);
+    if (!f) return -EBADF;
+    switch (cmd) {
+    case F_DUPFD:
+    case F_DUPFD_CLOEXEC: {
+        if ((int)arg < 0 || (int)arg >= MAX_FDS) return -EINVAL;
+        int n = fd_alloc(t, (int)arg, *f, cmd == F_DUPFD_CLOEXEC);
+        if (n >= 0) (*f)->refcnt++;
+        return n;
+    }
+    case F_GETFD: return t->fd_cloexec[fd] ? FD_CLOEXEC : 0;
+    case F_SETFD: t->fd_cloexec[fd] = (arg & FD_CLOEXEC) != 0; return 0;
+    case F_GETFL: return (*f)->flags & ~O_CLOEXEC;
+    case F_SETFL:                                       /* only these two may change */
+        (*f)->flags = ((*f)->flags & ~(O_NONBLOCK | O_APPEND)) | ((int)arg & (O_NONBLOCK | O_APPEND));
+        return 0;
+    default: return -EINVAL;
+    }
+}
+
+static int64_t do_dup(int oldfd, int newfd, int flags, bool any)
+{
+    struct tcb *t = current_task();
+    struct file **f = fd_slot(oldfd);
+    if (!f) return -EBADF;
+    if (any) { int n = fd_alloc(t, 0, *f, false); if (n >= 0) (*f)->refcnt++; return n; }
+    if (newfd < 0 || newfd >= MAX_FDS) return -EBADF;
+    if (newfd == oldfd) return flags ? -EINVAL : newfd;   /* dup3 refuses, dup2 is a no-op */
+    if (t->fds[newfd]) vfs_close(t->fds[newfd]);
+    t->fds[newfd] = *f;
+    (*f)->refcnt++;
+    t->fd_cloexec[newfd] = (flags & O_CLOEXEC) != 0;
+    return newfd;
+}
+
+static int64_t sys_dup(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return do_dup((int)fd, 0, 0, true); }
+
+static int64_t sys_dup2(uint64_t fd, uint64_t nfd, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if ((int)fd == (int)nfd) return fd_slot((int)fd) ? (int64_t)nfd : -EBADF;
+    return do_dup((int)fd, (int)nfd, 0, false);
+}
+
+static int64_t sys_dup3(uint64_t fd, uint64_t nfd, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (flags & ~(uint64_t)O_CLOEXEC) return -EINVAL;
+    return do_dup((int)fd, (int)nfd, (int)flags | 1 /* dup3 */ , false);
+}
+
+static int64_t sys_pipe2(uint64_t fds, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    if (bad_buf(fds, 8)) return -EFAULT;
+    if (flags & ~(uint64_t)(O_NONBLOCK | O_CLOEXEC)) return -EINVAL;
+    struct file *r, *w;
+    int rc = pipe_create(&r, &w, (int)flags);
+    if (rc) return rc;
+    int a = fd_alloc(t, 0, r, flags & O_CLOEXEC);
+    int b = a < 0 ? a : fd_alloc(t, 0, w, flags & O_CLOEXEC);
+    if (a < 0 || b < 0) {
+        if (a >= 0) t->fds[a] = NULL;
+        vfs_close(r); vfs_close(w);
+        return -EMFILE;
+    }
+    ((int *)fds)[0] = a;
+    ((int *)fds)[1] = b;
+    return 0;
+}
+
+static int64_t sys_pipe(uint64_t fds, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; return sys_pipe2(fds, 0, a3, a4, a5, a6); }
+
+struct pollfd { int fd; short events, revents; };
+
+/* Readiness is re-checked every millisecond until something is ready or the
+ * timeout expires: simple, and plenty for an X server's event loop on one
+ * CPU. Wait queues per object can replace the polling later. */
+static int64_t sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeout, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (nfds > 4 * MAX_FDS) return -EINVAL;
+    if (nfds && bad_buf(fds, nfds * sizeof(struct pollfd))) return -EFAULT;
+    struct pollfd *p = (struct pollfd *)fds;
+    int tmo = (int)timeout;
+    uint64_t deadline = tmo > 0 ? time_ms() + (uint64_t)tmo : 0;
+    for (;;) {
+        int ready = 0;
+        for (uint64_t i = 0; i < nfds; i++) {
+            p[i].revents = 0;
+            if (p[i].fd < 0) continue;
+            struct file **f = fd_slot(p[i].fd);
+            p[i].revents = f ? (short)vfs_poll(*f, p[i].events | POLLERR | POLLHUP) : POLLNVAL;
+            if (p[i].revents) ready++;
+        }
+        if (ready || tmo == 0) return ready;
+        if (tmo > 0 && time_ms() >= deadline) return 0;
+        task_sleep_ms(1);
+    }
+}
+
+static int64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (bad_ptr(path)) return -EFAULT;
+    struct stat st;
+    return vfs_stat((const char *)path, &st);           /* existence; everyone is root */
+}
+
+static int64_t sys_umask(uint64_t mask, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    uint32_t old = t->umask;
+    t->umask = (uint32_t)mask & 0777;
+    return old;
+}
+
+/* RDRAND when the CPU has it, else a TSC-seeded xorshift (fine for X auth
+ * cookies on a hobby OS; not for cryptography). */
+static int64_t sys_getrandom(uint64_t buf, uint64_t len, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)flags; (void)a4; (void)a5; (void)a6;
+    if (len > 1 << 20) len = 1 << 20;
+    if (bad_buf(buf, len)) return -EFAULT;
+    static int has_rdrand = -1;
+    static uint64_t x;
+    if (has_rdrand < 0) {
+        uint32_t a, b, c, d;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+        has_rdrand = (c >> 30) & 1;
+        x = rdtsc() | 1;
+    }
+    uint8_t *p = (uint8_t *)buf;
+    for (uint64_t i = 0; i < len; i += 8) {
+        uint64_t v = 0;
+        unsigned char ok = 0;
+        if (has_rdrand) __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
+        if (!ok) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; v = x ^ rdtsc(); }
+        for (int k = 0; k < 8 && i + (uint64_t)k < len; k++) p[i + k] = (uint8_t)(v >> (8 * k));
+    }
+    return (int64_t)len;
+}
+
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -473,6 +641,11 @@ void syscall_init(void)
     REG(SYS_rt_sigaction, sys_rt_sigaction);
     REG(SYS_rt_sigprocmask, sys_rt_sigprocmask);
     REG(SYS_readv, sys_readv);         REG(SYS_writev, sys_writev);
+    REG(SYS_fcntl, sys_fcntl);         REG(SYS_poll, sys_poll);
+    REG(SYS_dup, sys_dup);             REG(SYS_dup2, sys_dup2);
+    REG(SYS_dup3, sys_dup3);           REG(SYS_pipe, sys_pipe);
+    REG(SYS_pipe2, sys_pipe2);         REG(SYS_access, sys_access);
+    REG(SYS_umask, sys_umask);         REG(SYS_getrandom, sys_getrandom);
     REG(SYS_fork, sys_enosys);         REG(SYS_execve, sys_enosys);
     REG(SYS_wait4, sys_enosys);        REG(SYS_kill, sys_enosys);
     REG(SYS_gettimeofday, sys_enosys);
@@ -491,7 +664,18 @@ void syscall_init(void)
 void syscall_dispatch(struct int_frame *f)
 {
     uint64_t nr = f->rax;
-    if (nr >= SYS_MAX || !table[nr]) { f->rax = (uint64_t)-ENOSYS; return; }
+    if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
+        static uint8_t warned[SYS_MAX + 1];
+        struct tcb *t = current_task();
+        uint64_t k = nr < SYS_MAX ? nr : SYS_MAX;
+        if (t->user && warned[k] < 3) {         /* the gaps a ported program hits */
+            warned[k]++;
+            kprintf("syscall: pid %d (%s) called unimplemented syscall %lu (%s) at %lx\n", t->pid, t->name, nr,
+                    nr < SYS_MAX && names[nr] ? names[nr] : "?", f->rip);
+        }
+        f->rax = (uint64_t)-ENOSYS;
+        return;
+    }
     counts[nr]++;
     if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
     f->rax = (uint64_t)table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);

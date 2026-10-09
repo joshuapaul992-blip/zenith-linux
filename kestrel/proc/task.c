@@ -212,6 +212,8 @@ void task_exit(int code)
 {
     cli();
     kprintf("sched: pid %d (%s) exited with status %d\n", cur->pid, cur->name, code);
+    /* close now, not at reap time: pipe and socket peers must see EOF */
+    for (int fd = 0; fd < MAX_FDS; fd++) if (cur->fds[fd]) { vfs_close(cur->fds[fd]); cur->fds[fd] = NULL; }
     cur->exit_code = code;
     cur->state = TASK_ZOMBIE;
     wakeup(cur);                                /* anyone waiting on us */

@@ -541,7 +541,7 @@ Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, readv, writev, open, close, stat, fstat, lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getuid, getgid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, chown, utimensat, getdents64, clock_gettime (`CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the HPET), reboot.
+**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), access, umask, getrandom, stat, fstat, lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getuid, getgid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, chown, utimensat, getdents64, clock_gettime (`CLOCK_REALTIME` from the RTC, `CLOCK_MONOTONIC` from the HPET), reboot.
 
 **Accepted but inert (no signals yet):** rt_sigaction, rt_sigprocmask.
 
@@ -563,7 +563,11 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 - Unattended: boot with `kestrel.exec=/boot/bin/hello,arg1,arg2`. Output goes to the kernel log (serial and `REPORT.TXT`), followed by the exit status: 42 means every check passed.
 - Fault isolation: `hello crash` writes to kernel memory and must end with "killed (signal 11)".
 
-Not done yet: W^X page permissions, file-backed `mmap`, fork/execve, signals, threads, and a libc port. These are the next steps of the XLibre port.
+**musl libc:** programs linked with the stock x86_64 musl (`musl-gcc -static-pie`) run unchanged, because Kestrel uses the Linux syscall numbers and ABI. `user/libctest.c` (installed as `/boot/bin/libctest`) checks 37 things a ported program relies on: stdio, malloc (brk and mmap paths), floating-point formatting, files and directories, time, pipes, `poll` timeouts, `O_NONBLOCK`, `dup`, EOF/`POLLHUP` and `getrandom`. Exit status 0 means every check passed. A ring-3 program that calls an unimplemented syscall is named in the kernel log (first three calls per number).
+
+**Pipes and poll:** pipes have a 16 KiB buffer and follow POSIX blocking rules; with no signals, a write to a pipe without readers returns `-EPIPE`. `poll` re-checks readiness every millisecond until something is ready or the timeout expires. Files and devices without their own poll hook are always ready.
+
+Not done yet: W^X page permissions, file-backed `mmap`, fork/execve, signals, threads, and sockets. These are the next steps of the XLibre port.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 

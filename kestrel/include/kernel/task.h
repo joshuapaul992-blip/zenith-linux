@@ -9,7 +9,7 @@
 #define MAX_TASKS       64
 #define KSTACK_SIZE     (16 * 1024)
 #define TASK_NAME_LEN   24
-#define MAX_FDS         16
+#define MAX_FDS         64
 #define SCHED_QUANTUM   10              /* ticks (ms) per time slice */
 
 enum task_state {
@@ -47,6 +47,7 @@ struct tcb {
 
     /* POSIX process state */
     struct file  *fds[MAX_FDS];
+    uint8_t   fd_cloexec[MAX_FDS];      /* FD_CLOEXEC per descriptor        */
     struct vnode *cwd;
     uint32_t  uid, gid;
     uint32_t  umask;

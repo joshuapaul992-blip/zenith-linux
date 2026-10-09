@@ -25,13 +25,28 @@ enum vtype { VNON = 0, VREG, VDIR, VCHR };
 
 struct vnode;
 struct mount;
+struct file;
 
 struct vnode_ops {
     ssize_t (*read)(struct vnode *vn, void *buf, size_t len, uint64_t off);
     ssize_t (*write)(struct vnode *vn, const void *buf, size_t len, uint64_t off);
     int     (*ioctl)(struct vnode *vn, unsigned long req, void *arg);
     uint64_t (*size)(struct vnode *vn);         /* optional dynamic size */
+    /* Optional, for objects whose behaviour depends on the open file
+     * (O_NONBLOCK) or that need to know when a file closes: pipes, sockets. */
+    ssize_t (*fread)(struct file *f, void *buf, size_t len);
+    ssize_t (*fwrite)(struct file *f, const void *buf, size_t len);
+    int     (*poll)(struct file *f, int events);   /* ready POLL* bits     */
+    void    (*release)(struct file *f);            /* last close of f      */
 };
+
+/* poll(2) bits */
+#define POLLIN      0x001
+#define POLLPRI     0x002
+#define POLLOUT     0x004
+#define POLLERR     0x008
+#define POLLHUP     0x010
+#define POLLNVAL    0x020
 
 struct vnode {
     char        name[VFS_NAME_MAX];
@@ -103,6 +118,9 @@ off_t   vfs_lseek(struct file *f, off_t off, int whence);
 int     vfs_getdents(struct file *f, void *buf, size_t len);
 int     vfs_ioctl(struct file *f, unsigned long req, void *arg);
 int     vfs_fstat(struct file *f, struct stat *st);
+int     vfs_poll(struct file *f, int events);   /* ready subset of events (+ERR/HUP) */
+struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
+int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
 void    vfs_close(struct file *f);
 
 /* ---- filesystem drivers ------------------------------------------------- */

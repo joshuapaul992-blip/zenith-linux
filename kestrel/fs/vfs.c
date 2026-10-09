@@ -394,6 +394,7 @@ ssize_t vfs_read(struct file *f, void *buf, size_t len)
 {
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
     if (f->vn->type == VDIR) return -EISDIR;
+    if (f->vn->ops && f->vn->ops->fread) return f->vn->ops->fread(f, buf, len);
     if (!f->vn->ops || !f->vn->ops->read) return -EINVAL;
     ssize_t n = f->vn->ops->read(f->vn, buf, len, f->off);
     if (n > 0) f->off += (uint64_t)n;
@@ -403,6 +404,7 @@ ssize_t vfs_read(struct file *f, void *buf, size_t len)
 ssize_t vfs_write(struct file *f, const void *buf, size_t len)
 {
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (f->vn->ops && f->vn->ops->fwrite) return f->vn->ops->fwrite(f, buf, len);
     if (!f->vn->ops || !f->vn->ops->write) return -EINVAL;
     if (f->flags & O_APPEND) f->off = node_size(f->vn);
     ssize_t n = f->vn->ops->write(f->vn, buf, len, f->off);
@@ -468,7 +470,27 @@ int vfs_fstat(struct file *f, struct stat *st) { fill_stat(f->vn, st); return 0;
 
 void vfs_close(struct file *f)
 {
-    if (f && --f->refcnt <= 0) kfree(f);
+    if (!f || --f->refcnt > 0) return;
+    if (f->vn && f->vn->ops && f->vn->ops->release) f->vn->ops->release(f);
+    kfree(f);
+}
+
+struct file *vfs_file_new(struct vnode *vn, int flags)
+{
+    struct file *f = kzalloc(sizeof *f);
+    if (!f) return NULL;
+    f->vn = vn; f->flags = flags; f->refcnt = 1;
+    return f;
+}
+
+/* Files without a poll op (regular files, most devices) never block. */
+int vfs_poll(struct file *f, int events)
+{
+    if (f->vn && f->vn->ops && f->vn->ops->poll) return f->vn->ops->poll(f, events);
+    int r = 0;
+    if ((f->flags & O_ACCMODE) != O_WRONLY) r |= POLLIN;
+    if ((f->flags & O_ACCMODE) != O_RDONLY) r |= POLLOUT;
+    return r & events;
 }
 
 /* ======================================================================= */

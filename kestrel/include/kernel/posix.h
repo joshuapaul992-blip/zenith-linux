@@ -39,6 +39,7 @@ typedef uint32_t gid_t;
 #define ESPIPE       29
 #define EROFS        30
 #define EXDEV        18
+#define EPIPE        32
 #define ERANGE       34
 #define ETIMEDOUT   110
 #define ENOMEDIUM   123
@@ -55,6 +56,8 @@ typedef uint32_t gid_t;
 #define O_EXCL       0200
 #define O_TRUNC      01000
 #define O_APPEND     02000
+#define O_NONBLOCK   04000
+#define O_CLOEXEC    02000000
 #define O_DIRECTORY  0200000
 
 #define SEEK_SET 0

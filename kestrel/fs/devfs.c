@@ -141,9 +141,12 @@ static ssize_t kmsg_write(struct vnode *v, const void *buf, size_t n, uint64_t o
 {
     (void)v; (void)o;
     char tmp[256];
-    size_t k = n < sizeof tmp - 1 ? n : sizeof tmp - 1;
-    memcpy(tmp, buf, k); tmp[k] = 0;
-    kprintf("%s", tmp);
+    for (size_t done = 0; done < n; ) {                 /* all of it, 255 bytes at a time */
+        size_t k = n - done < sizeof tmp - 1 ? n - done : sizeof tmp - 1;
+        memcpy(tmp, (const char *)buf + done, k); tmp[k] = 0;
+        kprintf("%s", tmp);
+        done += k;
+    }
     return (ssize_t)n;
 }
 static uint64_t kmsg_size(struct vnode *v) { (void)v; return klog_size(); }
