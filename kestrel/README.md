@@ -216,13 +216,19 @@ The shell command `gpu` prints the report. It also lands in `REPORT.TXT`, with t
 
   It checks that every temporarily changed register is restored. The simulation encodes the same nouveau semantics as the driver, so it verifies the driver's logic, not the hardware's behaviour.
 
-**Stage 2 (lighting further monitors) is not written yet.** It will be built against a real card's report. Depending on what that report shows, it needs:
-- the display core channel: instance memory, DMA objects and a command buffer;
-- framebuffers in VRAM;
-- the mode-change supervisor;
-- pixel clock PLLs from the VBIOS tables;
-- DisplayPort link training;
-- the VBIOS script interpreter.
+**Stage 2: experimental modeset** (`nvdisp.c`, `nvbios_disp.c`, `nvinit.c`; Pascal, DisplayPort). It is off unless you add one of these to the kernel command line (press `e` in the GRUB menu and append it to the `multiboot2` line):
+- **`nvidia.modeset=1`** lights monitors the firmware left **dark**. Monitors the firmware already lit, including the one GRUB used, are kept exactly as they are. With a single monitor there is nothing to light, so nothing visibly changes; the log then says so.
+- **`nvidia.modeset=2`** also takes over the firmware-lit monitors and re-drives every output itself. Afterwards the firmware frame buffer is no longer on screen, so no terminal is put on it. If the modeset fails, that screen stays dark (use the text-console entry, or boot without the option).
+- **`nvidia.maxres=WxH`** limits the mode picked from the EDID (default 1920x1200).
+
+Monitors it lights become ordinary Kestrel displays: a terminal each, and an X screen each. Their frame buffers are in VRAM and are written through the PRAMIN window from a shadow copy in RAM.
+
+**Checking the result:**
+- in the desktop's xterm or any shell: `cat /proc/gpu` (the modeset outcome first, then the full probe report), or `grep nvidia /proc/kmsg`;
+- in the text console: the `gpu` command;
+- on the USB stick: `REPORT.TXT` in its "KESTREL RPT" partition, written at boot (the ISO has no report partition).
+
+The stage-2 code follows nouveau and was only checked against the simulated GP106 (`make test-nvidia`); it has not yet run on a real card.
 
 ## PCI enumerator (`drivers/pci/`)
 

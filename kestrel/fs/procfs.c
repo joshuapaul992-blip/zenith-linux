@@ -1,5 +1,6 @@
 /* fs/procfs.c -- /proc: process and kernel state, generated on every read */
 #include <kernel/vfs.h>
+#include <kernel/gpu.h>
 #include <kernel/task.h>
 #include <kernel/uvm.h>
 #include <kernel/cpu.h>
@@ -153,6 +154,15 @@ static size_t gen_pci(char *buf, size_t cap, void *ctx)
 static size_t gen_usb(char *buf, size_t cap, void *ctx) { (void)ctx; return usb_proc(buf, cap); }
 static size_t gen_partitions(char *buf, size_t cap, void *ctx) { (void)ctx; return blk_proc(buf, cap); }
 static size_t gen_bootvol(char *buf, size_t cap, void *ctx) { (void)ctx; return bootvol_proc(buf, cap); }
+
+/* NVIDIA: probe results and the modeset outcome (also the "gpu" command). */
+static size_t gen_gpu(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx;
+    size_t n = gpu_modeset_report(buf, cap);           /* first: the full report is long */
+    if (n && n < cap) buf[n++] = '\n';
+    return n + gpu_report(buf + n, cap - n);
+}
 
 /* Load averages are not tracked (0.00); running/total and the last pid are. */
 static size_t gen_loadavg(char *buf, size_t cap, void *ctx)
@@ -316,6 +326,7 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "meminfo",     gen_meminfo, NULL);
     pseudo_file(r, "stat",        gen_stat, NULL);
     pseudo_file(r, "loadavg",     gen_loadavg, NULL);
+    pseudo_file(r, "gpu",         gen_gpu, NULL);
     pseudo_file(r, "cpuinfo",     gen_cpuinfo, NULL);
     pseudo_file(r, "mounts",      gen_mounts, NULL);
     pseudo_file(r, "filesystems", gen_filesystems, NULL);

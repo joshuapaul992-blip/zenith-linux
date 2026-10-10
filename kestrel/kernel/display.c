@@ -53,6 +53,10 @@ const struct display_head *display_get(int index)
 static void probe_boot_fb(void)
 {
     if (!g_fb.ready) return;
+    if (gpu_replaced_boot_fb(g_fb.phys)) {          /* nvidia.modeset=2: not on screen any more */
+        kprintf("display: boot frame buffer replaced by the NVIDIA modeset, no terminal on it\n");
+        return;
+    }
     if ((g_fb.bpp != 32 && g_fb.bpp != 24) || g_fb.r_size != 8 || g_fb.g_size != 8 || g_fb.b_size != 8) {
         kprintf("display: boot frame buffer is %u bpp (%u:%u:%u), no text terminal on it\n",
                 g_fb.bpp, g_fb.r_size, g_fb.g_size, g_fb.b_size);

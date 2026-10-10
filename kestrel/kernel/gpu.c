@@ -89,10 +89,16 @@ static int modeset_level(void)
     return o ? o[15] - '0' : 0;
 }
 
+static bool took_over[MAX_GPUS];
+
 static void try_modeset(struct pci_device *p, struct nv_device *d)
 {
     int level = modeset_level();
-    if (level != 1 && level != 2) return;
+    if (level != 1 && level != 2) {
+        if (level) kprintf("nvidia: nvidia.modeset=%d ignored (use 1, or 2 to take over lit monitors)\n", level);
+        return;
+    }
+    took_over[d - gpus] = level == 2;
     /* Supervisor interrupts are polled; keep the GPU's INTx line quiet. */
     uint16_t cmd = pci_read16(p->bus, p->device, p->function, 0x04);
     pci_write16(p->bus, p->device, p->function, 0x04, cmd | PCI_CMD_INTX_DISABLE);
@@ -108,6 +114,25 @@ static void try_modeset(struct pci_device *p, struct nv_device *d)
     uint64_t t0 = time_ms();
     int rc = nv_modeset(d, &opts);
     kprintf("nvidia: modeset finished in %lu ms: %s\n", time_ms() - t0, nv_strerror(rc));
+    int kept = 0, lit = 0;
+    for (int i = 0; i < d->ms.nouts; i++) {
+        if (d->ms.out[i].kept) kept++;
+        else if (d->ms.out[i].lit) lit++;
+    }
+    kprintf("nvidia: %d monitor(s) newly lit, %d left as the firmware lit them%s\n", lit, kept,
+            kept && !lit && level == 1 ? " (nvidia.modeset=1 does not touch those; =2 takes them over)" : "");
+}
+
+bool gpu_replaced_boot_fb(uint64_t phys)
+{
+    for (int g = 0; g < ngpus; g++) {
+        const struct nv_device *d = &gpus[g];
+        if (!took_over[g] || !d->ms.attempted || !d->bar1 || phys < d->bar1 || phys >= d->bar1 + d->bar1_size)
+            continue;
+        for (int i = 0; i < d->ms.nouts; i++)
+            if (d->ms.out[i].lit && !d->ms.out[i].kept) return true;
+    }
+    return false;
 }
 
 struct nv_display_ctx { struct nv_device *dev; uint64_t fb; };
@@ -185,12 +210,23 @@ void gpu_probe(void)
 
 int gpu_count(void) { return ngpus; }
 
+size_t gpu_modeset_report(char *buf, size_t cap)
+{
+    size_t n = 0;
+    for (int i = 0; i < ngpus && n < cap; i++) {
+        n += (size_t)snprintf(buf + n, cap - n, "GPU %d (%s): ", i, gpus[i].chip_name);
+        if (n < cap) n += nv_modeset_report(&gpus[i], buf + n, cap - n);
+    }
+    return n < cap ? n : cap;
+}
+
 size_t gpu_report(char *buf, size_t cap)
 {
     size_t n = 0;
     for (int i = 0; i < ngpus && n < cap; i++) {
         if (ngpus > 1) n += (size_t)snprintf(buf + n, cap - n, "--- GPU %d ---\n", i);
         if (n < cap) n += nv_report(&gpus[i], buf + n, cap - n);
+        if (n < cap) n += nv_modeset_report(&gpus[i], buf + n, cap - n);
     }
     if (!ngpus && cap) n = (size_t)snprintf(buf, cap, "no NVIDIA display controller found\n");
     return n < cap ? n : cap;
