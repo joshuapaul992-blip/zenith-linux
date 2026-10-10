@@ -215,7 +215,7 @@ static int process_main(void *arg)
     write_cr3(pml4);
     irq_restore(f);
 
-    static char *const envp[] = { "PATH=/boot/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0" };
+    static char *const envp[] = { "PATH=/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0", "SHELL=/bin/sh" };
     struct exec_args ea = { a->argc, (int)(sizeof envp / sizeof *envp), a->argv, (char **)envp };
     uint64_t entry = 0, sp = 0;
     if (exec_load_image(t, a->path, &ea, &entry, &sp) < 0) {

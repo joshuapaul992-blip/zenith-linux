@@ -11,6 +11,7 @@
 #  make run-usb      boot the stick from a QEMU xHCI port (kestrel.root=usb)
 #  make xlibre       build the X server for Kestrel (see ports/xlibre/build.sh)
 #  make icewm        build the IceWM window manager (see ports/icewm/build.sh)
+#  make busybox      build BusyBox: /bin/sh and tools (see ports/busybox/build.sh)
 #  make debug        QEMU halted with a gdb stub on :1234
 #  make check        verify the Multiboot2 header with grub-file
 #  make fonts        regenerate drivers/font_*.c from the BDF sources
@@ -69,7 +70,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
-           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c fs/unixsock.c lib/crc32.c \
+           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
            kernel/display.c kernel/tty.c kernel/report.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
@@ -95,7 +96,7 @@ QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
 #   make iso KERNEL_CMDLINE="ahci.selftest=rw ahci.verify=5"
 KERNEL_CMDLINE ?=
 
-.PHONY: FORCE xlibre icewm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
+.PHONY: FORCE xlibre icewm busybox all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
 
 all: $(KERNEL)
 
@@ -173,7 +174,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest
+MUSL_PROGS  := libctest socktest proctest ptytest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
@@ -206,14 +207,24 @@ icewm:
 	@test -n "$(ICEWM_SRC)" || { echo "usage: make icewm ICEWM_SRC=<unpacked icewm release>"; exit 1; }
 	@ports/icewm/build.sh $(ICEWM_SRC) $(BUILD)
 
+# BusyBox (ports/busybox): /bin/sh and the command-line tools
+#   make busybox BUSYBOX_SRC=<unpacked busybox release>
+BUSYBOX_SRC  ?=
+BUSYBOX_ROOT := $(BUILD)/busybox-root
+busybox:
+	@test -n "$(BUSYBOX_SRC)" || { echo "usage: make busybox BUSYBOX_SRC=<unpacked busybox release>"; exit 1; }
+	@ports/busybox/build.sh $(BUSYBOX_SRC) $(BUILD)
+
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp)
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp)
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
+	@install -m 755 user/shtest.sh $(ROOTFS_STAGE)/bin/shtest.sh
 	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
+	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
 	@touch $@
 
 USBIMG := $(BUILD)/kestrel-usb.img

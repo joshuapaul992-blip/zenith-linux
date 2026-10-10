@@ -75,6 +75,7 @@ struct tcb {
 
     /* processes (proc/process.c) */
     int       pgid, sid;        /* process group, session                  */
+    int       ctty;             /* controlling terminal: pty index + 1      */
     int       exit_signal;      /* sent to the parent at exit (SIGCHLD)    */
     int       term_signal;      /* killed by this signal; 0 = exit()       */
     bool      vm_borrowed;      /* vfork child: pml4 belongs to the parent  */

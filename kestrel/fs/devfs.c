@@ -123,6 +123,19 @@ static int devtty_ioctl(struct vnode *v, unsigned long req, void *arg)
 }
 
 static const struct vnode_ops tty_ops     = { .read = devtty_read, .write = devtty_write, .ioctl = devtty_ioctl };
+
+/* /dev/tty: the controlling terminal. A process in a pty session gets its
+ * pty slave; everything else keeps Kestrel's own terminal (t->tty). */
+static int devtty_open(struct vnode *vn, int flags, struct file **out)
+{
+    if (current_task()->ctty) return pty_open_ctty(flags, out);
+    struct file *f = vfs_file_new(vn, flags);
+    if (!f) return -ENOMEM;
+    *out = f;
+    return 0;
+}
+static const struct vnode_ops ctty_ops    = { .open = devtty_open, .read = devtty_read, .write = devtty_write,
+                                              .ioctl = devtty_ioctl };
 static const struct vnode_ops console_ops = { .read = null_read, .write = devtty_write, .ioctl = devtty_ioctl };
 
 /* ---- serial ------------------------------------------------------------ */
@@ -271,7 +284,7 @@ void devfs_init(const char *mountpoint)
     add_dev(r, "random",  0666, MKDEV(1, 8),  &random_ops);
     add_dev(r, "urandom", 0666, MKDEV(1, 9),  &random_ops);
     add_dev(r, "kmsg",    0644, MKDEV(1, 11), &kmsg_ops);
-    add_dev(r, "tty",     0666, MKDEV(5, 0),  &tty_ops);
+    add_dev(r, "tty",     0666, MKDEV(5, 0),  &ctty_ops);
     add_tty(r, "console", 0600, MKDEV(5, 1),  &console_ops, tty_get(0));
     for (int i = 0; i < tty_count; i++) {
         char name[8];
@@ -284,5 +297,6 @@ void devfs_init(const char *mountpoint)
         snprintf(name, sizeof name, "fb%d", i);
         add_tty(r, name, 0660, MKDEV(29, (uint32_t)i), &fb_ops, tty_get(i));
     }
+    pty_init(r);
     vfs_mount(m, mountpoint);
 }

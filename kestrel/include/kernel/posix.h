@@ -66,6 +66,7 @@ typedef uint32_t gid_t;
 #define O_ACCMODE    03
 #define O_CREAT      0100
 #define O_EXCL       0200
+#define O_NOCTTY     00000400
 #define O_TRUNC      01000
 #define O_APPEND     02000
 #define O_NONBLOCK   04000

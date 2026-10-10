@@ -1,7 +1,7 @@
 # /boot/etc/icewm/menu -- the desktop (root window) menu on Kestrel
 #
 # Entries run through IceWM's fork() + execvp(); programs not found in
-# PATH (/boot/bin) are hidden.
+# PATH (/bin, which shows /boot/bin) are hidden.
 prog "X demo" - xdemo
 menufile Programs folder programs
 menufile Tool_bar folder toolbar

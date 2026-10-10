@@ -5,7 +5,9 @@
  * on the device and are read on demand through the block layer, so a
  * device that disappears later produces -EIO/-ENODEV on read instead of a
  * crash. Supported entries: regular files ('0', '\0'), directories ('5'),
- * GNU long names ('L'); pax headers, links and devices are skipped. */
+ * hard links to earlier files ('1': another name for the same data, e.g.
+ * busybox applets), GNU long names ('L'); pax headers, symbolic links and
+ * devices are skipped. */
 #include <kernel/tarfs.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
@@ -75,6 +77,18 @@ static struct vnode *child(struct vnode *dir, const char *name)
 {
     for (struct vnode *c = dir->children; c; c = c->sibling) if (!strcmp(c->name, name)) return c;
     return NULL;
+}
+
+/* The file at archive path `path` (already in the tree), or NULL. */
+static struct vnode *lookup_rel(struct vnode *root, const char *path)
+{
+    char buf[256];
+    strlcpy(buf, path, sizeof buf);
+    struct vnode *v = root;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, "/", &save); tok && v; tok = strtok_r(NULL, "/", &save))
+        if (strcmp(tok, ".")) v = child(v, tok);
+    return v;
 }
 
 /* Walk/create the directories of `path`; returns the parent directory and
@@ -161,7 +175,8 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
         }
 
         bool is_dir = h->typeflag == '5', is_file = h->typeflag == '0' || h->typeflag == 0;
-        if (!is_dir && !is_file) {
+        bool is_link = h->typeflag == '1';
+        if (!is_dir && !is_file && !is_link) {
             if (h->typeflag != 'x' && h->typeflag != 'g')
                 kprintf("tarfs: skipping %s (type '%c')\n", name, h->typeflag);
             st.skipped++;
@@ -175,7 +190,22 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
 
         uint32_t mode = (uint32_t)octal(h->mode, sizeof h->mode) & 0777;
         struct vnode *vn = child(dir, leaf);
-        if (is_dir) {
+        if (is_link) {
+            char target[101];
+            snprintf(target, sizeof target, "%.100s", h->linkname);
+            struct vnode *t = lookup_rel(root, target);
+            if (!vn && t && t->type == VREG && t->ops == &tar_file_ops) {
+                vn = vfs_node_new(m, leaf, VREG, mode ? mode : t->mode & 0777, &tar_file_ops);
+                if (!vn) { rc = -ENOMEM; break; }
+                vn->ctx = t->ctx;                       /* same data on the device */
+                vn->size = t->size;
+                vfs_node_add(dir, vn);
+                st.files++;
+            } else if (!t) {
+                kprintf("tarfs: %s: link target %s not found\n", name, target);
+                st.skipped++;
+            }
+        } else if (is_dir) {
             if (!vn) {
                 vn = vfs_node_new(m, leaf, VDIR, mode ? mode : 0555, &ramfs_ops);
                 if (vn) vfs_node_add(dir, vn);

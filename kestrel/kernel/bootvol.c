@@ -171,6 +171,7 @@ static int try_candidate(struct blkdev *dev, uint64_t hdr_block, const char *met
         return rc;
     }
     st.result = BV_MOUNTED;
+    vfs_bind("/boot/bin", "/bin");                      /* /bin/sh and friends where POSIX expects them */
     strlcpy(st.device, dev->name, sizeof st.device);
     st.method = method;
     memcpy(st.uuid, h.uuid, 16);

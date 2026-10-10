@@ -39,6 +39,9 @@ struct vnode_ops {
     int     (*poll)(struct file *f, int events);   /* ready POLL* bits     */
     void    (*release)(struct file *f);            /* last close of f      */
     int     (*fioctl)(struct file *f, unsigned long req, void *arg);  /* preferred over ioctl */
+    /* Optional: create the open file (devices that hand out a new object per
+     * open, e.g. /dev/ptmx). Called after vfs_open's permission checks. */
+    int     (*open)(struct vnode *vn, int flags, struct file **out);
 };
 
 /* poll(2) bits */
@@ -96,6 +99,7 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
 void          vfs_node_add(struct vnode *dir, struct vnode *child);
 struct vnode *vfs_mkfs(const char *fstype, uint32_t flags, struct mount **out);
 int           vfs_mount(struct mount *m, const char *path);
+int           vfs_bind(const char *src, const char *dst);     /* show src's contents at dst */
 
 /* ---- path operations (relative paths use the current task's cwd) ------- */
 int     vfs_lookup(const char *path, struct vnode **out);
@@ -129,6 +133,10 @@ void    vfs_close(struct file *f);
 extern const struct vnode_ops ramfs_ops;
 void devfs_init(const char *mountpoint);
 /* Add a character/block-style device node to /dev after boot (drivers). */
+/* fs/pty.c: /dev/ptmx and /dev/pts/N (created by devfs_init) */
+void          pty_init(struct vnode *devroot);
+int           pty_open_ctty(int flags, struct file **out);    /* /dev/tty of a pty session */
+
 struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
                              const struct vnode_ops *ops, void *ctx);
 void procfs_init(const char *mountpoint);

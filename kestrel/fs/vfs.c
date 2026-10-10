@@ -399,6 +399,7 @@ int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
 
     if ((flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops == &ramfs_ops)
         vn->size = 0;
+    if (vn->ops && vn->ops->open) return vn->ops->open(vn, flags, out);
 
     struct file *f = kzalloc(sizeof *f);
     if (!f) return -ENOMEM;
@@ -599,6 +600,32 @@ struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen,
     return f;
 }
 
+/* Make directory `dst` show the contents of directory `src` (a bind mount,
+ * e.g. /boot/bin on /bin). The source keeps its place in the tree, so ".."
+ * inside the bound directory leads to the source's parent. */
+int vfs_bind(const char *src, const char *dst)
+{
+    struct vnode *s, *d;
+    int r;
+    if ((r = vfs_lookup(src, &s)) < 0 || (r = vfs_lookup(dst, &d)) < 0) return r;
+    if (s->type != VDIR || d->type != VDIR) return -ENOTDIR;
+    if (d->mounted || s == d) return -EBUSY;
+    struct mount *m = kzalloc(sizeof *m);
+    if (!m) return -ENOMEM;
+    strlcpy(m->fstype, "bind", sizeof m->fstype);
+    m->flags = s->fs ? s->fs->flags : 0;
+    m->dev = s->fs ? s->fs->dev : 0;
+    m->root = s;
+    m->covered = d;
+    strlcpy(m->path, dst, sizeof m->path);
+    d->mounted = s;
+    struct mount **pp = &mounts;
+    while (*pp) pp = &(*pp)->next;
+    *pp = m;
+    kprintf("vfs: bound %s on %s\n", src, dst);
+    return 0;
+}
+
 /* ======================================================================= */
 /*  boot-time layout                                                          */
 /* ======================================================================= */
@@ -623,8 +650,8 @@ void vfs_init(void)
 
     ramfs_write_file("/etc/hostname", KESTREL_HOSTNAME "\n");
     ramfs_write_file("/etc/passwd",
-        "root:x:0:0:root:/root:/bin/kush\n"
-        "user:x:1000:1000:Kestrel User:/home/user:/bin/kush\n");
+        "root:x:0:0:root:/root:/bin/sh\n"
+        "user:x:1000:1000:Kestrel User:/home/user:/bin/sh\n");
     ramfs_write_file("/etc/group", "root:x:0:\nwheel:x:10:root\nuser:x:1000:\n");
     vfs_mkdir("/home/user", 0755);
     vfs_chown("/home/user", 1000, 1000);

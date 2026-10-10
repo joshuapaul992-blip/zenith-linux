@@ -160,6 +160,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->gid = p->gid;
     c->umask = p->umask;
     c->tty = p->tty;
+    c->ctty = p->ctty;
     c->exit_signal = (int)(flags & 0xff);
     memcpy(c->sigact, p->sigact, sizeof c->sigact);
     c->sig_mask = p->sig_mask;
@@ -353,6 +354,7 @@ int64_t proc_setsid(void)
         if (o->state != TASK_UNUSED && o->pgid == t->pid && o->user) return -EPERM;
     }
     t->sid = t->pgid = t->pid;
+    t->ctty = 0;                                        /* a new session has no terminal */
     return t->sid;
 }
 

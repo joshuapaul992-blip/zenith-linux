@@ -40,6 +40,7 @@ struct int_frame;
 #define SYS_madvise        28
 #define SYS_dup            32
 #define SYS_dup2           33
+#define SYS_sendfile       40
 #define SYS_socket         41
 #define SYS_connect        42
 #define SYS_accept         43
@@ -78,6 +79,7 @@ struct int_frame;
 #define SYS_chown          92
 #define SYS_gettimeofday   96
 #define SYS_umask          95
+#define SYS_getrlimit      97
 #define SYS_getuid        102
 #define SYS_getgid        104
 #define SYS_geteuid       107
@@ -91,6 +93,7 @@ struct int_frame;
 #define SYS_rt_sigpending 127
 #define SYS_rt_sigsuspend 130
 #define SYS_arch_prctl    158
+#define SYS_setrlimit     160
 #define SYS_reboot        169
 #define SYS_gettid        186
 #define SYS_tkill         200
@@ -105,6 +108,7 @@ struct int_frame;
 #define SYS_accept4       288
 #define SYS_dup3          292
 #define SYS_pipe2         293
+#define SYS_prlimit64     302
 #define SYS_getrandom     318
 #define SYS_MAX           320
 

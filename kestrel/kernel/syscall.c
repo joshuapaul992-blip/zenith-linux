@@ -6,6 +6,7 @@
  * each can be filled in independently. */
 #include <kernel/syscall.h>
 #include <kernel/process.h>
+#include <kernel/mm.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
 #include <kernel/task.h>
@@ -913,6 +914,72 @@ static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_
     return rc;
 }
 
+/* sendfile(out, in, offset, count): copy through a kernel buffer. With an
+ * offset pointer the input is read from there and its file position kept. */
+static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offp, uint64_t count, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    struct file **in = fd_slot((int)in_fd), **out = fd_slot((int)out_fd);
+    if (!in || !out) return -EBADF;
+    if (offp && bad_buf(offp, 8)) return -EFAULT;
+    off_t saved = 0;
+    if (offp) {
+        saved = vfs_lseek(*in, 0, 1);                       /* SEEK_CUR */
+        if (saved < 0 || vfs_lseek(*in, *(off_t *)offp, 0) < 0) return -ESPIPE;
+    }
+    uint8_t *buf = kmalloc(4096);
+    if (!buf) return -ENOMEM;
+    int64_t total = 0;
+    while ((uint64_t)total < count) {
+        size_t want = count - (uint64_t)total < 4096 ? (size_t)(count - (uint64_t)total) : 4096;
+        ssize_t n = vfs_read(*in, buf, want);
+        if (n <= 0) { if (!total && n < 0) total = n; break; }
+        ssize_t w = vfs_write(*out, buf, (size_t)n);
+        if (w < 0) { if (!total) total = w; break; }
+        total += w;
+        if (w < n) break;
+    }
+    kfree(buf);
+    if (offp) {
+        if (total > 0) *(off_t *)offp += total;
+        vfs_lseek(*in, saved, 0);
+    }
+    return total;
+}
+
+/* ---- resource limits: fixed by the kernel, reported Linux-style ------------ */
+#define RLIM_INF (~0ull)
+static void rlimit_of(int res, uint64_t out[2])
+{
+    switch (res) {
+    case 3:  out[0] = out[1] = UVM_STACK_SIZE; break;    /* RLIMIT_STACK  */
+    case 7:  out[0] = out[1] = MAX_FDS; break;           /* RLIMIT_NOFILE */
+    case 6:  out[0] = out[1] = MAX_TASKS; break;         /* RLIMIT_NPROC  */
+    case 4:  out[0] = out[1] = 0; break;                 /* RLIMIT_CORE   */
+    default: out[0] = out[1] = RLIM_INF; break;
+    }
+}
+
+static int64_t sys_prlimit64(uint64_t pid, uint64_t res, uint64_t newp, uint64_t oldp, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (pid && (int)pid != current_task()->pid) return -EPERM;
+    if (res > 15) return -EINVAL;
+    if (oldp) { if (bad_buf(oldp, 16)) return -EFAULT; rlimit_of((int)res, (uint64_t *)oldp); }
+    if (newp) {                                         /* lowering is accepted, raising is not */
+        if (bad_buf(newp, 16)) return -EFAULT;
+        uint64_t cur[2];
+        rlimit_of((int)res, cur);
+        const uint64_t *n = (const uint64_t *)newp;
+        if (n[0] > n[1] || n[1] > cur[1]) return -EPERM;
+    }
+    return 0;
+}
+static int64_t sys_getrlimit(uint64_t res, uint64_t oldp, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_prlimit64(0, res, 0, oldp, 0, 0); }
+static int64_t sys_setrlimit(uint64_t res, uint64_t newp, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_prlimit64(0, res, newp, 0, 0, 0); }
+
 /* ---- processes and signals (proc/process.c) ---------------------------- */
 #define SIGCHLD_ 17
 #define CLONE_VM_ 0x100
@@ -1014,6 +1081,8 @@ void syscall_init(void)
     REG(SYS_rt_sigreturn, sys_rt_sigreturn); REG(SYS_rt_sigpending, sys_rt_sigpending);
     REG(SYS_rt_sigsuspend, sys_rt_sigsuspend); REG(SYS_pause, sys_pause);
     REG(SYS_tkill, sys_tkill);         REG(SYS_tgkill, sys_tgkill);
+    REG(SYS_getrlimit, sys_getrlimit); REG(SYS_setrlimit, sys_setrlimit);
+    REG(SYS_prlimit64, sys_prlimit64); REG(SYS_sendfile, sys_sendfile);
     REG(SYS_wait4, sys_wait4);        REG(SYS_kill, sys_kill);
     REG(SYS_gettimeofday, sys_enosys);
 

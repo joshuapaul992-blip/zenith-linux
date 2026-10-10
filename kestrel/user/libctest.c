@@ -93,7 +93,8 @@ int main(int argc, char **argv)
     long ms = (b.tv_sec - a.tv_sec) * 1000 + (b.tv_nsec - a.tv_nsec) / 1000000;
     CHECK(ms >= 25 && ms < 1000, "usleep(30 ms)");
 
-    CHECK(getenv("PATH") && !strcmp(getenv("PATH"), "/boot/bin"), "getenv(PATH)");
+    CHECK(getenv("PATH") && !strcmp(getenv("PATH"), "/bin"), "getenv(PATH)");
+    CHECK(stat("/bin/libctest", &st) == 0 && st.st_size > 0, "/bin shows /boot/bin (bind)");
     CHECK(getpid() > 0, "getpid");
     CHECK(isatty(1) == 1 || isatty(1) == 0, "isatty does not crash");
 
