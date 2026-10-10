@@ -51,6 +51,9 @@ struct vnode_ops {
      * MAP_SHARED mappings and read()/write() see the same bytes (ramfs,
      * memfd). NULL: no shared mappings of this file. */
     struct vm_object *(*vmobject)(struct vnode *vn);
+    /* Optional: the time_ms() at which readiness may change on its own
+     * (timerfd expiry), so poll/epoll sleep exactly that long. 0: never. */
+    uint64_t (*poll_deadline)(struct file *f);
 };
 
 /* poll(2) bits */
@@ -60,6 +63,9 @@ struct vnode_ops {
 #define POLLERR     0x008
 #define POLLHUP     0x010
 #define POLLNVAL    0x020
+#define POLLRDNORM  0x040
+#define POLLWRNORM  0x100
+#define POLLRDHUP   0x2000
 
 struct vnode {
     char        name[VFS_NAME_MAX];
@@ -95,11 +101,13 @@ struct mount {
     struct mount *next;
 };
 
+struct epitem;
 struct file {
     struct vnode *vn;
     uint64_t      off;
     int           flags;
     int           refcnt;
+    struct epitem *ep_links;        /* epoll sets watching this file (fs/epoll.c) */
 };
 
 /* ---- core ------------------------------------------------------------- */
@@ -139,6 +147,7 @@ int     vfs_getdents(struct file *f, void *buf, size_t len);
 int     vfs_ioctl(struct file *f, unsigned long req, void *arg);
 int     vfs_fstat(struct file *f, struct stat *st);
 int     vfs_poll(struct file *f, int events);   /* ready subset of events (+ERR/HUP) */
+uint64_t vfs_poll_deadline(struct file *f);     /* see vnode_ops.poll_deadline */
 struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
 void    vfs_close(struct file *f);                  /* drops one reference */
@@ -172,5 +181,20 @@ struct vnode *pseudo_dir(struct vnode *parent, const char *name);
 struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx);
 struct vnode *ramfs_write_file(const char *path, const char *text);
 struct file  *ramfs_anon_file(const char *name, int flags);    /* memfd_create */
+
+/* fs/epoll.c */
+int      epoll_create_file(int flags, struct file **out);
+int      epoll_ctl_file(struct file *ep, int op, int fd, struct file *target, uint32_t events, uint64_t data);
+int      epoll_wait_file(struct file *ep, void *kevents, int maxevents, int64_t timeout_ms);
+bool     epoll_is(struct file *f);
+void     epoll_file_closing(struct file *f);    /* last close of a watched file */
+void     epoll_file_used(struct file *f);       /* I/O on it: re-arm edge-triggered watches */
+
+/* fs/anonfd.c */
+int      eventfd_create(uint32_t initval, int flags, struct file **out);
+int      timerfd_create_file(int clockid, int flags, struct file **out);
+int      timerfd_settime_file(struct file *f, int flags, const int64_t nv[4], int64_t old[4]);
+int      timerfd_gettime_file(struct file *f, int64_t cur[4]);
+int      signalfd_file(struct file *f, uint64_t mask, int flags, struct file **out);
 
 #endif

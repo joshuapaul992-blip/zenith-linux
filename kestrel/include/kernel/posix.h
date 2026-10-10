@@ -55,6 +55,8 @@ typedef uint32_t gid_t;
 #define ECONNRESET  104
 #define ERANGE       34
 #define ETIMEDOUT   110
+#define ENOBUFS     105
+#define ELOOP        40
 #define ENOMEDIUM   123
 #define ENAMETOOLONG 36
 #define ENOSYS       38

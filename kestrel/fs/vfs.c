@@ -538,6 +538,7 @@ struct file *vfs_file_get(struct file *f)
 void vfs_close(struct file *f)
 {
     if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
+    if (f->ep_links) epoll_file_closing(f);            /* leaves every epoll set */
     struct vnode *vn = f->vn;
     bool last = vn && __atomic_sub_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL) == 0 && vn->unlinked;
     if (vn && vn->ops && vn->ops->release) vn->ops->release(f);    /* may free a socket's vnode */
@@ -552,6 +553,11 @@ struct file *vfs_file_new(struct vnode *vn, int flags)
     f->vn = vn; f->flags = flags; f->refcnt = 1;
     if (vn) __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
     return f;
+}
+
+uint64_t vfs_poll_deadline(struct file *f)
+{
+    return f->vn && f->vn->ops && f->vn->ops->poll_deadline ? f->vn->ops->poll_deadline(f) : 0;
 }
 
 /* Files without a poll op (regular files, most devices) never block. */
@@ -744,6 +750,9 @@ void vfs_init(void)
     if (vfs_lookup("/tmp", &tmp) == 0) tmp->mode |= 01777;
 
     devfs_init("/dev");
+    struct mount *shm;                                  /* POSIX shared memory: a plain ramfs */
+    vfs_mkfs("tmpfs", 0, &shm)->mode = S_IFDIR | 01777;
+    vfs_mount(shm, "/dev/shm");
     procfs_init("/proc");
     sysfs_init("/sys");
 

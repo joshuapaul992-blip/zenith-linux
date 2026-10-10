@@ -394,6 +394,14 @@ void sleep_on(void *chan)
     cur->wait_chan = NULL;
 }
 
+void sleep_on_until(void *chan, uint64_t deadline_ms)
+{
+    if (!running || cur->pid == 0) { sti(); hlt(); cli(); return; }
+    task_block_self(chan, deadline_ms);
+    schedule();
+    cur->wait_chan = NULL;
+}
+
 void kmutex_lock(struct kmutex *m)
 {
     uint64_t f = irq_save();
@@ -414,13 +422,39 @@ void kmutex_unlock(struct kmutex *m)
 
 bool kmutex_held(const struct kmutex *m) { return m->owner == cur; }
 
+static uint64_t poll_seq;                       /* advanced by every wakeup() */
+static int      pollers;                        /* tasks in poll_sleep        */
+
 void wakeup(void *chan)
 {
-    for (int i = 0; i < MAX_TASKS; i++)
-        if (tasks[i].state == TASK_BLOCKED && tasks[i].wait_chan == chan) {
-            tasks[i].state = TASK_READY;
+    __atomic_add_fetch(&poll_seq, 1, __ATOMIC_SEQ_CST);
+    bool polls = __atomic_load_n(&pollers, __ATOMIC_RELAXED) > 0;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = &tasks[i];
+        if (((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && t->wait_chan == chan) ||
+            (polls && t->wait_chan == &poll_seq && (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING))) {
+            t->state = TASK_READY;
             need_resched = true;
         }
+    }
+}
+
+uint64_t poll_seq_read(void) { return __atomic_load_n(&poll_seq, __ATOMIC_SEQ_CST); }
+
+void poll_sleep(uint64_t seq, uint64_t deadline_ms)
+{
+    uint64_t f = irq_save();
+    if (__atomic_load_n(&poll_seq, __ATOMIC_SEQ_CST) == seq && !signal_pending()) {
+        /* Objects that change state without a wakeup() (a device polled by
+         * a driver) are still seen within 100 ms. */
+        uint64_t cap = time_ms() + 100;
+        __atomic_add_fetch(&pollers, 1, __ATOMIC_SEQ_CST);
+        task_block_self(&poll_seq, deadline_ms && deadline_ms < cap ? deadline_ms : cap);
+        schedule();
+        cur->wait_chan = NULL;
+        __atomic_sub_fetch(&pollers, 1, __ATOMIC_SEQ_CST);
+    }
+    irq_restore(f);
 }
 
 void task_sleep_ms(uint64_t ms)
@@ -431,6 +465,7 @@ void task_sleep_ms(uint64_t ms)
         pit_sleep_ms(ms);
         return;
     }
+    cur->wait_chan = NULL;
     cur->wake_tick = pit_ticks() + ms * PIT_HZ / 1000;
     cur->state = TASK_SLEEPING;
     schedule();

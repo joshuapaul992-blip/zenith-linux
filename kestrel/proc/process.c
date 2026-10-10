@@ -597,6 +597,8 @@ static bool ignored(const struct tcb *t, int sig)
 
 static uint64_t blocked_of(const struct tcb *t) { return t->sig_mask & ~UNBLOCKABLE; }
 
+int signal_wait_chan;
+
 int signal_send_thread(struct tcb *t, int sig, const struct ksig_info *info)
 {
     if (!thread_alive(t) || !t->user) return -ESRCH;
@@ -608,6 +610,7 @@ int signal_send_thread(struct tcb *t, int sig, const struct ksig_info *info)
         t->siginfo[sig - 1] = info ? *info : (struct ksig_info){ .code = SI_KERNEL };
     t->sig_pending |= sigbit(sig);
     if (!(blocked_of(t) & sigbit(sig))) task_interrupt(t);
+    wakeup(&signal_wait_chan);                          /* signalfd readers, pollers */
     irq_restore(fl);
     return 0;
 }
@@ -638,6 +641,7 @@ int signal_send_info(struct tcb *t, int sig, const struct ksig_info *info)
         if (thread_alive(o) && same_group(o, t) && !(blocked_of(o) & sigbit(sig))) w = o;
     }
     if (w) task_interrupt(w);
+    wakeup(&signal_wait_chan);
     irq_restore(fl);
     return 0;
 }
@@ -668,6 +672,28 @@ bool signal_pending(void)
 {
     struct tcb *t = current_task();
     return t->user && (pending_of(t) & ~blocked_of(t));
+}
+
+uint64_t signal_pending_mask(void)
+{
+    struct tcb *t = current_task();
+    return t->user ? pending_of(t) : 0;
+}
+
+int signal_dequeue(uint64_t mask, struct ksig_info *info)
+{
+    struct tcb *t = current_task();
+    if (!t->user) return 0;
+    uint64_t fl = irq_save();
+    uint64_t ready = pending_of(t) & mask & ~UNBLOCKABLE;
+    int sig = 0;
+    if (ready) {
+        sig = __builtin_ctzll(ready) + 1;
+        if (t->sig_pending & sigbit(sig)) { t->sig_pending &= ~sigbit(sig); *info = t->siginfo[sig - 1]; }
+        else { t->signal->shared_pending &= ~sigbit(sig); *info = t->signal->shared_info[sig - 1]; }
+    }
+    irq_restore(fl);
+    return sig;
 }
 
 static bool fault_signal(int sig) { return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE || sig == SIGTRAP; }
@@ -838,6 +864,10 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
         return;                                         /* one handler per return */
     }
     if (syscall && (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND)) restart(f, nr);
+    if (t->saved_mask_valid) {                          /* no handler ran: the wait's mask goes */
+        t->sig_mask = t->saved_mask;
+        t->saved_mask_valid = false;
+    }
 }
 
 int64_t sig_return(void)
@@ -948,6 +978,27 @@ int64_t sig_suspend(uint64_t mask, uint64_t size)
 }
 
 int64_t sig_pause(void) { return wait_for_signal(); }
+
+int sig_temp_mask(uint64_t umask, uint64_t size)
+{
+    struct tcb *t = current_task();
+    if (!umask) return 0;
+    if (size != 8) return -EINVAL;
+    uint64_t m;
+    if (copy_from_user(&m, (const void *)umask, 8)) return -EFAULT;
+    t->saved_mask = t->sig_mask;
+    t->saved_mask_valid = true;
+    t->sig_mask = m & ~UNBLOCKABLE;
+    return 0;
+}
+
+void sig_temp_mask_end(void)
+{
+    struct tcb *t = current_task();
+    if (!t->saved_mask_valid || signal_pending()) return;   /* delivery restores it */
+    t->sig_mask = t->saved_mask;
+    t->saved_mask_valid = false;
+}
 
 int64_t sig_kill(int64_t pid, int64_t sig)
 {

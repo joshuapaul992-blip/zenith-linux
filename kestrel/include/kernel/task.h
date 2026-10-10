@@ -9,7 +9,7 @@
 #define MAX_TASKS       256             /* threads included */
 #define KSTACK_SIZE     (16 * 1024)
 #define TASK_NAME_LEN   24
-#define MAX_FDS         64
+#define MAX_FDS         1024            /* per process (RLIMIT_NOFILE) */
 #define SCHED_QUANTUM   10              /* ticks (ms) per time slice */
 
 enum task_state {
@@ -178,7 +178,17 @@ void        kmutex_unlock(struct kmutex *m);
 bool        kmutex_held(const struct kmutex *m);   /* by the calling task */
 
 void        sleep_on(void *chan);       /* call with interrupts disabled */
+/* sleep_on() that also ends at deadline_ms of time_ms() (0: none) */
+void        sleep_on_until(void *chan, uint64_t deadline_ms);
 void        wakeup(void *chan);
+
+/* Waiting for any of many objects (poll, select, epoll). Every wakeup()
+ * advances a global sequence number and wakes the pollers: a poller reads
+ * the number, checks its objects, and sleeps only if the number has not
+ * moved since -- no state change can slip in between unnoticed.
+ * poll_sleep returns at a wakeup, a signal, or deadline_ms (0: none). */
+uint64_t    poll_seq_read(void);
+void        poll_sleep(uint64_t seq, uint64_t deadline_ms);
 void        task_sleep_ms(uint64_t ms);
 int         task_wait(int pid);         /* exit status, or -ECHILD        */
 

@@ -98,6 +98,11 @@ int  signal_send_thread(struct tcb *t, int sig, const struct ksig_info *info);
  * if it is blocked or ignored (then the default action applies). */
 void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err);
 bool signal_pending(void);                      /* for blocking loops         */
+/* signalfd: take the lowest pending signal of the current thread that is in
+ * mask (its own first, then the process'); 0 if none. */
+int  signal_dequeue(uint64_t mask, struct ksig_info *info);
+uint64_t signal_pending_mask(void);             /* pending for the current thread */
+extern int signal_wait_chan;                    /* woken whenever a signal is queued */
 /* Deliver pending signals to the current process before it returns to
  * ring 3 through `f` (interrupts off). `nr` is the system call being
  * finished, if `syscall`. May not return (default action: terminate). */
@@ -119,6 +124,11 @@ int64_t sig_return(void);
 int64_t sig_suspend(uint64_t mask, uint64_t size);
 int64_t sig_pause(void);
 int64_t sig_kill(int64_t pid, int64_t sig);
+/* ppoll, pselect6, epoll_pwait: wait with this signal mask (0: unchanged).
+ * sig_temp_mask_end puts the old one back, unless a signal is about to be
+ * delivered under the temporary mask (then rt_sigreturn restores it). */
+int     sig_temp_mask(uint64_t umask, uint64_t size);
+void    sig_temp_mask_end(void);
 int64_t sig_tgkill(int64_t tgid, int64_t tid, int64_t sig);
 
 #endif

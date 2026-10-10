@@ -55,6 +55,7 @@ static struct file *fget(int fd)
     if (fd < 0 || fd >= MAX_FDS) return NULL;
     uint64_t fl = irq_save();
     struct file *f = vfs_file_get(t->files->fd[fd]);
+    if (f && f->ep_links) epoll_file_used(f);           /* I/O on it re-arms EPOLLET watches */
     irq_restore(fl);
     return f;
 }
@@ -1011,11 +1012,131 @@ static int64_t sys_pipe2(uint64_t fds, uint64_t flags, uint64_t a3, uint64_t a4,
 static int64_t sys_pipe(uint64_t fds, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a2; return sys_pipe2(fds, 0, a3, a4, a5, a6); }
 
+/* ---- epoll, eventfd, timerfd, signalfd (fs/epoll.c, fs/anonfd.c) ------------- */
+/* Install the file a constructor made (f is read only after it ran). */
+static int64_t new_fd(int r, struct file **f, bool cloexec) { return r ? r : install(*f, cloexec); }
+
+static int64_t sys_epoll_create1(uint64_t flags, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = NULL;
+    return new_fd(epoll_create_file((int)flags, &f), &f, flags & O_CLOEXEC);
+}
+
+static int64_t sys_epoll_create(uint64_t size, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ return (int64_t)(int32_t)size <= 0 ? -EINVAL : sys_epoll_create1(0, a2, a3, a4, a5, a6); }
+
+static int64_t sys_epoll_ctl(uint64_t epfd, uint64_t op, uint64_t fd, uint64_t uev, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    uint8_t ev[12] = { 0 };                             /* struct epoll_event, packed */
+    if (op != 2 && copy_from_user(ev, (const void *)uev, sizeof ev)) return -EFAULT;   /* DEL needs none */
+    uint32_t events; uint64_t data;
+    memcpy(&events, ev, 4);
+    memcpy(&data, ev + 4, 8);
+    struct file *ep = fget((int)epfd);
+    if (!ep) return -EBADF;
+    struct file *t = fget((int)fd);
+    int64_t r = !t ? -EBADF : epoll_ctl_file(ep, (int)op, (int)fd, t, events, data);
+    if (t) fput(t);
+    fput(ep);
+    return r;
+}
+
+static int64_t epoll_wait_common(uint64_t epfd, uint64_t uev, int64_t max, int64_t tmo, uint64_t sig, uint64_t sigsize)
+{
+    if (max <= 0 || max > (1 << 20)) return -EINVAL;
+    if (!ubuf_ok(uev, (uint64_t)max * 12)) return -EFAULT;
+    int n = max > 1024 ? 1024 : (int)max;               /* per call; the rest wait for the next */
+    struct file *ep = fget((int)epfd);
+    if (!ep) return -EBADF;
+    if (!epoll_is(ep)) { fput(ep); return -EINVAL; }
+    uint8_t *k = kmalloc((size_t)n * 12);
+    int64_t r = k ? sig_temp_mask(sig, sigsize) : -ENOMEM;
+    if (!r) {
+        r = epoll_wait_file(ep, k, n, tmo);
+        sig_temp_mask_end();
+        if (r > 0 && copy_to_user((void *)uev, k, (size_t)r * 12)) r = -EFAULT;
+    }
+    kfree(k);
+    fput(ep);
+    return r;
+}
+
+static int64_t sys_epoll_wait(uint64_t epfd, uint64_t uev, uint64_t max, uint64_t tmo, uint64_t a5, uint64_t a6)
+{ (void)a5; (void)a6; return epoll_wait_common(epfd, uev, (int32_t)max, (int32_t)tmo, 0, 0); }
+
+static int64_t sys_epoll_pwait(uint64_t epfd, uint64_t uev, uint64_t max, uint64_t tmo, uint64_t sig, uint64_t size)
+{ return epoll_wait_common(epfd, uev, (int32_t)max, (int32_t)tmo, sig, size); }
+
+static int64_t sys_eventfd2(uint64_t initval, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = NULL;
+    return new_fd(eventfd_create((uint32_t)initval, (int)flags, &f), &f, flags & O_CLOEXEC);
+}
+
+static int64_t sys_eventfd(uint64_t initval, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; return sys_eventfd2(initval, 0, a3, a4, a5, a6); }
+
+static int64_t sys_timerfd_create(uint64_t clk, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = NULL;
+    return new_fd(timerfd_create_file((int)clk, (int)flags, &f), &f, flags & O_CLOEXEC);
+}
+
+static int64_t sys_timerfd_settime(uint64_t fd, uint64_t flags, uint64_t unew, uint64_t uold, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    int64_t nv[4], old[4];
+    if (copy_from_user(nv, (const void *)unew, sizeof nv)) return -EFAULT;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int64_t r = timerfd_settime_file(f, (int)flags, nv, uold ? old : NULL);
+    fput(f);
+    if (!r && uold && copy_to_user((void *)uold, old, sizeof old)) r = -EFAULT;
+    return r;
+}
+
+static int64_t sys_timerfd_gettime(uint64_t fd, uint64_t ucur, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    int64_t cur[4];
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int64_t r = timerfd_gettime_file(f, cur);
+    fput(f);
+    if (!r && copy_to_user((void *)ucur, cur, sizeof cur)) r = -EFAULT;
+    return r;
+}
+
+static int64_t sys_signalfd4(uint64_t fd, uint64_t umask, uint64_t size, uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (size != 8) return -EINVAL;
+    uint64_t mask;
+    if (copy_from_user(&mask, (const void *)umask, 8)) return -EFAULT;
+    if ((int32_t)fd == -1) {
+        struct file *f = NULL;
+        return new_fd(signalfd_file(NULL, mask, (int)flags, &f), &f, flags & O_CLOEXEC);
+    }
+    struct file *f = fget((int)fd), *unused;
+    if (!f) return -EBADF;
+    int64_t r = signalfd_file(f, mask, (int)flags, &unused);
+    fput(f);
+    return r ? r : (int64_t)(int32_t)fd;
+}
+
+static int64_t sys_signalfd(uint64_t fd, uint64_t umask, uint64_t size, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; return sys_signalfd4(fd, umask, size, 0, a5, a6); }
+
 struct pollfd { int fd; short events, revents; };
 
-/* Readiness is re-checked every millisecond until something is ready or the
- * timeout expires. The pollfd array is copied in once and the results out
- * once. */
+/* Readiness is checked, and while nothing is ready the caller sleeps until
+ * any object changes state (task.h: poll_sleep), the timeout expires, or a
+ * timerfd it watches fires. The pollfd array is copied in once and the
+ * results out once. */
 static int64_t do_poll(uint64_t ufds, uint64_t nfds, int64_t tmo)
 {
     if (nfds > 4 * MAX_FDS) return -EINVAL;
@@ -1025,18 +1146,28 @@ static int64_t do_poll(uint64_t ufds, uint64_t nfds, int64_t tmo)
     uint64_t deadline = tmo > 0 ? time_ms() + (uint64_t)tmo : 0;
     int64_t ready;
     for (;;) {
+        uint64_t seq = poll_seq_read(), wake = deadline;
         ready = 0;
         for (uint64_t i = 0; i < nfds; i++) {
             p[i].revents = 0;
             if (p[i].fd < 0) continue;
             struct file *f = fget(p[i].fd);
-            p[i].revents = f ? (short)vfs_poll(f, p[i].events | POLLERR | POLLHUP) : POLLNVAL;
-            if (f) fput(f);
+            if (f) {
+                int ev = vfs_poll(f, p[i].events | POLLERR | POLLHUP);
+                if ((p[i].events & POLLRDNORM) && (ev & POLLIN)) ev |= POLLRDNORM;
+                if ((p[i].events & POLLWRNORM) && (ev & POLLOUT)) ev |= POLLWRNORM;
+                p[i].revents = (short)(ev & (p[i].events | POLLERR | POLLHUP));
+                uint64_t d = vfs_poll_deadline(f);
+                if (d && (!wake || d < wake)) wake = d;
+                fput(f);
+            } else {
+                p[i].revents = POLLNVAL;
+            }
             if (p[i].revents) ready++;
         }
         if (ready || tmo == 0 || (tmo > 0 && time_ms() >= deadline)) break;
         if (signal_pending()) { ready = -ERESTARTNOHAND; break; }
-        task_sleep_ms(1);
+        poll_sleep(seq, wake);                          /* until something changes */
     }
     if (ready >= 0 && copy_to_user((void *)ufds, p, nfds * sizeof *p)) ready = -EFAULT;
     kfree(p);
@@ -1046,9 +1177,9 @@ static int64_t do_poll(uint64_t ufds, uint64_t nfds, int64_t tmo)
 static int64_t sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeout, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a4; (void)a5; (void)a6; return do_poll(fds, nfds, (int)timeout); }
 
-static int64_t sys_ppoll(uint64_t fds, uint64_t nfds, uint64_t tsp, uint64_t sig, uint64_t a5, uint64_t a6)
+static int64_t sys_ppoll(uint64_t fds, uint64_t nfds, uint64_t tsp, uint64_t sig, uint64_t sigsize, uint64_t a6)
 {
-    (void)sig; (void)a5; (void)a6;
+    (void)a6;
     int64_t tmo = -1;
     if (tsp) {
         struct timespec ts;
@@ -1056,7 +1187,11 @@ static int64_t sys_ppoll(uint64_t fds, uint64_t nfds, uint64_t tsp, uint64_t sig
         if (!timespec_ok(&ts)) return -EINVAL;
         tmo = ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000;
     }
-    return do_poll(fds, nfds, tmo);
+    int r = sig_temp_mask(sig, sigsize);
+    if (r) return r;
+    int64_t ret = do_poll(fds, nfds, tmo);
+    sig_temp_mask_end();
+    return ret == -ERESTARTNOHAND ? -EINTR : ret;       /* ppoll is never restarted */
 }
 
 /* select(2) and pselect6(2) on top of the same readiness checks as poll:
@@ -1078,6 +1213,7 @@ static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int6
     static const int want[3] = { POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI };
     uint64_t deadline = tmo_ms > 0 ? time_ms() + (uint64_t)tmo_ms : 0;
     for (;;) {
+        uint64_t seq = poll_seq_read(), wake = deadline;
         int ready = 0;
         uint8_t out[3][128];
         memset(out, 0, sizeof out);
@@ -1087,6 +1223,8 @@ static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int6
                 struct file *f = fget((int)fd);
                 if (!f) return -EBADF;
                 int ev = vfs_poll(f, want[k]);
+                uint64_t d = vfs_poll_deadline(f);
+                if (d && (!wake || d < wake)) wake = d;
                 fput(f);
                 if (ev & want[k]) {
                     out[k][fd / 8] |= (uint8_t)(1u << (fd % 8));
@@ -1100,7 +1238,7 @@ static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int6
             return ready;
         }
         if (signal_pending()) return -ERESTARTNOHAND;
-        task_sleep_ms(1);
+        poll_sleep(seq, wake);
     }
 }
 
@@ -1119,15 +1257,20 @@ static int64_t sys_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, uin
 
 static int64_t sys_pselect6(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, uint64_t tsp, uint64_t sig)
 {
-    (void)sig;
     int64_t tmo = -1;
+    uint64_t ss[2] = { 0, 0 };                          /* { const sigset_t *ss; size_t ss_len } */
+    if (sig && copy_from_user(ss, (const void *)sig, sizeof ss)) return -EFAULT;
     if (tsp) {
         struct timespec ts;
         if (copy_from_user(&ts, (const void *)tsp, sizeof ts)) return -EFAULT;
         if (!timespec_ok(&ts)) return -EINVAL;
         tmo = ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000;
     }
-    return do_select(n, rp, wp, ep, tmo);
+    int r = sig_temp_mask(ss[0], ss[1]);
+    if (r) return r;
+    int64_t ret = do_select(n, rp, wp, ep, tmo);
+    sig_temp_mask_end();
+    return ret == -ERESTARTNOHAND ? -EINTR : ret;
 }
 
 /* readlink: there are no symbolic links, except /proc/self/exe and
@@ -1528,34 +1671,149 @@ struct msghdr_k {
     int32_t  flags, pad1;
 };
 
-/* Data only for now: a message carrying ancillary data (SCM_RIGHTS
- * descriptor passing) is refused, never dropped. */
+/* sendmsg/recvmsg. The header, the iovec array and the control buffer are
+ * each copied into the kernel once and only those copies are used (no
+ * second look at user memory that another thread may change). Data goes
+ * through one bounce buffer: a record (SOCK_SEQPACKET/DGRAM) whole, a
+ * stream in 64 KiB pieces. SCM_RIGHTS descriptors are taken (each a counted
+ * reference) before anything is sent, and installed in the receiver's table
+ * only once the data has arrived. */
+#define CMSG_ALIGN(n)   (((n) + 7) & ~(uint64_t)7)
+#define CMSG_HDR        16                              /* u64 len, i32 level, i32 type */
+#define MAX_CONTROL     8192
+
+struct msg_cursor { const struct iovec *v; uint64_t n, i, off; };
+
+/* Copy between the bounce buffer and the iovecs at the cursor. */
+static int iov_xfer(struct msg_cursor *c, uint8_t *kb, size_t len, bool to_user)
+{
+    size_t done = 0;
+    while (done < len && c->i < c->n) {
+        uint64_t room = c->v[c->i].len - c->off;
+        if (!room) { c->i++; c->off = 0; continue; }
+        size_t k = len - done < room ? len - done : (size_t)room;
+        void *u = (void *)(c->v[c->i].base + c->off);
+        if (to_user ? copy_to_user(u, kb + done, k) : copy_from_user(kb + done, u, k)) return -EFAULT;
+        done += k;
+        c->off += k;
+    }
+    return 0;
+}
+
+static void close_files(struct file **files, int n) { for (int i = 0; i < n; i++) if (files[i]) vfs_close(files[i]); }
+
+/* Parse the (kernel copy of the) control buffer of a sendmsg. */
+static int64_t take_rights(const uint8_t *ctl, uint64_t len, struct file **files, int *nfiles)
+{
+    *nfiles = 0;
+    for (uint64_t off = 0; off + CMSG_HDR <= len;) {
+        uint64_t clen;
+        int32_t level, type;
+        memcpy(&clen, ctl + off, 8);
+        memcpy(&level, ctl + off + 8, 4);
+        memcpy(&type, ctl + off + 12, 4);
+        if (clen < CMSG_HDR || clen > len - off) { close_files(files, *nfiles); return -EINVAL; }
+        if (level == SOL_SOCKET && type == SCM_RIGHTS) {
+            uint64_t n = (clen - CMSG_HDR) / 4;
+            if (*nfiles + n > SCM_MAX_FD) { close_files(files, *nfiles); return -EINVAL; }
+            for (uint64_t i = 0; i < n; i++) {
+                int32_t fd;
+                memcpy(&fd, ctl + off + CMSG_HDR + i * 4, 4);
+                struct file *f = fget(fd);
+                if (!f) { close_files(files, *nfiles); return -EBADF; }
+                files[(*nfiles)++] = f;
+            }
+        } else if (!(level == SOL_SOCKET && type == SCM_CREDENTIALS)) {    /* credentials: ignored */
+            close_files(files, *nfiles);
+            return -EINVAL;
+        }
+        off += CMSG_ALIGN(clen);
+    }
+    return 0;
+}
+
 static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
 {
     struct msghdr_k m;
     if (copy_from_user(&m, (const void *)umsg, sizeof m)) return -EFAULT;
-    if (send && m.controllen) return -EOPNOTSUPP;
     if (m.iovlen > 1024) return -EMSGSIZE;
+    if (m.controllen > MAX_CONTROL) { if (send) return -ENOBUFS; m.controllen = MAX_CONTROL; }
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
     struct iovec *v = m.iovlen ? kmalloc(m.iovlen * sizeof *v) : NULL;
+    uint8_t *ctl = m.controllen ? kmalloc(m.controllen) : NULL;
+    uint8_t *kb = NULL;
+    struct file *files[SCM_MAX_FD];
+    int nfiles = 0;
     int64_t total = 0;
-    if (m.iovlen && !v) { total = -ENOMEM; goto out; }
+    if ((m.iovlen && !v) || (m.controllen && !ctl)) { total = -ENOMEM; goto out; }
     if (copy_from_user(v, (const void *)m.iov, m.iovlen * sizeof *v)) { total = -EFAULT; goto out; }
+    uint64_t len = 0;
     for (uint64_t i = 0; i < m.iovlen; i++) {
-        if (!v[i].len) continue;
-        if ((int64_t)v[i].len < 0) { if (!total) total = -EINVAL; break; }
-        int64_t n = sock_xfer(f, v[i].base, v[i].len, (int)flags | (total ? MSG_DONTWAIT : 0), send);
-        if (n < 0) { if (!total) total = n; break; }
-        total += n;
-        if ((uint64_t)n < v[i].len) break;
+        if ((int64_t)v[i].len < 0 || len + v[i].len < len || len + v[i].len > 0x7ffff000) { total = -EINVAL; goto out; }
+        if (v[i].len && !ubuf_ok(v[i].base, v[i].len)) { total = -EFAULT; goto out; }
+        len += v[i].len;
     }
-    if (!send && total >= 0) {
-        m.controllen = 0; m.flags = 0;
-        if (m.name) m.namelen = 0;
-        if (copy_to_user((void *)umsg, &m, sizeof m)) total = -EFAULT;
+    struct msg_cursor cur = { v, m.iovlen, 0, 0 };
+    size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
+    if (!(kb = kmalloc(chunk ? chunk : 1))) { total = -ENOMEM; goto out; }
+
+    if (send) {
+        if (m.controllen) {
+            if (copy_from_user(ctl, (const void *)m.control, m.controllen)) { total = -EFAULT; goto out; }
+            if ((total = take_rights(ctl, m.controllen, files, &nfiles))) goto out;
+        }
+        int type = 0; uint32_t tl = sizeof type;
+        usock_getsockopt(f, SOL_SOCKET, SO_TYPE, &type, &tl);
+        if (type != SOCK_STREAM && len > IO_CHUNK) { total = -EMSGSIZE; goto out; }
+        do {                                            /* stream: piece by piece */
+            size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
+            if (iov_xfer(&cur, kb, want, false)) { if (!total) total = -EFAULT; break; }
+            long n = usock_sendmsg(f, kb, want, (int)flags | (total ? MSG_DONTWAIT : 0), files, nfiles);
+            if (n < 0) { if (!total) total = n; break; }
+            nfiles = 0;                                 /* the socket has them now */
+            total += n;
+            if ((size_t)n < want) break;
+        } while ((uint64_t)total < len);
+    } else {
+        int maxfiles = m.controllen >= CMSG_HDR + 4 ? (int)((m.controllen - CMSG_HDR) / 4) : 0;
+        if (maxfiles > SCM_MAX_FD) maxfiles = SCM_MAX_FD;
+        int mflags = 0;
+        long n = usock_recvmsg(f, kb, chunk, (int)flags, files, &nfiles, maxfiles, &mflags);
+        if (n < 0) { total = n; goto out; }
+        size_t got = (size_t)n < chunk ? (size_t)n : chunk;       /* MSG_TRUNC may report more */
+        if (iov_xfer(&cur, kb, got, true)) { total = -EFAULT; goto out; }
+        total = n;
+        uint64_t clen = 0;
+        if (nfiles) {                                   /* install, then describe them */
+            int32_t fds[SCM_MAX_FD];
+            int k = 0;
+            for (; k < nfiles; k++) {
+                int nfd = fd_alloc(current_task(), 0, files[k], flags & MSG_CMSG_CLOEXEC);
+                if (nfd < 0) break;
+                fds[k] = nfd;
+                files[k] = NULL;
+            }
+            if (k < nfiles) mflags |= MSG_CTRUNC;       /* table full: the rest are closed */
+            uint64_t hl = CMSG_HDR + (uint64_t)k * 4;
+            int32_t lv = SOL_SOCKET, ty = SCM_RIGHTS;
+            memset(ctl, 0, CMSG_ALIGN(hl) <= m.controllen ? CMSG_ALIGN(hl) : m.controllen);
+            memcpy(ctl, &hl, 8);
+            memcpy(ctl + 8, &lv, 4);
+            memcpy(ctl + 12, &ty, 4);
+            memcpy(ctl + CMSG_HDR, fds, (size_t)k * 4);
+            clen = CMSG_ALIGN(hl) <= m.controllen ? CMSG_ALIGN(hl) : hl;
+            if (k && copy_to_user((void *)m.control, ctl, clen)) total = -EFAULT;
+        }
+        m.controllen = clen;
+        m.flags = mflags;
+        if (m.name) m.namelen = 0;                      /* the peer is unnamed */
+        if (total >= 0 && copy_to_user((void *)umsg, &m, sizeof m)) total = -EFAULT;
     }
 out:
+    close_files(files, nfiles);                         /* not sent / not installed */
+    kfree(kb);
+    kfree(ctl);
     kfree(v);
     fput(f);
     return total;
@@ -1822,6 +2080,13 @@ void syscall_init(void)
     REG(SYS_set_tid_address, sys_set_tid_address);
     REG(SYS_gettid, sys_gettid);
     REG(SYS_futex, sys_futex);
+    REG(SYS_epoll_create, sys_epoll_create);     REG(SYS_epoll_create1, sys_epoll_create1);
+    REG(SYS_epoll_ctl, sys_epoll_ctl);           REG(SYS_epoll_wait, sys_epoll_wait);
+    REG(SYS_epoll_pwait, sys_epoll_pwait);
+    REG(SYS_eventfd, sys_eventfd);               REG(SYS_eventfd2, sys_eventfd2);
+    REG(SYS_timerfd_create, sys_timerfd_create); REG(SYS_timerfd_settime, sys_timerfd_settime);
+    REG(SYS_timerfd_gettime, sys_timerfd_gettime);
+    REG(SYS_signalfd, sys_signalfd);             REG(SYS_signalfd4, sys_signalfd4);
     REG(SYS_set_robust_list, sys_set_robust_list);
     REG(SYS_get_robust_list, sys_get_robust_list);
     REG(SYS_sched_getaffinity, sys_sched_getaffinity);

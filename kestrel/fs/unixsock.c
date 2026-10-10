@@ -1,4 +1,4 @@
-/* fs/unixsock.c -- AF_UNIX stream sockets (see include/kernel/socket.h)
+/* fs/unixsock.c -- AF_UNIX sockets (see include/kernel/socket.h)
  *
  * Every socket is an anonymous vnode embedded in a struct usock; a file
  * descriptor is a struct file on that vnode. Single CPU: state changes run
@@ -10,7 +10,19 @@
  * (which then reads EOF and gets EPIPE on write) and frees it. Names are
  * kept in a small table: abstract names directly, path names by the inode
  * of their VSOCK node, so a socket file that was unlinked or replaced can
- * no longer be reached even if its vnode memory is reused. */
+ * no longer be reached even if its vnode memory is reused.
+ *
+ * Messages: every socket's receive ring has a queue of `umsg` marks keyed
+ * by absolute stream position. On SOCK_SEQPACKET/SOCK_DGRAM every send is
+ * one record (a mark with its length): a receive takes exactly one record,
+ * truncating it (MSG_TRUNC) if the buffer is short. On SOCK_STREAM a mark
+ * exists only where descriptors were sent (SCM_RIGHTS): they arrive with
+ * the first byte of the data they were sent with, and a receive never
+ * reads across a mark, so they come with the right bytes. Descriptors in
+ * flight are counted references to the open files; a socket closed with
+ * undelivered ones closes them. There is no garbage collector for sockets
+ * sent over themselves: in-flight counts are bounded instead (MAX_MSGS
+ * marks per socket, SCM_MAX_FD files per message). */
 #include <kernel/process.h>
 #include <kernel/socket.h>
 #include <kernel/vfs.h>
@@ -23,13 +35,22 @@
 #define SOCK_BUF        65536
 #define MAX_BACKLOG     64
 #define MAX_NAMES       64
+#define MAX_MSGS        1024            /* queued records / descriptor marks */
+
+struct umsg {
+    uint64_t     pos;                   /* stream position of the first byte */
+    uint32_t     len;                   /* record length (records only)     */
+    int          nfiles;
+    struct umsg *next;
+    struct file *files[];
+};
 
 enum ustate { US_NEW, US_LISTEN, US_CONNECTED };
 
 struct usock {
     struct vnode vn;                    /* vn.data == this */
     enum ustate state;
-    bool     nonblock_unused;
+    int      type;                      /* SOCK_STREAM, SOCK_SEQPACKET, SOCK_DGRAM */
     /* name: bound address (or, for accepted sockets, the listener's) */
     struct sockaddr_un addr;
     uint32_t addrlen;                   /* 0 = unnamed */
@@ -43,6 +64,9 @@ struct usock {
     bool     shut_rd, shut_wr;
     uint8_t *rx;                        /* SOCK_BUF ring: data from the peer */
     size_t   rx_head, rx_count;
+    uint64_t rx_in, rx_out;             /* bytes ever queued / taken          */
+    struct umsg *msgs, *msgs_tail;      /* marks, in stream order             */
+    int      nmsgs;
     struct ucred cred;                  /* of the process that created it */
 };
 
@@ -59,10 +83,13 @@ static const struct vnode_ops sock_ops;
 static struct usock *us(struct file *f) { return f->vn->data; }
 bool usock_is(struct file *f) { return f && f->vn && f->vn->ops == &sock_ops; }
 
-static struct usock *usock_new(void)
+static bool records(const struct usock *s) { return s->type != SOCK_STREAM; }
+
+static struct usock *usock_new(int type)
 {
     struct usock *s = kzalloc(sizeof *s);
     if (!s) return NULL;
+    s->type = type;
     s->rx = kmalloc(SOCK_BUF);
     if (!s->rx) { kfree(s); return NULL; }
     strlcpy(s->vn.name, "socket", sizeof s->vn.name);
@@ -71,7 +98,7 @@ static struct usock *usock_new(void)
     s->vn.ops = &sock_ops;
     s->vn.data = s;
     struct tcb *t = current_task();
-    s->cred.pid = t->pid; s->cred.uid = t->uid; s->cred.gid = t->gid;
+    s->cred.pid = t->tgid; s->cred.uid = t->uid; s->cred.gid = t->gid;
     return s;
 }
 
@@ -80,10 +107,28 @@ static void unname(struct usock *s)
     for (int i = 0; i < MAX_NAMES; i++) if (names[i].used && names[i].s == s) names[i].used = false;
 }
 
+static void umsg_free(struct umsg *m)
+{
+    for (int i = 0; i < m->nfiles; i++) if (m->files[i]) vfs_close(m->files[i]);
+    kfree(m);
+}
+
+/* Unlink the first mark (interrupts off). */
+static struct umsg *umsg_pop(struct usock *s)
+{
+    struct umsg *m = s->msgs;
+    if (!m) return NULL;
+    s->msgs = m->next;
+    if (!s->msgs) s->msgs_tail = NULL;
+    s->nmsgs--;
+    return m;
+}
+
 /* Detach from the peer and free. Interrupts must be off. */
 static void usock_destroy(struct usock *s)
 {
     unname(s);
+    while (s->msgs) umsg_free(umsg_pop(s));             /* undelivered descriptors */
     for (int i = 0; i < s->qlen; i++) usock_destroy(s->queue[i]);     /* never-accepted connections */
     s->qlen = 0;
     if (s->peer) {
@@ -104,9 +149,10 @@ static struct file *file_for(struct usock *s, int flags)
 int usock_create(int domain, int type, int protocol, struct file **out)
 {
     if (domain != AF_UNIX) return -EAFNOSUPPORT;
-    if ((type & 0xf) != SOCK_STREAM) return -EPROTONOSUPPORT;   /* DGRAM/SEQPACKET: later */
+    /* connection-oriented only: unconnected datagrams need addressing */
+    if ((type & 0xf) != SOCK_STREAM && (type & 0xf) != SOCK_SEQPACKET) return -EPROTONOSUPPORT;
     if (protocol != 0) return -EPROTONOSUPPORT;
-    struct usock *s = usock_new();
+    struct usock *s = usock_new(type & 0xf);
     if (!s) return -ENOMEM;
     if (!(*out = file_for(s, type))) { kfree(s->rx); kfree(s); return -ENOMEM; }
     return 0;
@@ -120,8 +166,9 @@ static void connect_pair(struct usock *a, struct usock *b)
 
 int usock_pair(int type, struct file **fa, struct file **fb)
 {
-    if ((type & 0xf) != SOCK_STREAM) return -EPROTONOSUPPORT;
-    struct usock *a = usock_new(), *b = usock_new();
+    int t = type & 0xf;
+    if (t != SOCK_STREAM && t != SOCK_SEQPACKET && t != SOCK_DGRAM) return -EPROTONOSUPPORT;
+    struct usock *a = usock_new(t), *b = usock_new(t);
     if (!a || !b) { if (a) { kfree(a->rx); kfree(a); } if (b) { kfree(b->rx); kfree(b); } return -ENOMEM; }
     connect_pair(a, b);
     *fa = file_for(a, type);
@@ -226,8 +273,9 @@ int usock_connect(struct file *f, const struct sockaddr_un *a, uint32_t len)
     uint64_t fl = irq_save();
     struct usock *l = find_listener(abstract, name, nl);
     if (!l || l->state != US_LISTEN) { irq_restore(fl); return -ECONNREFUSED; }
+    if (l->type != s->type) { irq_restore(fl); return -EPROTOTYPE; }
     if (l->qlen >= l->backlog) { irq_restore(fl); return (f->flags & O_NONBLOCK) ? -EAGAIN : -ECONNREFUSED; }
-    struct usock *srv = usock_new();
+    struct usock *srv = usock_new(s->type);
     if (!srv) { irq_restore(fl); return -ENOMEM; }
     srv->cred = l->cred;                        /* the server process owns it */
     srv->addr = l->addr;
@@ -269,60 +317,160 @@ int usock_accept(struct file *f, int flags, struct file **out, struct sockaddr_u
     return 0;
 }
 
-long usock_send(struct file *f, const void *buf, size_t len, int flags)
+/* Copy n bytes into p's ring at its tail (interrupts off, room checked). */
+static void ring_put(struct usock *p, const void *buf, size_t n)
+{
+    size_t tail = (p->rx_head + p->rx_count) % SOCK_BUF;
+    size_t first = n < SOCK_BUF - tail ? n : SOCK_BUF - tail;
+    memcpy(p->rx + tail, buf, first);
+    memcpy(p->rx, (const uint8_t *)buf + first, n - first);
+    p->rx_count += n;
+    p->rx_in += n;
+}
+
+static void ring_get(struct usock *s, void *buf, size_t n, bool consume)
+{
+    size_t first = n < SOCK_BUF - s->rx_head ? n : SOCK_BUF - s->rx_head;
+    if (buf) {
+        memcpy(buf, s->rx + s->rx_head, first);
+        memcpy((uint8_t *)buf + first, s->rx, n - first);
+    }
+    if (consume) {
+        s->rx_head = (s->rx_head + n) % SOCK_BUF;
+        s->rx_count -= n;
+        s->rx_out += n;
+    }
+}
+
+static void umsg_append(struct usock *p, struct umsg *m)
+{
+    m->next = NULL;
+    if (p->msgs_tail) p->msgs_tail->next = m; else p->msgs = m;
+    p->msgs_tail = m;
+    p->nmsgs++;
+}
+
+static struct umsg *umsg_new(int nfiles)
+{
+    return kzalloc(sizeof(struct umsg) + (size_t)nfiles * sizeof(struct file *));
+}
+
+/* Send len bytes; on success the socket takes over the references in
+ * files[] (delivered with the first byte). On failure they stay the
+ * caller's. Records go whole or not at all. */
+long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struct file **files, int nfiles)
 {
     struct usock *s = us(f);
     bool nb = (f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT);
+    if (nfiles < 0 || nfiles > SCM_MAX_FD) return -EINVAL;
+    if (records(s) && len > SOCK_BUF) return -EMSGSIZE;
+    struct umsg *m = NULL;
+    if (records(s) || nfiles) {
+        if (!(m = umsg_new(nfiles))) return -ENOMEM;
+        m->nfiles = nfiles;
+        m->len = (uint32_t)len;
+    }
     size_t done = 0;
     uint64_t fl = irq_save();
-    if (s->state != US_CONNECTED && !s->peer_gone) { irq_restore(fl); return -ENOTCONN; }
-    if (s->shut_wr) { irq_restore(fl); return -EPIPE; }
-    while (done < len) {
+    long r = 0;
+    if (s->state != US_CONNECTED && !s->peer_gone) { r = -ENOTCONN; goto out; }
+    if (s->shut_wr) { r = -EPIPE; goto out; }
+    for (;;) {
         struct usock *p = s->peer;
-        if (!p || p->shut_rd) { irq_restore(fl); return done ? (long)done : -EPIPE; }
-        if (p->rx_count == SOCK_BUF) {
-            if (nb) break;
-            if (signal_pending()) { irq_restore(fl); return done ? (long)done : -ERESTARTSYS; }
+        if (!p || p->shut_rd) { r = -EPIPE; break; }
+        size_t room = SOCK_BUF - p->rx_count;
+        bool fits = records(s) ? room >= len : room > 0;
+        if (m && p->nmsgs >= MAX_MSGS) fits = false;
+        if (!fits) {
+            if (nb) { r = -EAGAIN; break; }
+            if (signal_pending()) { r = -ERESTARTSYS; break; }
             sleep_on(p);
             continue;
         }
-        size_t room = SOCK_BUF - p->rx_count, n = len - done < room ? len - done : room;
-        size_t tail = (p->rx_head + p->rx_count) % SOCK_BUF;
-        size_t first = n < SOCK_BUF - tail ? n : SOCK_BUF - tail;
-        memcpy(p->rx + tail, (const uint8_t *)buf + done, first);
-        memcpy(p->rx, (const uint8_t *)buf + done + first, n - first);
-        p->rx_count += n;
+        size_t n = len - done < room ? len - done : room;
+        if (m) {                                        /* the mark goes with the first byte */
+            m->pos = p->rx_in;
+            for (int i = 0; i < nfiles; i++) m->files[i] = files[i];
+            umsg_append(p, m);
+            m = NULL;
+        }
+        ring_put(p, (const uint8_t *)buf + done, n);
         done += n;
         wakeup(p);
+        if (done == len) break;
     }
+out:
     irq_restore(fl);
-    return done ? (long)done : -EAGAIN;
+    if (m) kfree(m);                                    /* never queued: files stay the caller's */
+    if (done || (r == 0 && len == 0)) return (long)done;
+    return r ? r : -EAGAIN;
 }
 
-long usock_recv(struct file *f, void *buf, size_t len, int flags)
+long usock_send(struct file *f, const void *buf, size_t len, int flags)
+{
+    return usock_sendmsg(f, buf, len, flags, NULL, 0);
+}
+
+/* Receive up to len bytes. Descriptors that came with them are stored in
+ * files[] (up to maxfiles; the rest are closed and MSG_CTRUNC set) and
+ * their number in *nfiles; the caller owns those references. */
+long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file **files, int *nfiles,
+                   int maxfiles, int *msg_flags)
 {
     struct usock *s = us(f);
     bool nb = (f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT);
-    if (!len) return 0;
+    bool peek = flags & MSG_PEEK;
+    if (nfiles) *nfiles = 0;
+    if (msg_flags) *msg_flags = 0;
+    if (!len && !records(s)) return 0;
     uint64_t fl = irq_save();
     if (s->state != US_CONNECTED && !s->peer_gone) { irq_restore(fl); return -ENOTCONN; }
-    while (!s->rx_count) {
+    for (;;) {
+        bool have = records(s) ? s->msgs != NULL : s->rx_count > 0;
+        if (have) break;
         if (!s->peer || s->shut_rd || (s->peer && s->peer->shut_wr)) { irq_restore(fl); return 0; }    /* EOF */
         if (nb) { irq_restore(fl); return -EAGAIN; }
         if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(s);
     }
-    size_t n = len < s->rx_count ? len : s->rx_count;
-    size_t first = n < SOCK_BUF - s->rx_head ? n : SOCK_BUF - s->rx_head;
-    memcpy(buf, s->rx + s->rx_head, first);
-    memcpy((uint8_t *)buf + first, s->rx, n - first);
-    if (!(flags & MSG_PEEK)) {
-        s->rx_head = (s->rx_head + n) % SOCK_BUF;
-        s->rx_count -= n;
-        wakeup(s);                              /* writers waiting for room */
+    struct umsg *m = s->msgs;
+    long ret;
+    if (records(s)) {                                   /* one whole record */
+        size_t n = len < m->len ? len : m->len;
+        ring_get(s, buf, n, false);
+        if (n < m->len && msg_flags) *msg_flags |= MSG_TRUNC;
+        ret = (flags & MSG_TRUNC) ? (long)m->len : (long)n;
+        if (!peek) ring_get(s, NULL, m->len, true);
+        else m = NULL;
+    } else {                                            /* bytes up to the next mark */
+        size_t n = len < s->rx_count ? len : s->rx_count;
+        if (m && m->pos > s->rx_out) {                  /* a mark ahead: stop before it */
+            if (m->pos - s->rx_out < n) n = (size_t)(m->pos - s->rx_out);
+            m = NULL;
+        } else if (m) {                                 /* a mark here: its files come now */
+            struct umsg *nx = m->next;
+            if (nx && nx->pos - s->rx_out < n) n = (size_t)(nx->pos - s->rx_out);
+            if (peek) m = NULL;
+        }
+        ring_get(s, buf, n, !peek);
+        ret = (long)n;
     }
+    if (m) {                                            /* consumed: hand over its descriptors */
+        umsg_pop(s);
+        for (int i = 0; i < m->nfiles; i++) {
+            if (files && nfiles && *nfiles < maxfiles) { files[(*nfiles)++] = m->files[i]; m->files[i] = NULL; }
+            else if (msg_flags) *msg_flags |= MSG_CTRUNC;
+        }
+        umsg_free(m);                                   /* closes any not handed over */
+    }
+    if (!peek) wakeup(s);                               /* writers waiting for room */
     irq_restore(fl);
-    return (long)n;
+    return ret;
+}
+
+long usock_recv(struct file *f, void *buf, size_t len, int flags)
+{
+    return usock_recvmsg(f, buf, len, flags, NULL, NULL, 0, NULL);
 }
 
 int usock_shutdown(struct file *f, int how)
@@ -364,7 +512,7 @@ int usock_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *le
         *len = sizeof(struct ucred);
         return 0;
     }
-    case SO_TYPE:   i = SOCK_STREAM; break;
+    case SO_TYPE:   i = s->type; break;
     case SO_ERROR:  i = 0; break;
     case SO_SNDBUF:
     case SO_RCVBUF: i = SOCK_BUF; break;
@@ -387,9 +535,9 @@ static int sock_poll(struct file *f, int events)
     if (s->state == US_LISTEN) {
         if (s->qlen) r |= POLLIN;
     } else if (s->state == US_CONNECTED || s->peer_gone) {
-        if (s->rx_count) r |= POLLIN;
+        if (records(s) ? s->msgs != NULL : s->rx_count > 0) r |= POLLIN;
         if (!s->peer || s->shut_rd) r |= POLLIN | POLLHUP;
-        if (s->peer && !s->shut_wr && s->peer->rx_count < SOCK_BUF) r |= POLLOUT;
+        if (s->peer && !s->shut_wr && s->peer->rx_count < SOCK_BUF && s->peer->nmsgs < MAX_MSGS) r |= POLLOUT;
     } else {
         r |= POLLOUT | POLLHUP;                 /* unconnected: like Linux */
     }
@@ -400,7 +548,7 @@ static int sock_poll(struct file *f, int events)
 static int sock_ioctl(struct vnode *vn, unsigned long req, void *arg)
 {
     struct usock *s = vn->data;
-    if (req == FIONREAD) { *(int *)arg = (int)s->rx_count; return 0; }
+    if (req == FIONREAD) { *(int *)arg = records(s) ? (s->msgs ? (int)s->msgs->len : 0) : (int)s->rx_count; return 0; }
     return -ENOTTY;
 }
 

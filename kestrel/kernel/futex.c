@@ -122,6 +122,7 @@ static int futex_wait(uint64_t uaddr, uint32_t val, uint64_t deadline_ms, uint32
         task_block_self(&q, deadline_ms);               /* state set; we sleep at schedule() */
         spin_unlock_keep_irqs(&b->lock);
         schedule();                                     /* interrupts still off: nobody runs in between */
+        self->wait_chan = NULL;
         /* Requeue may have moved us: lock the bucket our key is in now. */
         for (;;) {
             b = bucket_of(&q.key);

@@ -7,7 +7,9 @@
  * the listener; accept() hands it out. Each direction has a 64 KiB buffer;
  * blocking, O_NONBLOCK / MSG_DONTWAIT, EOF and poll() follow POSIX/Linux.
  * Peer credentials (SO_PEERCRED) are the creating process' pid/uid/gid.
- * Not yet: SCM_RIGHTS descriptor passing, SOCK_DGRAM/SEQPACKET. */
+ * SOCK_SEQPACKET (socket, socketpair) and SOCK_DGRAM (socketpair) keep
+ * message boundaries; any type passes descriptors (SCM_RIGHTS).
+ * Not yet: unconnected datagram sockets (sendto/recvfrom with addresses). */
 #ifndef KESTREL_SOCKET_H
 #define KESTREL_SOCKET_H
 
@@ -17,6 +19,8 @@
 
 #define AF_UNIX         1
 #define SOCK_STREAM     1
+#define SOCK_DGRAM      2
+#define SOCK_SEQPACKET  5
 #define SOCK_NONBLOCK   04000
 #define SOCK_CLOEXEC    02000000
 #define SOL_SOCKET      1
@@ -26,6 +30,13 @@
 #define SO_RCVBUF       8
 #define SO_PEERCRED     17
 #define MSG_PEEK        0x2
+#define MSG_CTRUNC      0x8
+#define MSG_TRUNC       0x20
+#define MSG_WAITALL     0x100
+#define MSG_CMSG_CLOEXEC 0x40000000
+#define SCM_RIGHTS      1
+#define SCM_CREDENTIALS 2
+#define SCM_MAX_FD      253
 #define MSG_DONTWAIT    0x40
 #define MSG_NOSIGNAL    0x4000
 #define SHUT_RD         0
@@ -47,6 +58,10 @@ int   usock_connect(struct file *f, const struct sockaddr_un *a, uint32_t len);
 int   usock_accept(struct file *f, int flags, struct file **out, struct sockaddr_un *peer, uint32_t *len);
 long  usock_send(struct file *f, const void *buf, size_t len, int flags);
 long  usock_recv(struct file *f, void *buf, size_t len, int flags);
+/* With descriptors (SCM_RIGHTS): see fs/unixsock.c */
+long  usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struct file **files, int nfiles);
+long  usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file **files, int *nfiles,
+                    int maxfiles, int *msg_flags);
 int   usock_shutdown(struct file *f, int how);
 int   usock_name(struct file *f, bool peer, struct sockaddr_un *a, uint32_t *len);
 int   usock_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *len);

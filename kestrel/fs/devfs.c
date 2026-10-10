@@ -291,5 +291,6 @@ void devfs_init(const char *mountpoint)
         add_tty(r, name, 0660, MKDEV(29, (uint32_t)i), &fb_ops, tty_get(i));
     }
     pty_init(r);
+    pseudo_dir(r, "shm");                               /* tmpfs mounted here: shm_open() */
     vfs_mount(m, mountpoint);
 }
