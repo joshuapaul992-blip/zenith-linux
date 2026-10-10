@@ -8,7 +8,6 @@
 #define PTE_P       0x001ull
 #define PTE_W       0x002ull
 #define PTE_U       0x004ull
-#define PTE_HUGE    0x080ull
 #define ADDR_MASK   0x000FFFFFFFFFF000ull
 #define KERNEL_SLOTS 128                    /* PML4[0..127] */
 
@@ -55,110 +54,4 @@ uint64_t uvm_create(void)
 bool uvm_range_ok(uint64_t va, uint64_t len)
 {
     return va >= UVM_USER_START && len <= UVM_USER_END - UVM_USER_START && va + len <= UVM_USER_END;
-}
-
-/* Walk to the PTE for `va`, allocating user page tables on the way. */
-static uint64_t *pte_of(uint64_t pml4, uint64_t va, bool alloc)
-{
-    uint64_t *t = (uint64_t *)pml4;
-    static const int shift[3] = { 39, 30, 21 };
-    for (int l = 0; l < 3; l++) {
-        uint64_t *e = &t[(va >> shift[l]) & 511];
-        if (!(*e & PTE_P)) {
-            if (!alloc) return NULL;
-            uint64_t n = pmm_alloc();
-            if (!n) return NULL;
-            *e = n | PTE_P | PTE_W | PTE_U;
-        }
-        if (*e & PTE_HUGE) return NULL;     /* never in the user half */
-        t = (uint64_t *)(*e & ADDR_MASK);
-    }
-    return &t[(va >> 12) & 511];
-}
-
-bool uvm_map(uint64_t pml4, uint64_t va, uint64_t len, int prot)
-{
-    if ((va | len) & (UVM_PAGE - 1) || !uvm_range_ok(va, len)) return false;
-    for (uint64_t a = va; a < va + len; a += UVM_PAGE) {
-        uint64_t *pte = pte_of(pml4, a, true);
-        if (!pte) return false;
-        if (*pte & PTE_P) {                 /* keep contents, widen rights */
-            if (prot & UVM_W) *pte |= PTE_W;
-            continue;
-        }
-        uint64_t f = pmm_alloc();
-        if (!f) return false;
-        *pte = f | PTE_P | PTE_U | ((prot & UVM_W) ? PTE_W : 0);
-    }
-    if ((read_cr3() & ADDR_MASK) == pml4) write_cr3(read_cr3());
-    return true;
-}
-
-void uvm_unmap(uint64_t pml4, uint64_t va, uint64_t len)
-{
-    if (!uvm_range_ok(va, len)) return;
-    for (uint64_t a = va & ~(UVM_PAGE - 1); a < va + len; a += UVM_PAGE) {
-        uint64_t *pte = pte_of(pml4, a, false);
-        if (!pte || !(*pte & PTE_P)) continue;
-        pmm_free(*pte & ADDR_MASK);
-        *pte = 0;
-    }
-    if ((read_cr3() & ADDR_MASK) == pml4) write_cr3(read_cr3());
-}
-
-bool uvm_mapped(uint64_t pml4, uint64_t va, uint64_t len)
-{
-    if (!uvm_range_ok(va, len)) return false;
-    for (uint64_t a = va & ~(UVM_PAGE - 1); a < va + len; a += UVM_PAGE) {
-        uint64_t *pte = pte_of(pml4, a, false);
-        if (!pte || !(*pte & PTE_P)) return false;
-    }
-    return true;
-}
-
-/* Visit the user half: free (or count) every page and page table. */
-static uint64_t walk(uint64_t *t, int level, bool free_it)
-{
-    uint64_t n = 0;
-    for (int i = (level == 4 ? KERNEL_SLOTS : 0); i < (level == 4 ? 256 : 512); i++) {
-        if (!(t[i] & PTE_P)) continue;
-        uint64_t phys = t[i] & ADDR_MASK;
-        if (level == 1) n++;
-        else n += walk((uint64_t *)phys, level - 1, free_it);
-        if (free_it) { pmm_free(phys); t[i] = 0; }
-    }
-    return n;
-}
-
-uint64_t uvm_pages(uint64_t pml4) { return pml4 ? walk((uint64_t *)pml4, 4, false) : 0; }
-
-/* Copy one level of the user half from `src` into `dst` (both tables of
- * the same level), duplicating every page. False on OOM; `dst` then holds
- * a partial copy that uvm_destroy() frees. */
-static bool copy_level(const uint64_t *src, uint64_t *dst, int level)
-{
-    for (int i = (level == 4 ? KERNEL_SLOTS : 0); i < (level == 4 ? 256 : 512); i++) {
-        if (!(src[i] & PTE_P)) continue;
-        uint64_t n = pmm_alloc();
-        if (!n) return false;
-        dst[i] = n | (src[i] & ~ADDR_MASK);             /* same rights */
-        if (level == 1) memcpy((void *)n, (const void *)(src[i] & ADDR_MASK), UVM_PAGE);
-        else if (!copy_level((const uint64_t *)(src[i] & ADDR_MASK), (uint64_t *)n, level - 1)) return false;
-    }
-    return true;
-}
-
-uint64_t uvm_clone(uint64_t src)
-{
-    uint64_t dst = uvm_create();
-    if (!dst) return 0;
-    if (!copy_level((const uint64_t *)src, (uint64_t *)dst, 4)) { uvm_destroy(dst); return 0; }
-    return dst;
-}
-
-void uvm_destroy(uint64_t pml4)
-{
-    if (!pml4 || pml4 == kernel_pml4) return;
-    walk((uint64_t *)pml4, 4, true);
-    pmm_free(pml4);
 }

@@ -45,6 +45,12 @@ struct vnode_ops {
     /* Optional, directories: bring the children up to date before a lookup
      * or listing (/proc's per-process directories). */
     void    (*refresh)(struct vnode *dir);
+    /* Optional, regular files: set the size (ftruncate, O_TRUNC). */
+    int     (*truncate)(struct vnode *vn, uint64_t size);
+    /* Optional: the page-backed object holding the file's data, so that
+     * MAP_SHARED mappings and read()/write() see the same bytes (ramfs,
+     * memfd). NULL: no shared mappings of this file. */
+    struct vm_object *(*vmobject)(struct vnode *vn);
 };
 
 /* poll(2) bits */
@@ -71,6 +77,9 @@ struct vnode {
     struct mount *fs;
     struct vnode *parent, *children, *sibling;
     struct vnode *mounted;          /* root of filesystem mounted here    */
+    int         refs;               /* open files on it (atomic)          */
+    bool        unlinked;           /* removed from its directory: freed
+                                       when the last open file closes      */
 };
 
 #define MNT_RDONLY   0x1
@@ -123,6 +132,8 @@ int     vfs_path_of(struct vnode *vn, char *buf, size_t size);
 int     vfs_open(const char *path, int flags, mode_t mode, struct file **out);
 ssize_t vfs_read(struct file *f, void *buf, size_t len);
 ssize_t vfs_write(struct file *f, const void *buf, size_t len);
+ssize_t vfs_pread(struct file *f, void *buf, size_t len, uint64_t off);     /* position untouched */
+ssize_t vfs_pwrite(struct file *f, const void *buf, size_t len, uint64_t off);
 off_t   vfs_lseek(struct file *f, off_t off, int whence);
 int     vfs_getdents(struct file *f, void *buf, size_t len);
 int     vfs_ioctl(struct file *f, unsigned long req, void *arg);
@@ -132,6 +143,8 @@ struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
 void    vfs_close(struct file *f);                  /* drops one reference */
 struct file *vfs_file_get(struct file *f);         /* takes one (atomic), returns f */
+int     vfs_truncate(struct vnode *vn, uint64_t size);
+struct vm_object *vfs_vmobject(struct vnode *vn);  /* see vnode_ops.vmobject */
 
 /* ---- filesystem drivers ------------------------------------------------- */
 extern const struct vnode_ops ramfs_ops;
@@ -158,5 +171,6 @@ typedef size_t (*vfs_gen_t)(char *buf, size_t cap, void *ctx);
 struct vnode *pseudo_dir(struct vnode *parent, const char *name);
 struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen, void *ctx);
 struct vnode *ramfs_write_file(const char *path, const char *text);
+struct file  *ramfs_anon_file(const char *name, int flags);    /* memfd_create */
 
 #endif

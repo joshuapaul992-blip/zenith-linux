@@ -1,5 +1,6 @@
 /* fs/procfs.c -- /proc: process and kernel state, generated on every read */
 #include <kernel/vfs.h>
+#include <kernel/vm.h>
 #include <kernel/gpu.h>
 #include <kernel/task.h>
 #include <kernel/uvm.h>
@@ -180,7 +181,7 @@ static size_t gen_loadavg(char *buf, size_t cap, void *ctx)
     return n;
 }
 
-/* ---- per-process directories: /proc/PID/{stat,status,cmdline,comm} and
+/* ---- per-process directories: /proc/PID/{stat,status,cmdline,comm,maps} and
  * /proc/self -----------------------------------------------------------
  * A fixed pool of directories (one per task slot is enough) is attached to
  * /proc for live processes and detached again when they go; nothing is
@@ -218,7 +219,7 @@ static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
     if (!t) return 0;
     uint64_t ticks = t->cpu_ticks * 100 / PIT_HZ;              /* USER_HZ */
     uint64_t start = t->start_tick * 100 / PIT_HZ;
-    uint64_t pages = t->user && t->pml4 && !t->vm_borrowed ? uvm_pages(t->pml4) : 0;
+    uint64_t pages = t->mm ? t->mm->rss : 0;
     int tty = t->ctty ? (136 << 8) | (t->ctty - 1) : 0;
     /* pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
      * majflt cmajflt utime stime cutime cstime priority nice threads
@@ -237,7 +238,7 @@ static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
     if (!t) return 0;
     static const char *const names[] = { "?", "R (running)", "R (running)", "S (sleeping)", "S (sleeping)",
                                          "Z (zombie)" };
-    uint64_t pages = t->user && t->pml4 && !t->vm_borrowed ? uvm_pages(t->pml4) : 0;
+    uint64_t pages = t->mm ? t->mm->rss : 0;
     P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
       t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->pid, t->pid, t->ppid);
     P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", t->uid, t->uid, t->uid, t->uid,
@@ -264,12 +265,20 @@ static size_t gen_pid_comm(char *buf, size_t cap, void *ctx)
     return n;
 }
 
+/* /proc/PID/maps: the regions of the address space, Linux format */
+static size_t gen_pid_maps(char *buf, size_t cap, void *ctx)
+{
+    struct tcb *t = pid_task(ctx);
+    return t && t->mm ? vm_maps(t->mm, buf, cap) : 0;
+}
+
 static void pid_files(struct vnode *dir, void *ctx)
 {
     pseudo_file(dir, "stat", gen_pid_stat, ctx);
     pseudo_file(dir, "status", gen_pid_status, ctx);
     pseudo_file(dir, "cmdline", gen_pid_cmdline, ctx);
     pseudo_file(dir, "comm", gen_pid_comm, ctx);
+    pseudo_file(dir, "maps", gen_pid_maps, ctx);
 }
 
 static void detach(struct vnode *parent, struct vnode *c)

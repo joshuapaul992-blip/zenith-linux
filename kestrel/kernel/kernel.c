@@ -40,6 +40,7 @@
 #include <kernel/report.h>
 #include <kernel/kush.h>
 #include <kernel/vt.h>
+#include <kernel/vm.h>
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
 #include <kernel/block.h>
@@ -331,6 +332,9 @@ static int init_main(void *arg)
  * thread, to check that faults are caught and reported (register dump,
  * backtrace, stack-overflow detection) on a given machine. Diagnostics only. */
 static volatile int crash_depth;
+static volatile uintptr_t crash_addr = 0x8;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Winfinite-recursion"
 static __attribute__((noinline)) int crash_recurse(int n)
 {
     volatile char pad[256];
@@ -338,6 +342,7 @@ static __attribute__((noinline)) int crash_recurse(int n)
     crash_depth = n;
     return crash_recurse(n + 1) + pad[0];
 }
+#pragma GCC diagnostic pop
 
 static int crash_main(void *arg)
 {
@@ -345,7 +350,7 @@ static int crash_main(void *arg)
     task_sleep_ms(500);
     kprintf("crashtest: %s\n", what);
     if (!strncmp(what, "stack", 5)) crash_recurse(0);
-    else if (!strncmp(what, "null", 4)) { volatile int *p = (int *)0x8; *p = 1; }
+    else if (!strncmp(what, "null", 4)) *(volatile int *)crash_addr = 1;
     else if (!strncmp(what, "ud", 2)) __asm__ volatile("ud2");
     kprintf("crashtest: unknown test\n");
     return 0;
@@ -410,6 +415,10 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     pmm_init(mbi);
     heap_init(KERNEL_HEAP_SIZE);
     time_init(mbi);             /* HPET / calibrated TSC: timeouts that work before sti */
+    /* Page 0 becomes a guard page: a kernel NULL-pointer access faults (and
+     * is reported) instead of scribbling over low memory. ACPI's search of
+     * the BIOS data area there is done by now. */
+    vmm_set_guard(0, true);
     pci_init();                 /* before video: BAR sizing briefly disables decoding */
     video_init(fbt);
     storage_init();             /* AHCI: HBA bring-up + MBR verify loop (COM1 + klog) */
@@ -419,6 +428,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     pit_init(PIT_HZ);
     keyboard_init();
     uvm_init();                 /* shared kernel PDPTs, before any address space */
+    vm_init();                  /* EFER.NXE: no-execute for data pages */
     sched_init();
     sti();
     kprintf("arch: interrupts enabled, PIT at %d Hz\n", PIT_HZ);

@@ -15,6 +15,7 @@
 #include <kernel/uvm.h>
 #include <kernel/process.h>
 #include <kernel/time.h>
+#include <kernel/vm.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp);
 extern void thread_trampoline(void);
@@ -99,7 +100,7 @@ bool task_stack_guard_hit(const struct tcb *t, uint64_t addr)
 static void reap_one(struct tcb *t)
 {
     for (int fd = 0; fd < MAX_FDS; fd++) if (t->fds[fd]) vfs_close(t->fds[fd]);
-    if (t->pml4 && !t->vm_borrowed) uvm_destroy(t->pml4);
+    if (t->mm) { mm_put(t->mm); t->mm = NULL; }       /* normally gone at exit already */
     t->pml4 = 0;
     kstack_free(t->kstack);
     t->kstack = NULL;
@@ -284,6 +285,26 @@ void sleep_on(void *chan)
     cur->wait_chan = NULL;
 }
 
+void kmutex_lock(struct kmutex *m)
+{
+    uint64_t f = irq_save();
+    if (m->owner == cur) { m->depth++; irq_restore(f); return; }
+    while (m->owner) sleep_on(m);
+    m->owner = cur;
+    m->depth = 1;
+    irq_restore(f);
+}
+
+void kmutex_unlock(struct kmutex *m)
+{
+    uint64_t f = irq_save();
+    if (m->owner != cur) panic("kmutex_unlock: not the owner (pid %d)", cur->pid);
+    if (--m->depth == 0) { m->owner = NULL; wakeup(m); }
+    irq_restore(f);
+}
+
+bool kmutex_held(const struct kmutex *m) { return m->owner == cur; }
+
 void wakeup(void *chan)
 {
     for (int i = 0; i < MAX_TASKS; i++)
@@ -314,6 +335,19 @@ void task_exit(int code)
     /* close now, not at reap time: pipe and socket peers must see EOF */
     for (int fd = 0; fd < MAX_FDS; fd++) if (cur->fds[fd]) { vfs_close(cur->fds[fd]); cur->fds[fd] = NULL; }
     cur->exit_code = code;
+    /* Give the address space back now, not when the parent reaps us: memory
+     * comes back at once (the OOM killer relies on that). Run on the kernel
+     * page tables from here on. */
+    if (cur->mm) {
+        struct mm *mm = cur->mm;
+        cur->mm = NULL;
+        cur->pml4 = 0;
+        cur->cr3 = uvm_kernel_pml4();
+        write_cr3(cur->cr3);
+        sti();
+        mm_put(mm);
+        cli();
+    }
     process_exit(cur);                          /* parent, children, vfork */
     cur->state = TASK_ZOMBIE;
     wakeup(cur);                                /* anyone waiting on us */

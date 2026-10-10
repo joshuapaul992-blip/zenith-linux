@@ -37,6 +37,7 @@ typedef uint32_t gid_t;
 #define EMFILE       24
 #define ENOTTY       25
 #define ENOSPC       28
+#define EFBIG        27
 #define ESPIPE       29
 #define EROFS        30
 #define EXDEV        18

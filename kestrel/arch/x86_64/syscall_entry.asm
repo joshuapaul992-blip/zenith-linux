@@ -57,6 +57,11 @@ syscall_entry:
     cli
     test    eax, eax
     jnz     .iret
+    ; Never SYSRET to a non-canonical (or kernel) RIP: on Intel CPUs SYSRET
+    ; would fault in ring 0 on the user stack. IRETQ faults safely in ring 3.
+    mov     rcx, [rsp + 17*8]           ; frame.rip
+    shr     rcx, 47
+    jnz     .iret
 
     pop     r15
     pop     r14

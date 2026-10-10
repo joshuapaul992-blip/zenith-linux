@@ -79,9 +79,8 @@ struct tcb {
 
     /* user process (ring 3); all zero for kernel threads */
     bool      user;
-    uint64_t  pml4;             /* own address space (uvm.h), 0 = kernel's */
-    uint64_t  brk_start, brk;   /* program break                          */
-    uint64_t  mmap_next;        /* next free address in the mmap region    */
+    struct mm *mm;              /* address space (vm.h); shared by vfork    */
+    uint64_t  pml4;             /* = mm->pml4, 0 = the kernel's             */
     uint64_t  fs_base;          /* TLS pointer (arch_prctl ARCH_SET_FS)    */
     uint64_t  tid_address;      /* set_tid_address()                       */
     uint8_t   fpu[512] __attribute__((aligned(16)));    /* fxsave area     */
@@ -95,7 +94,7 @@ struct tcb {
     uint64_t  alarm_at, alarm_every;    /* ITIMER_REAL in ms: next expiry, period */
     int       exit_signal;      /* sent to the parent at exit (SIGCHLD)    */
     int       term_signal;      /* killed by this signal; 0 = exit()       */
-    bool      vm_borrowed;      /* vfork child: pml4 belongs to the parent  */
+    bool      oom_killed;       /* chosen by the OOM killer                 */
     int       vfork_parent;     /* pid blocked in vfork() until exec/exit   */
     struct int_frame *uframe;   /* user registers of the syscall in progress */
     bool      iret_return;      /* leave this syscall through iretq          */
@@ -122,6 +121,16 @@ void        sched_yield(void);
 void        task_set_idle_class(struct tcb *t);  /* background work (kworker/0) */
 void        sched_tick(void);           /* from the timer IRQ            */
 void        sched_idle_loop(void) __attribute__((noreturn));
+
+/* A sleeping, recursive mutex: the owner may lock it again (a page fault
+ * inside a memory-management call); others sleep until it is free. */
+struct kmutex {
+    struct tcb *owner;
+    int         depth;
+};
+void        kmutex_lock(struct kmutex *m);
+void        kmutex_unlock(struct kmutex *m);
+bool        kmutex_held(const struct kmutex *m);   /* by the calling task */
 
 void        sleep_on(void *chan);       /* call with interrupts disabled */
 void        wakeup(void *chan);

@@ -21,6 +21,12 @@ uint64_t pmm_total_bytes(void);
 uint64_t pmm_free_bytes(void);
 uint64_t pmm_highest_usable(void);
 
+/* ---- user pages: reference-counted frames (mapped, shared, copy-on-write) */
+uint64_t page_alloc(void);                   /* zeroed, 1 reference, 0 on OOM */
+void     page_ref(uint64_t phys);
+void     page_unref(uint64_t phys);          /* frees the frame at 0        */
+int      page_refs(uint64_t phys);
+
 /* ---- kernel heap ------------------------------------------------------- */
 void   heap_init(size_t bytes);
 void  *kmalloc(size_t n);

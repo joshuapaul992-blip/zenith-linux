@@ -8,6 +8,7 @@
 #include <kernel/string.h>
 #include <kernel/uaccess.h>
 #include <kernel/vm.h>
+#include <kernel/posix.h>
 
 struct idt_gate {
     uint16_t offset_lo;
@@ -111,13 +112,19 @@ static void user_fault(struct int_frame *f)
     case 6:  sig = SIGILL;  code = ILL_ILLOPN; addr = f->rip; break;
     case 7:  sig = SIGILL;  code = SI_KERNEL; break;
     case 11: case 12: sig = SIGBUS; break;              /* segment / stack-segment not present */
-    case 14:
+    case 14: {
         addr = read_cr2();
-        if (vm_fault(addr, f->error, true) == 0) return;  /* demand paging, copy-on-write */
+        sti();                                          /* resolving may sleep (file read, OOM) */
+        int r = vm_fault(addr, f->error, true);         /* demand paging, copy-on-write */
+        cli();
+        if (r == 0) return;
+        if (r == -EIO) { sig = SIGBUS; code = 2; break; }   /* BUS_ADRERR: past the end of a file */
+        if (r == -ENOMEM) return;                       /* SIGKILL is pending (OOM) */
         /* Like Linux: anything outside the user half (the kernel's own
          * supervisor-only mappings included) is "not mapped" for the process. */
-        code = (f->error & 1) && user_range_ok(addr, 1) ? SEGV_ACCERR : SEGV_MAPERR;
+        code = r == -EACCES ? SEGV_ACCERR : SEGV_MAPERR;
         break;
+    }
     case 16: sig = SIGFPE;  code = FPE_FLTINV; addr = f->rip; break;
     case 17: sig = SIGBUS;  code = BUS_ADRALN; break;
     case 19: sig = SIGFPE;  code = simd_code(); addr = f->rip; break;
@@ -254,7 +261,12 @@ static void exception(struct int_frame *f)
          * manager resolve it (demand paging, copy-on-write) unless the caller
          * asked for no fault handling, else resume at the fixup (-EFAULT). */
         uint64_t addr = read_cr2();
-        if (user_range_ok(addr, 1) && !pagefault_disabled() && vm_fault(addr, f->error, false) == 0) return;
+        if (user_range_ok(addr, 1) && !pagefault_disabled()) {
+            if (f->rflags & 0x200) sti();               /* the copy ran with interrupts on */
+            int r = vm_fault(addr, f->error, false);
+            cli();
+            if (r == 0) return;
+        }
         uint64_t fix = extable_fixup(f->rip);
         if (fix && user_range_ok(addr, 1)) { f->rip = fix; return; }
     }

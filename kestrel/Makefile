@@ -65,7 +65,7 @@ LDFLAGS   := -nostdlib -static -no-pie -T linker.ld -z max-page-size=0x1000 \
 BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm
-C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c mm/vm.c \
+C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c mm/vm.c mm/vmobj.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
@@ -193,13 +193,28 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
 	@mkdir -p $(dir $@)
 	@echo "  MUSLCC  $<"
 	@$(MUSL_CC) $(MUSL_CFLAGS) $< -o $@
+
+# Dynamically linked test program + shared library, and musl's dynamic loader
+# (libc.so doubles as /lib/ld-musl-x86_64.so.1) for the boot volume's /lib.
+MUSL_LOADER ?= $(firstword $(wildcard /usr/lib/x86_64-linux-musl/libc.so /usr/lib/musl/lib/libc.so /usr/local/musl/lib/libc.so))
+DYN_FILES := $(if $(and $(shell command -v $(MUSL_CC)),$(MUSL_LOADER)),$(BUILD)/user/dyntest $(BUILD)/user/libdyntest.so)
+
+$(BUILD)/user/libdyntest.so: user/libdyntest.c
+	@mkdir -p $(dir $@)
+	@echo "  MUSLCC  $< (shared library)"
+	@$(MUSL_CC) -std=gnu11 -O2 -g -Wall -Wextra -fPIC -shared -Wl,-soname,libdyntest.so $< -o $@
+
+$(BUILD)/user/dyntest: user/dyntest.c $(BUILD)/user/libdyntest.so
+	@mkdir -p $(dir $@)
+	@echo "  MUSLCC  $< (dynamic)"
+	@$(MUSL_CC) -std=gnu11 -O2 -g -Wall -Wextra -fPIE -pie $< -o $@ -L$(BUILD)/user -ldyntest
 
 $(BUILD)/user/hello: $(BUILD)/user/%: user/%.c
 	@mkdir -p $(dir $@)
@@ -243,12 +258,14 @@ xterm:
 	@ports/xterm/build.sh $(XTERM_SRC) $(BUILD)
 
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp)
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) $(DYN_FILES) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp)
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
 	@cp $(USER_PROGS) $(ROOTFS_STAGE)/bin/
 	@install -m 755 user/shtest.sh $(ROOTFS_STAGE)/bin/shtest.sh
+	@if [ -n "$(DYN_FILES)" ]; then mkdir -p $(ROOTFS_STAGE)/lib && cp $(MUSL_LOADER) $(ROOTFS_STAGE)/lib/ld-musl-x86_64.so.1 && \
+	    cp $(BUILD)/user/libdyntest.so $(ROOTFS_STAGE)/lib/ && cp $(BUILD)/user/dyntest $(ROOTFS_STAGE)/bin/; fi
 	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links

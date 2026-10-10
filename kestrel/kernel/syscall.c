@@ -26,6 +26,8 @@
 #include <kernel/termios.h>
 #include <kernel/kfb.h>
 #include <kernel/kinput.h>
+#include <kernel/vm.h>
+#include <kernel/vmobj.h>
 
 extern void syscall_entry(void);
 
@@ -178,17 +180,30 @@ static int64_t pio(uint64_t fd, uint64_t buf, uint64_t len, int64_t off, bool wr
     if ((int64_t)len < 0 || off < 0) return -EINVAL;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
-    int64_t r;
-    if (!f->vn || f->vn->type != VREG) { r = -ESPIPE; goto out; }
-    uint64_t fl = irq_save();                           /* single CPU: nobody moves it meanwhile */
-    uint64_t saved = f->off;
-    f->off = (uint64_t)off;
-    irq_restore(fl);
-    r = wr ? write_from_user(f, buf, len) : read_to_user(f, buf, len);
-    f->off = saved;
+    int64_t total = 0;
+    uint8_t *kb = NULL;
+    if (!len) goto out;
+    if (!ubuf_ok(buf, len)) { total = -EFAULT; goto out; }
+    size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
+    if (!(kb = kmalloc(chunk))) { total = -ENOMEM; goto out; }
+    while ((uint64_t)total < len) {
+        size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
+        ssize_t n;
+        if (wr) {
+            if (copy_from_user(kb, (const void *)(buf + (uint64_t)total), want)) { if (!total) total = -EFAULT; break; }
+            n = vfs_pwrite(f, kb, want, (uint64_t)off + (uint64_t)total);
+        } else {
+            n = vfs_pread(f, kb, want, (uint64_t)off + (uint64_t)total);
+            if (n > 0 && copy_to_user((void *)(buf + (uint64_t)total), kb, (size_t)n)) { if (!total) total = -EFAULT; break; }
+        }
+        if (n < 0) { if (!total) total = n; break; }
+        total += n;
+        if ((size_t)n < want) break;
+    }
 out:
+    kfree(kb);
     fput(f);
-    return r;
+    return total;
 }
 static int64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t len, uint64_t off, uint64_t a5, uint64_t a6)
 { (void)a5; (void)a6; return pio(fd, buf, len, (int64_t)off, false); }
@@ -578,76 +593,179 @@ static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, u
     return -EINVAL;
 }
 
-/* ---- user memory (ring-3 processes only) ------------------------------- */
-#define PROT_WRITE      0x2
-#define MAP_PRIVATE     0x02
-#define MAP_FIXED       0x10
-#define MAP_ANONYMOUS   0x20
-#define MAP_FAILED_VAL  ((uint64_t)-1)
-
-static uint64_t pg_up(uint64_t a) { return (a + UVM_PAGE - 1) & ~(UVM_PAGE - 1); }
+/* ---- user memory (mm/vm.c does the work) ------------------------------- */
+static struct mm *cur_mm(void) { struct tcb *t = current_task(); return t->user ? t->mm : NULL; }
 
 static int64_t sys_brk(uint64_t addr, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
-    struct tcb *t = current_task();
-    if (!t->user) return -ENOSYS;
-    if (!addr || addr < t->brk_start || addr >= UVM_MMAP_BASE) return (int64_t)t->brk;
-    if (pg_up(addr) > pg_up(t->brk)) {
-        if (!uvm_map(t->pml4, pg_up(t->brk), pg_up(addr) - pg_up(t->brk), UVM_W)) return (int64_t)t->brk;
-    } else if (pg_up(addr) < pg_up(t->brk)) {
-        uvm_unmap(t->pml4, pg_up(addr), pg_up(t->brk) - pg_up(addr));
-    }
-    t->brk = addr;
-    return (int64_t)t->brk;
+    struct mm *mm = cur_mm();
+    if (!mm) return -ENOSYS;
+    return vm_brk(mm, addr);
 }
 
-/* Anonymous private memory only for now; file mappings come with the
- * X server's needs (fonts are read(), not mmap()ed, in our build). */
+/* mmap(2): anonymous (private or shared), private file mappings (filled from
+ * the file on first touch, beyond EOF: SIGBUS), shared mappings of files
+ * that keep their data in a vm_object (ramfs, memfd: coherent with
+ * read/write), /dev/zero. A shared read-only mapping of another regular file
+ * (the boot volume) is the same as a private one. */
+#define MAP_KNOWN (MAP_TYPE | MAP_FIXED | MAP_ANONYMOUS | MAP_GROWSDOWN | MAP_DENYWRITE | MAP_EXECUTABLE | \
+                   MAP_LOCKED | MAP_NORESERVE | MAP_POPULATE | MAP_NONBLOCK | MAP_STACK | MAP_FIXED_NOREPLACE)
+
 static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t flags, uint64_t fd, uint64_t off)
 {
-    (void)prot; (void)off;
-    struct tcb *t = current_task();
-    if (!t->user) return -ENOSYS;
-    if (!len) return -EINVAL;
-    if (!(flags & MAP_ANONYMOUS) || (int)fd != -1) return -ENODEV;
-    len = pg_up(len);
-    uint64_t va;
-    if (flags & MAP_FIXED) {
-        if (addr & (UVM_PAGE - 1) || !uvm_range_ok(addr, len)) return -EINVAL;
-        uvm_unmap(t->pml4, addr, len);                  /* fresh zero pages */
-        va = addr;
-    } else {
-        va = t->mmap_next;
-        if (!uvm_range_ok(va, len + UVM_PAGE) || va + len + UVM_PAGE > UVM_STACK_TOP - UVM_STACK_SIZE) return -ENOMEM;
-        t->mmap_next = va + len + UVM_PAGE;             /* + one unmapped guard page */
+    struct mm *mm = cur_mm();
+    if (!mm) return -ENOSYS;
+    int type = (int)(flags & MAP_TYPE);
+    if (type != MAP_SHARED && type != MAP_PRIVATE && type != MAP_SHARED_VALIDATE) return -EINVAL;
+    if (type == MAP_SHARED_VALIDATE && (flags & ~(uint64_t)MAP_KNOWN)) return -EOPNOTSUPP;
+    if (flags & MAP_HUGETLB) return -EINVAL;
+    if (!len || (off & (UVM_PAGE - 1))) return -EINVAL;
+    if (len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
+    bool shared = type != MAP_PRIVATE;
+    if (flags & MAP_ANONYMOUS) {
+        if (!shared) return vm_mmap(mm, addr, len, (int)prot, (int)flags, NULL, NULL, 0, 0);
+        struct vm_object *o = vmobj_new((len + UVM_PAGE - 1) & ~(UVM_PAGE - 1));
+        if (!o) return -ENOMEM;
+        int64_t r = vm_mmap(mm, addr, len, (int)prot, (int)flags, NULL, o, 0, 0);
+        vmobj_put(o);                                   /* the mapping holds it now */
+        return r;
     }
-    if (!uvm_map(t->pml4, va, len, UVM_W)) { uvm_unmap(t->pml4, va, len); return -ENOMEM; }
-    return (int64_t)va;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int64_t r;
+    int acc = f->flags & O_ACCMODE;
+    struct vnode *vn = f->vn;
+    if (acc == O_WRONLY) { r = -EACCES; goto out; }
+    if (vn->type == VCHR && vn->rdev == ((1u << 8) | 5)) {          /* /dev/zero */
+        r = sys_mmap(addr, len, prot, flags | MAP_ANONYMOUS, (uint64_t)-1, 0);
+        goto out;
+    }
+    if (vn->type != VREG) { r = -ENODEV; goto out; }
+    struct vm_object *o = shared ? vfs_vmobject(vn) : NULL;
+    if (shared && o) {
+        if ((prot & PROT_WRITE) && acc != O_RDWR) { r = -EACCES; goto out; }
+        if ((prot & PROT_WRITE) && (o->seals & 0x0008)) { r = -EPERM; goto out; }   /* F_SEAL_WRITE */
+        r = vm_mmap(mm, addr, len, (int)prot, (int)flags, NULL, o, off, 0);
+    } else {
+        if (shared && (prot & PROT_WRITE)) { r = -EACCES; goto out; }  /* read-only file system */
+        r = vm_mmap(mm, addr, len, (int)prot, (int)flags, f, NULL, off, UINT64_MAX);
+    }
+out:
+    fput(f);
+    return r;
 }
 
 static int64_t sys_munmap(uint64_t addr, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    struct tcb *t = current_task();
-    if (!t->user) return -ENOSYS;
-    if (addr & (UVM_PAGE - 1) || !len || !uvm_range_ok(addr, pg_up(len))) return -EINVAL;
-    uvm_unmap(t->pml4, addr, pg_up(len));
-    return 0;
+    struct mm *mm = cur_mm();
+    return mm ? vm_munmap(mm, addr, len) : -ENOSYS;
 }
 
-/* Accepted and ignored until W^X is enforced: every user page is RW. */
 static int64_t sys_mprotect(uint64_t addr, uint64_t len, uint64_t prot, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)prot; (void)a4; (void)a5; (void)a6;
-    struct tcb *t = current_task();
-    if (!t->user) return -ENOSYS;
-    if (addr & (UVM_PAGE - 1) || !uvm_range_ok(addr, pg_up(len))) return -EINVAL;
-    return uvm_mapped(t->pml4, addr, pg_up(len)) ? 0 : -ENOMEM;
+    (void)a4; (void)a5; (void)a6;
+    struct mm *mm = cur_mm();
+    return mm ? vm_mprotect(mm, addr, len, (int)prot) : -ENOSYS;
 }
 
-static int64_t sys_madvise(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return 0; }
+static int64_t sys_mremap(uint64_t old, uint64_t olen, uint64_t nlen, uint64_t flags, uint64_t naddr, uint64_t a6)
+{
+    (void)a6;
+    struct mm *mm = cur_mm();
+    return mm ? vm_mremap(mm, old, olen, nlen, (int)flags, naddr) : -ENOSYS;
+}
+
+#define MADV_DONTNEED 4
+#define MADV_FREE     8
+static int64_t sys_madvise(uint64_t addr, uint64_t len, uint64_t advice, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct mm *mm = cur_mm();
+    if (!mm) return -ENOSYS;
+    if (addr & (UVM_PAGE - 1)) return -EINVAL;
+    if (advice == MADV_DONTNEED || advice == MADV_FREE) return vm_madvise_dontneed(mm, addr, len);
+    return 0;                                           /* hints: accepted */
+}
+
+static int64_t sys_msync(uint64_t addr, uint64_t len, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)len; (void)a4; (void)a5; (void)a6;
+    if ((addr & (UVM_PAGE - 1)) || (flags & ~7ull) || ((flags & 1) && (flags & 4))) return -EINVAL;
+    return 0;                                           /* shared mappings are the file's own pages */
+}
+
+static int64_t sys_mincore(uint64_t addr, uint64_t len, uint64_t vec, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct mm *mm = cur_mm();
+    if (!mm) return -ENOSYS;
+    if (addr & (UVM_PAGE - 1)) return -EINVAL;
+    uint64_t pages = (len + UVM_PAGE - 1) / UVM_PAGE;
+    if (!user_range_ok(addr, pages * UVM_PAGE)) return -ENOMEM;
+    if (pages > (1u << 20)) return -ENOMEM;
+    uint8_t *k = pages ? kmalloc(pages) : NULL;
+    if (pages && !k) return -ENOMEM;
+    int r = vm_mincore(mm, addr, pages * UVM_PAGE, k);
+    if (!r && copy_to_user((void *)vec, k, pages)) r = -EFAULT;
+    kfree(k);
+    return r;
+}
+
+static int64_t sys_ftruncate(uint64_t fd, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if ((int64_t)len < 0) return -EINVAL;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int r = (f->flags & O_ACCMODE) == O_RDONLY ? -EINVAL : vfs_truncate(f->vn, len);
+    fput(f);
+    return r;
+}
+
+static int64_t sys_truncate(uint64_t path, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if ((int64_t)len < 0) return -EINVAL;
+    char p[VFS_PATH_MAX];
+    int r = get_path(path, p);
+    if (r) return r;
+    struct vnode *vn;
+    if ((r = vfs_lookup(p, &vn))) return r;
+    return vfs_truncate(vn, len);
+}
+
+static int64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    fput(f);
+    return 0;                                           /* everything lives in memory */
+}
+
+/* memfd_create(name, flags): an anonymous ramfs file (page-backed, so it can
+ * be shared with MAP_SHARED and passed to other processes). */
+#define MFD_CLOEXEC       1
+#define MFD_ALLOW_SEALING 2
+static int64_t sys_memfd_create(uint64_t uname, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (flags & ~(uint64_t)(MFD_CLOEXEC | MFD_ALLOW_SEALING | 4 /* MFD_HUGETLB */)) return -EINVAL;
+    if (flags & 4) return -EINVAL;
+    char name[250 + 7];
+    strlcpy(name, "memfd:", sizeof name);
+    long n = strncpy_from_user(name + 6, (const char *)uname, sizeof name - 6);
+    if (n == -EFAULT) return -EFAULT;
+    if (n < 0) return -EINVAL;                          /* longer than 249 bytes */
+    struct file *f = ramfs_anon_file(name, O_RDWR);
+    if (!f) return -ENOMEM;
+    struct vm_object *o = vfs_vmobject(f->vn);
+    if (!o) { vfs_close(f); return -ENOMEM; }
+    if (!(flags & MFD_ALLOW_SEALING)) o->seals = 0x0001;   /* F_SEAL_SEAL: no seals can be added */
+    return install(f, flags & MFD_CLOEXEC);
+}
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -743,6 +861,21 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
     case F_GETFD: r = t->fd_cloexec[fd] ? FD_CLOEXEC : 0; break;
     case F_SETFD: t->fd_cloexec[fd] = (arg & FD_CLOEXEC) != 0; r = 0; break;
     case F_GETFL: r = f->flags & ~O_CLOEXEC; break;
+    case 1033: {                                        /* F_ADD_SEALS */
+        struct vm_object *o = f->vn->type == VREG ? vfs_vmobject(f->vn) : NULL;
+        if (!o || !f->vn->unlinked) { r = -EINVAL; break; }     /* memfds only */
+        if (o->seals & 0x0001) { r = -EPERM; break; }           /* F_SEAL_SEAL */
+        if (arg & ~0x1fULL) { r = -EINVAL; break; }
+        if ((f->flags & O_ACCMODE) == O_RDONLY) { r = -EPERM; break; }
+        o->seals |= (uint32_t)arg;
+        r = 0;
+        break;
+    }
+    case 1034: {                                        /* F_GET_SEALS */
+        struct vm_object *o = f->vn->type == VREG ? vfs_vmobject(f->vn) : NULL;
+        r = o && f->vn->unlinked ? (int64_t)o->seals : -EINVAL;
+        break;
+    }
     case F_SETFL:                                       /* only these two may change */
         f->flags = (f->flags & ~(O_NONBLOCK | O_APPEND)) | ((int)arg & (O_NONBLOCK | O_APPEND));
         r = 0;
@@ -1678,6 +1811,10 @@ void syscall_init(void)
     REG(SYS_openat, sys_openat);       REG(SYS_newfstatat, sys_newfstatat);
     REG(SYS_unlinkat, sys_unlinkat);   REG(SYS_mkdirat, sys_mkdirat);
     REG(SYS_faccessat, sys_faccessat); REG(SYS_ppoll, sys_ppoll);
+    REG(SYS_mremap, sys_mremap);       REG(SYS_msync, sys_msync);
+    REG(SYS_mincore, sys_mincore);     REG(SYS_ftruncate, sys_ftruncate);
+    REG(SYS_truncate, sys_truncate);   REG(SYS_fsync, sys_fsync);
+    REG(SYS_fdatasync, sys_fsync);     REG(SYS_memfd_create, sys_memfd_create);
 
     /* SYSCALL/SYSRET fast path (used once ring-3 processes exist) */
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);                       /* EFER.SCE */

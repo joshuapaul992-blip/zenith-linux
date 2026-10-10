@@ -99,6 +99,42 @@ void pmm_free_contig(uint64_t phys, size_t n)
 
 void pmm_free(uint64_t phys) { pmm_free_contig(phys, 1); }
 
+/* ---- reference counts of frames mapped into user space --------------------
+ * A user page can be mapped by several address spaces (fork, copy-on-write)
+ * and held by a memory object (shared mappings, files). Each holder counts;
+ * the last page_unref() frees the frame. Locked instructions: holders on
+ * different CPUs may drop their references at the same time. */
+static int32_t frame_refs[MAX_FRAMES];
+
+void page_ref(uint64_t phys)
+{
+    uint64_t f = phys / PAGE_SIZE;
+    if (f < MAX_FRAMES) __atomic_add_fetch(&frame_refs[f], 1, __ATOMIC_ACQ_REL);
+}
+
+void page_unref(uint64_t phys)
+{
+    uint64_t f = phys / PAGE_SIZE;
+    if (f >= MAX_FRAMES) return;
+    int32_t n = __atomic_sub_fetch(&frame_refs[f], 1, __ATOMIC_ACQ_REL);
+    if (n == 0) pmm_free(phys & ~(PAGE_SIZE - 1));
+    else if (n < 0) panic("page_unref: frame %lx has no references", phys);
+}
+
+int page_refs(uint64_t phys)
+{
+    uint64_t f = phys / PAGE_SIZE;
+    return f < MAX_FRAMES ? __atomic_load_n(&frame_refs[f], __ATOMIC_ACQUIRE) : 0;
+}
+
+/* A zeroed frame with one reference, for user memory. */
+uint64_t page_alloc(void)
+{
+    uint64_t p = pmm_alloc();
+    if (p) __atomic_store_n(&frame_refs[p / PAGE_SIZE], 1, __ATOMIC_RELEASE);
+    return p;
+}
+
 uint64_t pmm_total_bytes(void)   { return total_frames * PAGE_SIZE; }
 uint64_t pmm_free_bytes(void)    { return free_frames * PAGE_SIZE; }
 uint64_t pmm_highest_usable(void){ return highest; }

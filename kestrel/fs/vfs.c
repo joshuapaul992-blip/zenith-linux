@@ -6,6 +6,8 @@
 #include <kernel/mm.h>
 #include <kernel/task.h>
 #include <kernel/string.h>
+#include <kernel/vmobj.h>
+#include <kernel/cpu.h>
 #include <kernel/klog.h>
 #include <kernel/arch.h>
 #include <kernel/time.h>
@@ -209,10 +211,21 @@ static struct vnode *entry_named(struct vnode *dir, const char *name)
     return NULL;
 }
 
+static void node_destroy(struct vnode *vn)
+{
+    if (vn->ops == &ramfs_ops && vn->type == VREG && vn->data) vmobj_put(vn->data);
+    kfree(vn);
+}
+
+/* A node leaves the tree. Like Linux, a file that is still open stays alive
+ * (reads, writes and mappings keep working) until its last close. */
 static void node_free(struct vnode *vn)
 {
-    if (vn->ops == &ramfs_ops) kfree(vn->data);
-    kfree(vn);
+    uint64_t f = irq_save();
+    vn->unlinked = true;
+    bool now = __atomic_load_n(&vn->refs, __ATOMIC_ACQUIRE) == 0;
+    irq_restore(f);
+    if (now) node_destroy(vn);
 }
 
 /* unlink(2): files and devices only */
@@ -398,13 +411,18 @@ int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
     struct tcb *self = current_task();
     if (acc != O_RDONLY && !(vn->mode & 0222) && !created && self && self->uid != 0) return -EACCES;
 
-    if ((flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops == &ramfs_ops)
-        vn->size = 0;
-    if (vn->ops && vn->ops->open) return vn->ops->open(vn, flags, out);
+    if ((flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops && vn->ops->truncate)
+        vn->ops->truncate(vn, 0);
+    if (vn->ops && vn->ops->open) {
+        int r2 = vn->ops->open(vn, flags, out);
+        if (r2 == 0 && (*out)->vn) __atomic_add_fetch(&(*out)->vn->refs, 1, __ATOMIC_ACQ_REL);
+        return r2;
+    }
 
     struct file *f = kzalloc(sizeof *f);
     if (!f) return -ENOMEM;
     f->vn = vn; f->flags = flags; f->refcnt = 1;
+    __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
     *out = f;
     return 0;
 }
@@ -417,6 +435,25 @@ ssize_t vfs_read(struct file *f, void *buf, size_t len)
     if (!f->vn->ops || !f->vn->ops->read) return -EINVAL;
     ssize_t n = f->vn->ops->read(f->vn, buf, len, f->off);
     if (n > 0) f->off += (uint64_t)n;
+    return n;
+}
+
+/* Read at an offset without touching the file position (page faults of
+ * file mappings, the ELF loader, pread64). Regular files only. */
+ssize_t vfs_pread(struct file *f, void *buf, size_t len, uint64_t off)
+{
+    if ((f->flags & O_ACCMODE) == O_WRONLY) return -EBADF;
+    if (f->vn->type == VDIR) return -EISDIR;
+    if (f->vn->type != VREG || !f->vn->ops || !f->vn->ops->read) return -ESPIPE;
+    return f->vn->ops->read(f->vn, buf, len, off);
+}
+
+ssize_t vfs_pwrite(struct file *f, const void *buf, size_t len, uint64_t off)
+{
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
+    if (f->vn->type != VREG || !f->vn->ops || !f->vn->ops->write) return -ESPIPE;
+    ssize_t n = f->vn->ops->write(f->vn, buf, len, off);
+    if (n > 0) f->vn->mtime = (uint64_t)time_realtime_sec();
     return n;
 }
 
@@ -501,8 +538,11 @@ struct file *vfs_file_get(struct file *f)
 void vfs_close(struct file *f)
 {
     if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
-    if (f->vn && f->vn->ops && f->vn->ops->release) f->vn->ops->release(f);
+    struct vnode *vn = f->vn;
+    bool last = vn && __atomic_sub_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL) == 0 && vn->unlinked;
+    if (vn && vn->ops && vn->ops->release) vn->ops->release(f);    /* may free a socket's vnode */
     kfree(f);
+    if (last) node_destroy(vn);
 }
 
 struct file *vfs_file_new(struct vnode *vn, int flags)
@@ -510,6 +550,7 @@ struct file *vfs_file_new(struct vnode *vn, int flags)
     struct file *f = kzalloc(sizeof *f);
     if (!f) return NULL;
     f->vn = vn; f->flags = flags; f->refcnt = 1;
+    if (vn) __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
     return f;
 }
 
@@ -527,31 +568,78 @@ int vfs_poll(struct file *f, int events)
 /*  ramfs: heap-backed regular files                                          */
 /* ======================================================================= */
 
+/* Regular files keep their bytes in a vm_object (created on first write),
+ * so shared mappings of the file and read()/write() stay coherent. */
 static ssize_t ramfs_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
 {
-    if (off >= vn->size) return 0;
-    if (len > vn->size - off) len = vn->size - off;
-    memcpy(buf, (uint8_t *)vn->data + off, len);
-    return (ssize_t)len;
+    return vn->data ? vmobj_read(vn->data, buf, len, off) : 0;
+}
+
+static struct vm_object *ramfs_vmobject(struct vnode *vn)
+{
+    if (vn->type != VREG) return NULL;
+    if (!vn->data) vn->data = vmobj_new(0);
+    return vn->data;
 }
 
 static ssize_t ramfs_write(struct vnode *vn, const void *buf, size_t len, uint64_t off)
 {
-    size_t need = off + len;
-    if (need > vn->cap) {
-        size_t cap = vn->cap ? vn->cap : 256;
-        while (cap < need) cap *= 2;
-        void *nd = krealloc(vn->data, cap);
-        if (!nd) return -ENOSPC;
-        vn->data = nd; vn->cap = cap;
-    }
-    if (off > vn->size) memset((uint8_t *)vn->data + vn->size, 0, off - vn->size);
-    memcpy((uint8_t *)vn->data + off, buf, len);
-    if (need > vn->size) vn->size = need;
-    return (ssize_t)len;
+    struct vm_object *o = ramfs_vmobject(vn);
+    if (!o) return -ENOSPC;
+    if (o->seals & 0x0008 && len) return -EPERM;        /* F_SEAL_WRITE */
+    if ((o->seals & 0x0004) && off + len > o->size) return -EPERM;    /* F_SEAL_GROW */
+    ssize_t n = vmobj_write(o, buf, len, off);
+    if (n > 0) vn->size = o->size;
+    return n;
 }
 
-const struct vnode_ops ramfs_ops = { .read = ramfs_read, .write = ramfs_write };
+static uint64_t ramfs_size(struct vnode *vn)
+{
+    return vn->type == VREG && vn->data ? ((struct vm_object *)vn->data)->size : 0;
+}
+
+static int ramfs_truncate(struct vnode *vn, uint64_t size)
+{
+    struct vm_object *o = ramfs_vmobject(vn);
+    if (!o) return -ENOMEM;
+    if ((o->seals & 0x0002) && size < o->size) return -EPERM;   /* F_SEAL_SHRINK */
+    if ((o->seals & 0x0004) && size > o->size) return -EPERM;   /* F_SEAL_GROW */
+    int r = vmobj_truncate(o, size);
+    if (!r) vn->size = size;
+    return r;
+}
+
+const struct vnode_ops ramfs_ops = { .read = ramfs_read, .write = ramfs_write, .size = ramfs_size,
+                                     .truncate = ramfs_truncate, .vmobject = ramfs_vmobject };
+
+/* An open file on a ramfs node that is in no directory (memfd_create):
+ * freed with its last close. */
+struct file *ramfs_anon_file(const char *name, int flags)
+{
+    struct vnode *vn = vfs_node_new(root ? root->fs : NULL, name, VREG, 0600, &ramfs_ops);
+    if (!vn) return NULL;
+    vn->unlinked = true;
+    if (!ramfs_vmobject(vn)) { kfree(vn); return NULL; }
+    struct file *f = vfs_file_new(vn, flags);
+    if (!f) { node_destroy(vn); return NULL; }
+    return f;
+}
+
+int vfs_truncate(struct vnode *vn, uint64_t size)
+{
+    if (vn->type == VDIR) return -EISDIR;
+    if (vn->type != VREG) return -EINVAL;
+    if (vn->fs && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
+    if (!vn->ops || !vn->ops->truncate) return -EINVAL;
+    int r = vn->ops->truncate(vn, size);
+    if (!r) vn->mtime = (uint64_t)time_realtime_sec();
+    return r;
+}
+
+struct vm_object *vfs_vmobject(struct vnode *vn)
+{
+    return vn && vn->ops && vn->ops->vmobject ? vn->ops->vmobject(vn) : NULL;
+}
 
 struct vnode *ramfs_write_file(const char *path, const char *text)
 {
@@ -567,7 +655,7 @@ struct vnode *ramfs_write_file(const char *path, const char *text)
 /*  pseudo files: generated content (procfs, sysfs)                           */
 /* ======================================================================= */
 
-#define PSEUDO_BUF 8192
+#define PSEUDO_BUF 65536            /* /proc/PID/maps of a large program */
 
 static ssize_t pseudo_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
 {
@@ -648,7 +736,7 @@ void vfs_init(void)
     vfs_mount(rootfs, "/");
 
     static const char *const dirs[] = {
-        "/bin", "/dev", "/etc", "/home", "/mnt", "/proc", "/root",
+        "/bin", "/dev", "/etc", "/home", "/lib", "/mnt", "/proc", "/root",
         "/sys", "/tmp", "/usr", "/usr/bin", "/var", "/var/log",
     };
     for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) vfs_mkdir(dirs[i], 0755);

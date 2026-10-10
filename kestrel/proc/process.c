@@ -15,6 +15,7 @@
 #include <kernel/string.h>
 #include <kernel/posix.h>
 #include <kernel/uaccess.h>
+#include <kernel/vm.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
 
@@ -123,10 +124,11 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (newsp && !user_range_ok(newsp, 0)) return -EINVAL;
 
     bool share = flags & CLONE_VM;
-    uint64_t pml4 = share ? p->pml4 : uvm_clone(p->pml4);      /* eager copy, interrupts on */
-    if (!pml4) return -ENOMEM;
+    struct mm *mm;
+    if (share) { mm = p->mm; mm_get(mm); }
+    else if (!(mm = mm_fork(p->mm))) return -ENOMEM;   /* copy-on-write */
     struct int_frame *cf = kmalloc(sizeof *cf);
-    if (!cf) { if (!share) uvm_destroy(pml4); return -ENOMEM; }
+    if (!cf) { mm_put(mm); return -ENOMEM; }
     *cf = *p->uframe;
     cf->rax = 0;                                        /* the child's return value */
     if (newsp) cf->rsp = newsp;
@@ -137,18 +139,15 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (!c) {
         irq_restore(fl);
         kfree(cf);
-        if (!share) uvm_destroy(pml4);
+        mm_put(mm);
         return -EAGAIN;
     }
     c->ppid = p->pid;
     c->pgid = p->pgid;
     c->sid = p->sid;
     c->user = true;
-    c->pml4 = c->cr3 = pml4;
-    c->vm_borrowed = share;
-    c->brk_start = p->brk_start;
-    c->brk = p->brk;
-    c->mmap_next = p->mmap_next;
+    c->mm = mm;
+    c->pml4 = c->cr3 = mm->pml4;
     c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);
     c->tid_address = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
     __asm__ volatile("fxsave %0" : "=m"(c->fpu));       /* the parent's live SSE state */
@@ -253,28 +252,27 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
 
     /* Build the new image in a fresh address space; the old one stays
      * intact (and current again) if loading fails. */
-    uint64_t old = t->pml4, nw = uvm_create();
+    struct mm *old = t->mm, *nw = mm_create();
     if (!nw) { rc = -ENOMEM; goto out; }
-    uint64_t brk_start = t->brk_start, brk = t->brk, mmap_next = t->mmap_next;
     uint64_t fl = irq_save();
-    t->pml4 = t->cr3 = nw;
-    write_cr3(nw);
+    t->mm = nw;
+    t->pml4 = t->cr3 = nw->pml4;
+    write_cr3(nw->pml4);
     irq_restore(fl);
     uint64_t entry = 0, sp = 0;
     rc = exec_load_image(t, path, &ea, &entry, &sp);
     if (rc < 0) {
         fl = irq_save();
-        t->pml4 = t->cr3 = old;
-        write_cr3(old);
+        t->mm = old;
+        t->pml4 = t->cr3 = old->pml4;
+        write_cr3(old->pml4);
         irq_restore(fl);
-        uvm_destroy(nw);
-        t->brk_start = brk_start; t->brk = brk; t->mmap_next = mmap_next;
+        mm_put(nw);
         goto out;
     }
 
-    /* point of no return */
-    if (!t->vm_borrowed) uvm_destroy(old);
-    t->vm_borrowed = false;
+    /* point of no return: drop the old image (a vfork parent keeps using it) */
+    mm_put(old);
     vfork_release(t);
     for (int fd = 0; fd < MAX_FDS; fd++)
         if (t->fds[fd] && t->fd_cloexec[fd]) { vfs_close(t->fds[fd]); t->fds[fd] = NULL; t->fd_cloexec[fd] = 0; }
@@ -303,7 +301,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     f->rip = entry;
     f->rsp = sp;
     f->rflags = 0x202;
-    kprintf("exec: pid %d: execve %s, entry %lx, %lu user pages\n", t->pid, path, entry, uvm_pages(t->pml4));
+    kprintf("exec: pid %d: execve %s, entry %lx\n", t->pid, path, entry);
     rc = 0;
 out:
     free_strings(ea.argv, ea.argc);
