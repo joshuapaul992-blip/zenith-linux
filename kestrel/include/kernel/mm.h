@@ -42,5 +42,9 @@ bool vmm_identity_map(uint64_t phys, uint64_t size, uint64_t flags);
 /* Make an identity-mapped MMIO range uncached (PCD|PWT), mapping it first if
  * needed. Granularity is the 2 MiB boot page, which for MMIO holes is fine. */
 bool vmm_set_uncached(uint64_t phys, uint64_t size);
+/* Map an identity-mapped frame buffer write-combining (PAT), mapping it first
+ * if needed; 2 MiB pages already made uncached are left alone. False if the
+ * CPU has no PAT. */
+bool vmm_set_write_combining(uint64_t phys, uint64_t size);
 
 #endif

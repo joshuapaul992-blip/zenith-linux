@@ -83,7 +83,7 @@ static inline void put_px(const struct kestrel_tty *t, uint8_t *row, int px, uin
 
 /* Copy a rectangle of this monitor's shadow to its VRAM (no-op without a
  * shadow: drawing already went to VRAM). Clipped to the monitor. */
-static void publish(const struct kestrel_tty *t, int x, int y, int w, int h)
+static void publish_now(const struct kestrel_tty *t, int x, int y, int w, int h)
 {
     if (!t->shadow) return;
     if (x < 0) { w += x; x = 0; }
@@ -123,6 +123,23 @@ static void paint_glyph(struct kestrel_tty *t, unsigned char c, int x, int y, ui
     }
 }
 
+/* Inside a batch (a chunk of tty_write output, see batch_end()) changed
+ * rectangles are only collected, and their bounding box goes to VRAM once at
+ * the end. VRAM is slow to write even when write-combining. */
+static void publish(struct kestrel_tty *t, int x, int y, int w, int h)
+{
+    if (!t->batch) { publish_now(t, x, y, w, h); return; }
+    if (w <= 0 || h <= 0) return;
+    if (t->dirty_x1 <= t->dirty_x0) {
+        t->dirty_x0 = x; t->dirty_y0 = y; t->dirty_x1 = x + w; t->dirty_y1 = y + h;
+        return;
+    }
+    if (x < t->dirty_x0) t->dirty_x0 = x;
+    if (y < t->dirty_y0) t->dirty_y0 = y;
+    if (x + w > t->dirty_x1) t->dirty_x1 = x + w;
+    if (y + h > t->dirty_y1) t->dirty_y1 = y + h;
+}
+
 void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, uint32_t bg_color)
 {
     if (!t || !t->active || t->graphics) return;
@@ -150,6 +167,7 @@ static void cell_draw(struct kestrel_tty *t, int cx, int cy, bool inverse)
  * rectangle (or not, for a caller that publishes a larger area). */
 static void paint_cells(struct kestrel_tty *t, int cy, int x0, int x1, bool pub)
 {
+    if (t->batch) { t->row_dirty[cy] = 1; return; }    /* drawn at batch_end() */
     if (t->graphics || x0 >= x1) return;
     for (int cx = x0; cx < x1; cx++) {
         const struct tty_cell *k = cell_at(t, cx, cy);
@@ -178,7 +196,8 @@ static void cell_set(struct kestrel_tty *t, int cx, int cy, unsigned char ch)
     struct tty_cell *k = cell_at(t, cx, cy);
     k->ch = ch;
     cur_colors(t, &k->fg, &k->bg);
-    cell_draw(t, cx, cy, false);
+    if (t->batch) t->row_dirty[cy] = 1;
+    else cell_draw(t, cx, cy, false);
 }
 
 /* Blank cells x0..x1-1 of row cy in the current colours (the Linux console
@@ -277,6 +296,23 @@ static void scroll_region(struct kestrel_tty *t, int top, int bot, int n)
     int h = bot - top + 1, a = n > 0 ? n : -n;
     if (!n || h <= 0) return;
     if (a > h) a = h;
+    if (t->batch) {                                     /* cells now, pixels at batch_end() */
+        const size_t cells = sizeof(struct tty_cell) * (size_t)t->max_cols;
+        if (n > 0 && top == 0 && bot == t->max_rows - 1 && !t->repaint_all && t->pending_up + a < t->max_rows) {
+            t->pending_up += a;                         /* one pixel move for all of them */
+            memmove(t->row_dirty, t->row_dirty + a, (size_t)(h - a));
+        } else {
+            t->repaint_all = true;
+        }
+        if (n > 0) {
+            memmove(cell_at(t, 0, top), cell_at(t, 0, top + a), cells * (size_t)(h - a));
+            for (int y = bot - a + 1; y <= bot; y++) erase_cells(t, y, 0, t->max_cols, false);
+        } else {
+            memmove(cell_at(t, 0, top + a), cell_at(t, 0, top), cells * (size_t)(h - a));
+            for (int y = top; y < top + a; y++) erase_cells(t, y, 0, t->max_cols, false);
+        }
+        return;
+    }
     if (t->cursor_visible) cursor_hide(t);              /* its pixels move too */
     const size_t row_bytes = (size_t)t->max_cols * TTY_CELL_W * (size_t)t->bytes_pp;
     const size_t cells = sizeof(struct tty_cell) * (size_t)t->max_cols;
@@ -344,6 +380,48 @@ static void move_to(struct kestrel_tty *t, int col, int row)
     t->wrap_pending = false;
 }
 
+/* Batches: text output only updates the cell model, marks rows dirty and
+ * counts full-screen scrolls. batch_end() then moves the pixels once by all
+ * the scrolled rows, draws the dirty rows and publishes the result in one
+ * go, so a burst that scrolls the screen a thousand times costs about one
+ * screen redraw instead of a thousand. */
+static void batch_begin(struct kestrel_tty *t)
+{
+    t->batch = true;
+    t->dirty_x0 = t->dirty_y0 = t->dirty_x1 = t->dirty_y1 = 0;
+}
+
+static void batch_end(struct kestrel_tty *t)
+{
+    t->batch = false;
+    const int rows = t->max_rows, text_h = rows * TTY_CELL_H;
+    int lo = rows, hi = -1;
+    if (t->repaint_all) {
+        lo = 0; hi = rows - 1;
+        for (int y = 0; y < rows; y++) paint_cells(t, y, 0, t->max_cols, false);
+    } else {
+        if (t->pending_up && !t->graphics) {
+            const size_t row_bytes = (size_t)t->max_cols * TTY_CELL_W * (size_t)t->bytes_pp;
+            for (int py = 0; py < text_h - t->pending_up * TTY_CELL_H; py++)
+                memcpy(row_ptr(t, py), row_ptr(t, py + t->pending_up * TTY_CELL_H), row_bytes);
+        }
+        if (t->pending_up) { lo = 0; hi = rows - 1; }
+        for (int y = 0; y < rows; y++)
+            if (t->row_dirty[y]) {
+                paint_cells(t, y, 0, t->max_cols, false);
+                if (y < lo) lo = y;
+                if (y > hi) hi = y;
+            }
+    }
+    memset(t->row_dirty, 0, (size_t)rows);
+    t->pending_up = 0;
+    t->repaint_all = false;
+    if (t->graphics) return;
+    if (hi >= lo) publish(t, 0, lo * TTY_CELL_H, t->max_cols * TTY_CELL_W, (hi - lo + 1) * TTY_CELL_H);
+    if (t->dirty_x1 > t->dirty_x0)
+        publish_now(t, t->dirty_x0, t->dirty_y0, t->dirty_x1 - t->dirty_x0, t->dirty_y1 - t->dirty_y0);
+}
+
 static void clear_locked(struct kestrel_tty *t)
 {
     if (!t->graphics) {
@@ -353,6 +431,7 @@ static void clear_locked(struct kestrel_tty *t)
     }
     for (int y = 0; y < t->max_rows; y++)
         for (int x = 0; x < t->max_cols; x++) *cell_at(t, x, y) = (struct tty_cell){ ' ', t->fg, TTY_BG };
+    if (t->batch) t->repaint_all = true;                /* the pixels were just wiped */
     t->cursor_col = t->cursor_row = 0;
     t->wrap_pending = false;
     t->cursor_visible = false;
@@ -715,10 +794,12 @@ static void write_common(struct kestrel_tty *t, const char *s, size_t n, bool vt
 {
     if (!t || !t->active || !s) return;
     while (n) {
-        size_t chunk = n < 256 ? n : 256;       /* let other writers of this TTY in between */
+        size_t chunk = n < 4096 ? n : 4096;     /* let other writers of this TTY in between */
         if (!tty_lock(t)) return;               /* busy, and we cannot wait (IRQ context) */
         cursor_hide(t);
+        batch_begin(t);
         for (size_t i = 0; i < chunk; i++) putc_locked(t, s[i], vt);
+        batch_end(t);
         cursor_refresh(t);
         tty_unlock(t);
         s += chunk; n -= chunk;
@@ -911,7 +992,8 @@ static bool tty_setup(struct kestrel_tty *t, int index, const struct display_hea
     t->max_rows = h->height / TTY_CELL_H;
     if (t->max_cols < 1 || t->max_rows < 1) return false;
     t->cells = kmalloc(sizeof(struct tty_cell) * (size_t)t->max_cols * (size_t)t->max_rows);
-    if (!t->cells) return false;
+    t->row_dirty = kzalloc((size_t)t->max_rows);
+    if (!t->cells || !t->row_dirty) return false;
     t->fg = TTY_FG;
     t->bg = TTY_BG;
     t->fg_low = -1;

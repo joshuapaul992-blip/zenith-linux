@@ -35,9 +35,11 @@ int display_register(const struct display_head *h)
         kprintf("display: %s ignored, bad geometry %dx%d pitch %d\n", h->name, h->width, h->height, h->pitch);
         return -1;
     }
+    bool wc = h->vram && h->phys &&                 /* CPU-mapped VRAM: write-combining */
+              vmm_set_write_combining(h->phys, (uint64_t)h->pitch * (uint64_t)h->height);
     heads[nheads] = *h;
-    kprintf("display: monitor %d: %dx%dx%d, pitch %d, VRAM %lx%s, %s%s%s%s\n", nheads, h->width, h->height,
-            h->bytes_pp * 8, h->pitch, h->phys, h->shadow ? " + RAM shadow" : "", h->name,
+    kprintf("display: monitor %d: %dx%dx%d, pitch %d, VRAM %lx%s%s, %s%s%s%s\n", nheads, h->width, h->height,
+            h->bytes_pp * 8, h->pitch, h->phys, wc ? " (write-combining)" : "", h->shadow ? " + RAM shadow" : "", h->name,
             h->monitor[0] ? " (\"" : "", h->monitor, h->monitor[0] ? "\")" : "");
     return nheads++;
 }

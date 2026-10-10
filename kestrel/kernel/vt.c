@@ -47,9 +47,10 @@ static void vt_reply(void *ctx, const char *s, size_t n)
 static int vt_output(void *arg)
 {
     struct vt *v = arg;
-    char buf[512];
+    static char bufs[MAX_MONITORS][4096];           /* a big read: one VRAM update per screenful */
+    char *buf = bufs[v - vts];
     for (;;) {
-        ssize_t n = pty_console_read(v->pty, buf, sizeof buf);
+        ssize_t n = pty_console_read(v->pty, buf, sizeof bufs[0]);
         if (n > 0) tty_write_vt(v->tty, buf, (size_t)n);
         else task_sleep_ms(10);
     }

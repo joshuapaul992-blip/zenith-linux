@@ -130,6 +130,11 @@ struct kestrel_tty {
                                            text still updates the cells, but
                                            nothing is drawn until it lets go   */
     volatile int lock;                  /* see "Locking" above                      */
+    bool      batch;                    /* inside tty_write: see batch_end() in tty.c */
+    int       dirty_x0, dirty_y0, dirty_x1, dirty_y1;   /* rectangles to publish, pixels */
+    uint8_t  *row_dirty;                /* rows whose cells changed in this batch   */
+    int       pending_up;               /* full-screen scrolls not yet done in pixels */
+    bool      repaint_all;              /* other scrolls/clears: redraw every row    */
 };
 
 extern struct kestrel_tty system_ttys[MAX_MONITORS];

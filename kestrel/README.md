@@ -102,6 +102,7 @@ No global screen size is used anywhere in the rendering path.
 - `draw_char(tty, c, x, y, fg, bg)` draws the 16 rows of a glyph into that TTY's surface using that TTY's own pitch, clipped to its own size. Set bits get the fg colour and clear bits the bg colour; bit 7 is the leftmost pixel.
 - `scroll_screen(tty)` moves that monitor's text up one row with a per-scan-line `memcpy` (source and destination never overlap) and blanks the bottom row. Only that monitor's memory is read or written.
 - A monitor with a RAM shadow is drawn and scrolled in the shadow, and the changed rectangle is then copied to VRAM, because reading VRAM over PCIe is slow.
+- **Speed:** frame buffers the CPU writes directly are mapped write-combining (PAT entry 1, as on Linux; firmware MTRRs otherwise make VRAM uncached, one slow bus write per pixel). Terminal output is processed in chunks of up to 4 KiB: inside a chunk only the character cells change and full-screen scrolls are counted, then the pixels move once, the changed rows are drawn and one rectangle goes to VRAM. 5,000 lines of `seq` take 0.7 s in QEMU, against 17 s with a pixel scroll and a VRAM copy per line.
 
 **Cursor:**
 - The 1 kHz timer interrupt walks every TTY and toggles each cursor every 500 ms, at that TTY's own cell and on its own phase.

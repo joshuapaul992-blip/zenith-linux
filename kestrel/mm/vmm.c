@@ -49,6 +49,51 @@ bool vmm_set_uncached(uint64_t phys, uint64_t size)
     return true;
 }
 
+/* Write-combining for frame buffers. Firmware MTRRs normally make video
+ * memory uncached, which turns every frame-buffer write into a single slow
+ * bus transaction. A write-combining PAT type overrides an uncached MTRR, so
+ * PAT entry 1 (PWT=1, PCD=0 -- unused otherwise) is reprogrammed from
+ * write-through to write-combining, as Linux does, and frame-buffer pages
+ * are mapped with PWT alone. */
+#define MSR_PAT     0x277
+#define PAT_WC      0x01
+
+static bool pat_wc_ready(void)
+{
+    static int state;                               /* 0 untried, 1 ok, -1 no PAT */
+    if (state) return state > 0;
+    uint32_t a, b, c, d;
+    cpuid(1, 0, &a, &b, &c, &d);
+    if (!(d & (1u << 16))) { state = -1; return false; }
+    uint64_t f = irq_save();
+    uint64_t pat = (rdmsr(MSR_PAT) & ~(0xFFull << 8)) | ((uint64_t)PAT_WC << 8);
+    __asm__ volatile("wbinvd" ::: "memory");
+    wrmsr(MSR_PAT, pat);
+    __asm__ volatile("wbinvd" ::: "memory");
+    write_cr3(read_cr3());                          /* drop TLB entries with the old type */
+    irq_restore(f);
+    state = 1;
+    return true;
+}
+
+bool vmm_set_write_combining(uint64_t phys, uint64_t size)
+{
+    if (!size || !pat_wc_ready() || !vmm_identity_map(phys, size, VMM_WRITE)) return false;
+    uint64_t *pml4 = kpml4();
+    int pages = 0;
+    for (uint64_t a = phys & ~0x1FFFFFull; a < phys + size; a += 0x200000) {
+        uint64_t *pdpt = (uint64_t *)(pml4[(a >> 39) & 511] & ADDR_MASK);
+        uint64_t *pd = (uint64_t *)(pdpt[(a >> 30) & 511] & ADDR_MASK);
+        uint64_t *pde = &pd[(a >> 21) & 511];
+        if (!(*pde & PTE_HUGE) || (*pde & VMM_PCD)) continue;   /* MMIO made uncached stays so */
+        *pde = (*pde & ~(uint64_t)VMM_PCD) | VMM_PWT;
+        invlpg(a);
+        pages++;
+    }
+    __asm__ volatile("wbinvd" ::: "memory");
+    return pages > 0;
+}
+
 bool vmm_identity_map(uint64_t phys, uint64_t size, uint64_t flags)
 {
     uint64_t *pml4 = kpml4();
