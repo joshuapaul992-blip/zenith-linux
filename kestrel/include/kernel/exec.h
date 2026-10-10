@@ -22,6 +22,11 @@ int exec_spawn(const char *path, int argc, char *const argv[]);
 /* The same with stdin/stdout/stderr on device `stdio` (e.g. "/dev/kmsg"). */
 int exec_spawn_io(const char *path, int argc, char *const argv[], const char *stdio);
 
+/* A login session on terminal `tty` (e.g. "/dev/tty1"): stdin/stdout/stderr
+ * on it, and it becomes the controlling terminal of the new process, which
+ * leads its own session. The environment says TERM=linux. */
+int exec_spawn_tty(const char *path, int argc, char *const argv[], const char *tty);
+
 /* Wait for process `pid` to exit; returns its exit status, or -ECHILD. */
 int exec_wait(int pid);
 

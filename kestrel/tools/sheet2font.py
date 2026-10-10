@@ -10,7 +10,11 @@ The sheet must hold 256 glyphs in a 16 x 16 grid (code point = row * 16 +
 column), light glyphs on a dark background. Any cell size works:
 
   * an exact 128 x 256 sheet (8 x 16 cells) converts losslessly;
-  * a larger or scaled sheet (e.g. 240 x 368 = 15 x 23 cells) is resampled:
+  * a sheet with larger cells whose ink fits in 8 x 16 pixels everywhere
+    (e.g. 256 x 256 = 16 x 16 cells drawn in the middle 8 columns) is
+    cropped losslessly: the same 8 x 16 window is cut out of every cell,
+    pixel for pixel, with no scaling;
+  * any other larger or scaled sheet (e.g. 240 x 368 = 15 x 23 cells) is resampled:
     each cell is cropped to its ink bounding box across the whole font
     (so baselines stay aligned), area-averaged down to 8 x 16 and
     thresholded. JPEG noise is removed by the threshold.
@@ -49,6 +53,14 @@ def main():
                     if px[int(cx + x), int(cy + y)] > 128:
                         x0, y0 = min(x0, x), min(y0, y)
                         x1, y1 = max(x1, x + 1), max(y1, y + 1)
+    # Whole-pixel cells whose ink fits in W x H: cut out a W x H window
+    # around the ink, the same for every cell, without resampling.
+    crop = (not exact and cw == int(cw) and ch == int(ch) and cw >= W and ch >= H
+            and x1 - x0 <= W and y1 - y0 <= H)
+    if crop:
+        ox = min(max(0, x0 - (W - (x1 - x0)) // 2), int(cw) - W)
+        oy = min(max(0, y0 - (H - (y1 - y0)) // 2), int(ch) - H)
+    elif not exact:
         # pad the box to the 1:2 cell aspect with a 1-pixel margin
         x0, y0 = max(0, x0 - 1), max(0, y0 - 1)
         x1, y1 = min(int(cw), x1 + 1), min(int(ch), y1 + 1)
@@ -58,6 +70,8 @@ def main():
         cx, cy = (code % 16) * cw, (code // 16) * ch
         if exact:
             cell = img.crop((int(cx), int(cy), int(cx) + W, int(cy) + H))
+        elif crop:
+            cell = img.crop((int(cx) + ox, int(cy) + oy, int(cx) + ox + W, int(cy) + oy + H))
         else:
             cell = img.crop((int(cx + x0), int(cy + y0), int(cx + x1), int(cy + y1)))
             cell = cell.resize((W, H), Image.BOX)
@@ -66,7 +80,7 @@ def main():
         for y in range(H):
             v = 0
             for x in range(W):
-                if cp[x, y] > (128 if exact else 96):
+                if cp[x, y] > (128 if exact or crop else 96):
                     v |= 0x80 >> x
             rows.append(v)
         font.append(rows)
@@ -85,15 +99,18 @@ def main():
         out = Image.new("L", (16 * W * 4, 16 * H * 4), 0)
         op = out.load()
         for code, rows in enumerate(font):
-            ox, oy = (code % 16) * W * 4, (code // 16) * H * 4
+            gx, gy = (code % 16) * W * 4, (code // 16) * H * 4
             for y, r in enumerate(rows):
                 for x in range(W):
                     if r & (0x80 >> x):
                         for dy in range(4):
                             for dx in range(4):
-                                op[ox + x * 4 + dx, oy + y * 4 + dy] = 255
+                                op[gx + x * 4 + dx, gy + y * 4 + dy] = 255
         out.save(preview)
-    print("%s: %d glyphs written (%s)" % (dst, len(font), "exact" if exact else "resampled from %.0fx%.0f cells" % (cw, ch)))
+    how = ("exact" if exact else
+           "cropped losslessly from %.0fx%.0f cells at +%d,+%d" % (cw, ch, ox, oy) if crop else
+           "resampled from %.0fx%.0f cells" % (cw, ch))
+    print("%s: %d glyphs written (%s)" % (dst, len(font), how))
 
 
 if __name__ == "__main__":

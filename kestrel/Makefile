@@ -73,7 +73,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
-           kernel/display.c kernel/tty.c kernel/report.c \
+           kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
            drivers/gpu/nvidia/nvinit.c drivers/gpu/nvidia/nvdisp.c drivers/gpu/nvidia/nvidia.c kernel/gpu.c kernel/kush.c \
            kernel/coreutils/cu_lib.c kernel/coreutils/table.c kernel/coreutils/nav.c \
@@ -356,7 +356,7 @@ check: $(KERNEL)
 
 # ---- fonts (Spleen, BSD-2-Clause, third_party/spleen)
 fonts:
-	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/kestrel_font_sheet.jpg drivers/kestrel_font.c
+	$(PYTHON) tools/sheet2font.py third_party/kestrel_font/kestrel_font_sheet.png drivers/kestrel_font.c
 	$(PYTHON) tools/bdf2c.py third_party/spleen/spleen-8x16.bdf  font_8x16  > drivers/font_8x16.c
 	$(PYTHON) tools/bdf2c.py third_party/spleen/spleen-12x24.bdf font_12x24 > drivers/font_12x24.c
 

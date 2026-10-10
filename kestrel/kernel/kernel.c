@@ -39,6 +39,7 @@
 #include <kernel/display.h>
 #include <kernel/report.h>
 #include <kernel/kush.h>
+#include <kernel/vt.h>
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
 #include <kernel/block.h>
@@ -211,7 +212,13 @@ static void section(const char *title)
     u_puts(buf);
 }
 
-/* A shell on another monitor: bind the thread to that TTY first, so its
+/* /bin/sh on another monitor's terminal (vt.c). */
+static int getty_main(void *arg)
+{
+    vt_session((int)(intptr_t)arg);
+}
+
+/* kush on another monitor: bind the thread to that TTY first, so its
  * stdin/stdout (/dev/tty) and everything it starts use that monitor. */
 static int shell_main(void *arg)
 {
@@ -303,12 +310,19 @@ static int init_main(void *arg)
 
     /* One shell per monitor: TTY 0 keeps this thread, every other TTY gets a
      * thread of its own, so a command running on one monitor never blocks
-     * typing on another. */
+     * typing on another. The shell is /bin/sh (BusyBox ash) on a real
+     * terminal; kush, the built-in one, with kestrel.shell=kush or when the
+     * boot volume has no /bin/sh. */
+    bool sh = vt_shell_available();
     for (int i = 1; i < tty_count; i++) {
         char name[TASK_NAME_LEN];
-        snprintf(name, sizeof name, "kush/tty%d", i + 1);
-        if (!task_create(name, shell_main, (void *)(intptr_t)i))
+        snprintf(name, sizeof name, "%s/tty%d", sh ? "getty" : "kush", i + 1);
+        if (!task_create(name, sh ? getty_main : shell_main, (void *)(intptr_t)i))
             kprintf("init: cannot start a shell on tty%d\n", i + 1);
+    }
+    if (sh && tty_count) {
+        u_puts("\n");
+        vt_session(0);                            /* /bin/sh on tty1; never returns */
     }
     kush_main();                                  /* interactive shell on tty1; never returns */
 }

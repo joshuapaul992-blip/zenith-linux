@@ -45,7 +45,7 @@ The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial 
 
 **Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer two entries for 5 seconds:
 - **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, IceWM and an xterm. Logout in IceWM's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
-- **Text console:** the kernel's terminals and kush only.
+- **Text console:** a login shell (`/bin/sh`) on every monitor's terminal, no X. Type `startx` there for the desktop.
 
 On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`module2 /boot/kestrel.vol`). `kernel/ramdisk.c` turns each module into a read-only `/dev/ramN`, and the usual boot-volume discovery mounts it on `/boot`, found through the volume's sector-0 signature. `tools/mkusbimg.py --ramdisk` writes that volume file. This has been checked under BIOS and UEFI (OVMF) in QEMU.
 
@@ -78,7 +78,9 @@ Layout is an 85×32 character grid drawn with a 12×24 font:
 
 ## After boot: one terminal and one shell per monitor
 
-Every monitor gets its own text terminal (`kernel/tty.c`), drawn with `kestrel_font[256][16]`. `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts one `kush` shell (`kernel/kush.c`) per monitor, each in its own thread.
+Every monitor gets its own text terminal (`kernel/tty.c`), drawn with `kestrel_font[256][16]`. `init` (pid 1) prints a short system summary on the first monitor, read through system calls. It then starts a shell on every monitor: BusyBox's `/bin/sh` as a login shell on a real Unix terminal (`kernel/vt.c`, see "The shell on the terminals" below). Without `/bin/sh` on the boot volume, or with `kestrel.shell=kush` on the kernel command line, it runs `kush` (`kernel/kush.c`), the shell built into the kernel, instead.
+
+**Font** (`drivers/kestrel_font.c`): 256 glyphs, 8×16 pixels, in Windows-1252 order. It is generated from the glyph sheet `third_party/kestrel_font/kestrel_font_sheet.png` by `tools/sheet2font.py` (`make fonts`). The sheet is a 16×16 grid of 16×16-pixel cells whose ink fits in the middle 8 columns, so the tool cuts the same 8×16 window out of every cell: pixel for pixel, no scaling. To change the font, replace the sheet and run `make fonts`.
 
 **Monitors** (`kernel/display.c`):
 - Display drivers register one head per monitor. Each head has its frame buffer, native resolution, pitch and pixel format.
@@ -91,8 +93,8 @@ Every monitor gets its own text terminal (`kernel/tty.c`), drawn with `kestrel_f
 - its native width and height, and pitch
 - `max_cols × max_rows` (width / 8 × height / 16): 128 × 48 at 1024×768, 160 × 64 at 1280×1024, 240 × 67 at 1920×1080
 - the cursor position, the blink state and the colours
-- the ANSI escape parser
-- a key queue, and a 1024-byte `input_buffer`
+- the escape-sequence parser and UTF-8 decoder (see below)
+- a key queue, and a 1024-byte `input_buffer` (for kush)
 
 No global screen size is used anywhere in the rendering path.
 
@@ -122,7 +124,22 @@ No global screen size is used anywhere in the rendering path.
 - `TIOCGWINSZ` reports the size of the caller's monitor.
 - The kernel log goes to TTY 1.
 
-**Line editing:** the shell edits its line in its TTY's `input_buffer`, and keeps its history, `$?` and parse buffers in a per-session struct. The shells share no state.
+**The shell on the terminals** (`kernel/vt.c`). Each monitor's terminal is a terminal in the Unix sense, built from a console pty (`fs/pty.c`) whose master the kernel holds and whose slave is `/dev/ttyN`:
+- **Keyboard:** the thread `vt-in/ttyN` turns the TTY's keys into the bytes a Linux console sends (Enter is CR, Backspace is DEL, the cursor and editing keys and F1–F12 are escape sequences, Alt adds an ESC prefix) and types them into the pty. So the line discipline does the editing, the echo and Ctrl+C/Ctrl+\ (signals), with full termios.
+- **Screen:** the thread `vt-out/ttyN` draws the pty's output with `tty_write_vt()`.
+- **Sessions:** the thread `getty/ttyN` starts `-sh` (ash as a login shell, which reads `/etc/profile`) as a new session with `/dev/ttyN` as its controlling terminal and `TERM=linux`. When the shell exits, the terminal is hung up (SIGHUP for anything left in the session) and reset, and a new shell starts.
+- `tty`, `stty`, line editing with history and Tab completion, `top`, `vi`, `less` and Ctrl+C work as on Linux. `startx` starts the desktop from there; after Logout the terminal is back.
+
+**Escape sequences and text** (`tty_write_vt()`): the Linux console's subset of ECMA-48, which is what `TERM=linux` promises.
+- cursor movement and addressing, erase in line and display, insert and delete characters and lines, scroll regions, save and restore the cursor;
+- SGR: bold, reverse, 8/16/256 colours and 24-bit colour;
+- cursor show/hide, application cursor keys, and answers to the status and cursor-position queries;
+- lines wrap the way xterm and the Linux console wrap them: the cursor stays in the last column until the next character arrives.
+- **UTF-8:** code points the font has (Latin-1, the euro sign, curly quotes, dashes and the rest of Windows-1252) use their glyph. Box drawing and arrows get a look-alike, and anything else a `?`. A byte that is not valid UTF-8 shows its own Windows-1252 glyph.
+
+The kernel's own output (the log, kush) goes through the same parser, except that a newline also returns the carriage.
+
+**kush line editing** (with `kestrel.shell=kush`): the shell edits its line in its TTY's `input_buffer`, and keeps its history, `$?` and parse buffers in a per-session struct. The shells share no state.
 - Printable characters are appended and echoed at the TTY's cursor.
 - Backspace steps left, back across a line wrap if needed, and blanks the cell.
 - Enter hands the line to the parser.
@@ -138,7 +155,7 @@ qemu-system-x86_64 -m 256M -vga none -device VGA \
     -device secondary-vga,xres=1920,yres=1080 -cdrom build/kestrel.iso
 ```
 
-`kush` is the shell. Its prompt shows the working directory (`kestrel:/root# `), and it starts in `/root`. Its command line understands:
+`kush` is the shell built into the kernel, used with `kestrel.shell=kush` or when there is no `/bin/sh`. Its prompt shows the working directory (`kestrel:/root# `), and it starts in `/root`. Its command line understands:
 - `'single'` and `"double"` quotes, and backslash escapes
 - `$?`, the last exit status
 - redirection: `> file`, `>> file` and `< file`
@@ -534,7 +551,10 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
               display.c      display heads: boot frame buffer + DISPI adapters at their EDID mode
               tty.c          one terminal per monitor: draw_char/scroll_screen per TTY, cell
                              model, per-TTY lock, cursor blink on every monitor, focus hotkeys,
-                             per-TTY key queues, /dev/tty line discipline
+                             per-TTY key queues, Linux-console escape sequences, UTF-8,
+                             kush's /dev/tty line discipline
+              vt.c           /bin/sh on every terminal: console pty, key and output threads,
+                             login sessions (getty/ttyN), respawn
               kush.c         kush shell (one instance per monitor): line editor, quoting,
                              redirection, $?, built-ins
               coreutils/     pwd cd ls mkdir rmdir touch rm cp mv cat head tail grep echo
@@ -717,14 +737,14 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 ## Terminals: pseudo-terminals, a shell, xterm
 
 **Pseudo-terminals** (`fs/pty.c`) work like Linux's Unix98 ptys, so musl's `posix_openpt`/`grantpt`/`unlockpt`/`ptsname`, `openpty`, `tcgetattr`/`tcsetattr`, `isatty` and `ttyname` work unchanged.
-- **Devices:** opening `/dev/ptmx` gives a new master; its slave is `/dev/pts/N` (16 pairs).
+- **Devices:** opening `/dev/ptmx` gives a new master; its slave is `/dev/pts/N` (16 pairs). The text terminals use one pair each, from the top (`/dev/pts/15` down): their slave is `/dev/ttyN` (see "The shell on the terminals").
 - **Line discipline:** canonical editing (erase, word erase, kill, EOF), echo with `^X` for control characters, `ICRNL`/`INLCR`/`IGNCR`, output `OPOST`/`ONLCR`, and raw mode with `VMIN`/`VTIME`.
 - **Controlling terminal:** set with `TIOCSCTTY`, or when a session leader opens a slave. `/dev/tty` then opens it; `TIOCGPGRP`/`TIOCSPGRP` set the foreground process group.
 - **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group (SIGTSTP is ignored: no job control). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
 - **Hang-up:** after the slave side closes, master reads fail with EIO (as on Linux).
 - **Test:** `user/ptytest.c` checks all of this in 18 tests.
 
-**A shell** (`ports/busybox`): BusyBox 1.36 provides `/bin/sh` (ash) and about 400 tools in one 1.2 MB static-PIE musl binary.
+**A shell** (`ports/busybox`): BusyBox 1.36 provides `/bin/sh` (ash) and about 400 tools in one 1.2 MB static-PIE musl binary. It is the login shell on every text terminal.
 - **Install:** every applet is a hard link to it. The boot volume keeps the links: tarfs supports hard links, and `make usbimg` preserves them. `/boot/bin` is bound on `/bin`, so `/bin/sh` is where scripts expect it.
 - **Building:** `make busybox BUSYBOX_SRC=<unpacked busybox release>`.
 - **Test:** `user/shtest.sh` (`kestrel.exec=/bin/sh,/bin/shtest.sh`) checks pipes, redirection, background jobs, `kill`, traps, here-documents, `/proc`, `ps` and `killall` in 22 tests.
@@ -734,7 +754,7 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 
 **xterm** (`ports/xterm`): xterm 390 built against Xt, Xaw, Xmu, SM and ICE, added to the musl sysroot, and ncurses.
 - **Configuration:** core fonts, no FreeType, luit, setuid, utmp helper, input methods or Tek4014.
-- **Install:** resources go to `/boot/share/X11/app-defaults/XTerm`; the terminfo entries for `xterm*` go to `/boot/share/terminfo`.
+- **Install:** resources go to `/boot/share/X11/app-defaults/XTerm`; the terminfo entries for `xterm*`, and `linux` for the text terminals, go to `/boot/share/terminfo`.
 - **Patch:** one patch makes xterm call `setsid()` with musl too. glibc implies `_POSIX_SOURCE`, which xterm tests for.
 - **Configure:** `HAVE_GRANTPT_PTY_ISATTY` is set because configure cannot run its test program when cross-compiling.
 
@@ -745,7 +765,7 @@ make busybox BUSYBOX_SRC=<unpacked busybox release>
 make usbimg
 ```
 
-**Trying it:** choose the desktop entry in the boot menu (`kestrel.exec=/bin/startx`). Or start the pieces yourself with `kestrel.exec=/bin/Xkestrel,:0+2s+/bin/icewm` and pick XTerm in IceWM's start menu. In a text terminal, `run startx` does the same.
+**Trying it:** choose the desktop entry in the boot menu (`kestrel.exec=/bin/startx`). Or start the pieces yourself with `kestrel.exec=/bin/Xkestrel,:0+2s+/bin/icewm` and pick XTerm in IceWM's start menu. In a text terminal, `startx` does the same.
 
 **Checked in QEMU** with an xHCI keyboard and mouse: commands typed into the shell run, including pipes, `ps`, `top` and `stty size`; Ctrl+C interrupts a running `sleep`; `exit` closes the window, and IceWM reaps xterm.
 
@@ -777,6 +797,6 @@ The structure is laid out for these, in order:
 
 Kestrel source: yours to license as you wish.
 
-Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus.
+Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The terminal font (`third_party/kestrel_font`) is the project's own.
 
 NVIDIA register and VBIOS table knowledge in `drivers/gpu/nvidia/` is derived from nouveau (`third_party/nouveau/LICENSE`): MIT, © Red Hat Inc.

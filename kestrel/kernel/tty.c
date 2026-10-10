@@ -102,10 +102,11 @@ static void publish(const struct kestrel_tty *t, int x, int y, int w, int h)
     }
 }
 
-void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, uint32_t bg_color)
+/* One glyph into the drawing surface, without publishing it. */
+static void paint_glyph(struct kestrel_tty *t, unsigned char c, int x, int y, uint32_t fg_color, uint32_t bg_color)
 {
-    if (!t || !t->active || t->graphics) return;
-    const unsigned char *glyph = kestrel_font[(unsigned char)c];   /* char may be signed */
+    if (t->graphics) return;
+    const unsigned char *glyph = kestrel_font[c];
     const uint32_t fg = native_color(t, fg_color);
     const uint32_t bg = native_color(t, bg_color);
 
@@ -120,6 +121,12 @@ void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, u
             put_px(t, line, px, (bits & (0x80u >> col)) ? fg : bg);    /* bit 7 = leftmost pixel */
         }
     }
+}
+
+void draw_char(struct kestrel_tty *t, char c, int x, int y, uint32_t fg_color, uint32_t bg_color)
+{
+    if (!t || !t->active || t->graphics) return;
+    paint_glyph(t, (unsigned char)c, x, y, fg_color, bg_color);    /* char may be signed */
     publish(t, x, y, KFONT_WIDTH, KFONT_HEIGHT);
 }
 
@@ -139,10 +146,51 @@ static void cell_draw(struct kestrel_tty *t, int cx, int cy, bool inverse)
               inverse ? k->bg : k->fg, inverse ? k->fg : k->bg);
 }
 
+/* Cells x0..x1-1 of row cy from the model to the pixels, published as one
+ * rectangle (or not, for a caller that publishes a larger area). */
+static void paint_cells(struct kestrel_tty *t, int cy, int x0, int x1, bool pub)
+{
+    if (t->graphics || x0 >= x1) return;
+    for (int cx = x0; cx < x1; cx++) {
+        const struct tty_cell *k = cell_at(t, cx, cy);
+        paint_glyph(t, k->ch, cx * TTY_CELL_W, cy * TTY_CELL_H, k->fg, k->bg);
+    }
+    if (pub) publish(t, x0 * TTY_CELL_W, cy * TTY_CELL_H, (x1 - x0) * TTY_CELL_W, TTY_CELL_H);
+}
+
+static const uint32_t ansi[16] = {
+    0x000000, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xC0C0C0,
+    0x666666, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF,
+};
+
+/* The colours new text gets: bold brightens ANSI colours 0-7 (and the
+ * default grey to white), reverse swaps foreground and background. */
+static void cur_colors(const struct kestrel_tty *t, uint32_t *fg, uint32_t *bg)
+{
+    uint32_t f = t->fg;
+    if (t->bold) f = t->fg_low >= 0 ? ansi[t->fg_low + 8] : t->fg == TTY_FG ? 0xFFFFFFu : t->fg;
+    *fg = t->reverse ? t->bg : f;
+    *bg = t->reverse ? f : t->bg;
+}
+
 static void cell_set(struct kestrel_tty *t, int cx, int cy, unsigned char ch)
 {
-    *cell_at(t, cx, cy) = (struct tty_cell){ ch, t->fg, t->bg };
+    struct tty_cell *k = cell_at(t, cx, cy);
+    k->ch = ch;
+    cur_colors(t, &k->fg, &k->bg);
     cell_draw(t, cx, cy, false);
+}
+
+/* Blank cells x0..x1-1 of row cy in the current colours (the Linux console
+ * erases with the current background). */
+static void erase_cells(struct kestrel_tty *t, int cy, int x0, int x1, bool pub)
+{
+    if (x0 < 0) x0 = 0;
+    if (x1 > t->max_cols) x1 = t->max_cols;
+    uint32_t fg, bg;
+    cur_colors(t, &fg, &bg);
+    for (int x = x0; x < x1; x++) *cell_at(t, x, cy) = (struct tty_cell){ ' ', fg, bg };
+    paint_cells(t, cy, x0, x1, pub);
 }
 
 /* ======================================================================== */
@@ -174,7 +222,7 @@ static void cursor_hide(struct kestrel_tty *t)
 
 static void cursor_show(struct kestrel_tty *t)
 {
-    if (!t->active || !t->cursor_enabled || t->cursor_visible) return;
+    if (!t->active || !t->cursor_enabled || t->cursor_hidden || t->cursor_visible) return;
     if (t->cursor_col < 0 || t->cursor_col >= t->max_cols || t->cursor_row < 0 || t->cursor_row >= t->max_rows) return;
     t->cursor_drawn_col = t->cursor_col;
     t->cursor_drawn_row = t->cursor_row;
@@ -220,34 +268,32 @@ void tty_cursor_enable(struct kestrel_tty *t, bool on)
 /*  4. text layout                                                             */
 /* ======================================================================== */
 
-static void blank_row(struct kestrel_tty *t, int cy)
+/* Scroll rows top..bot of the scroll region by n rows: n > 0 moves the text
+ * up (new blank rows at the bottom), n < 0 down. Pixels move with the cells;
+ * each scan line is copied separately, so the copy never leaves this
+ * monitor's frame buffer and source and destination never overlap. */
+static void scroll_region(struct kestrel_tty *t, int top, int bot, int n)
 {
-    for (int x = 0; x < t->max_cols; x++) *cell_at(t, x, cy) = (struct tty_cell){ ' ', t->fg, TTY_BG };
-}
-
-static void scroll_locked(struct kestrel_tty *t)
-{
+    int h = bot - top + 1, a = n > 0 ? n : -n;
+    if (!n || h <= 0) return;
+    if (a > h) a = h;
+    if (t->cursor_visible) cursor_hide(t);              /* its pixels move too */
     const size_t row_bytes = (size_t)t->max_cols * TTY_CELL_W * (size_t)t->bytes_pp;
-    const int text_h = t->max_rows * TTY_CELL_H;
-
-    if (t->graphics) goto cells;                /* a graphics client owns the pixels */
-    /* Shift pixel rows 16..text_h-1 of this monitor up to 0..text_h-17. One
-     * scan line per copy: source and destination never overlap, so memcpy is
-     * valid, and with this TTY's own pitch and text size the copy never
-     * leaves this monitor's frame buffer. */
-    for (int py = 0; py < text_h - TTY_CELL_H; py++)
-        memcpy(row_ptr(t, py), row_ptr(t, py + TTY_CELL_H), row_bytes);
-    for (int py = text_h - TTY_CELL_H; py < text_h; py++)        /* bottom text row: black */
-        memset(row_ptr(t, py), 0x00, row_bytes);
-
-cells:
-    memmove(t->cells, t->cells + t->max_cols, sizeof(struct tty_cell) * (size_t)t->max_cols * (size_t)(t->max_rows - 1));
-    blank_row(t, t->max_rows - 1);
-
-    if (t->cursor_visible && t->cursor_drawn_row > 0) t->cursor_drawn_row--;   /* moved with the pixels */
-    else t->cursor_visible = false;
-    t->cursor_row = t->max_rows - 1;
-    if (!t->graphics) publish(t, 0, 0, t->max_cols * TTY_CELL_W, text_h);
+    const size_t cells = sizeof(struct tty_cell) * (size_t)t->max_cols;
+    if (n > 0) {
+        memmove(cell_at(t, 0, top), cell_at(t, 0, top + a), cells * (size_t)(h - a));
+        if (!t->graphics)
+            for (int py = top * TTY_CELL_H; py < (bot + 1 - a) * TTY_CELL_H; py++)
+                memcpy(row_ptr(t, py), row_ptr(t, py + a * TTY_CELL_H), row_bytes);
+        for (int y = bot - a + 1; y <= bot; y++) erase_cells(t, y, 0, t->max_cols, false);
+    } else {
+        memmove(cell_at(t, 0, top + a), cell_at(t, 0, top), cells * (size_t)(h - a));
+        if (!t->graphics)
+            for (int py = (bot + 1) * TTY_CELL_H - 1; py >= (top + a) * TTY_CELL_H; py--)
+                memcpy(row_ptr(t, py), row_ptr(t, py - a * TTY_CELL_H), row_bytes);
+        for (int y = top; y < top + a; y++) erase_cells(t, y, 0, t->max_cols, false);
+    }
+    if (!t->graphics) publish(t, 0, top * TTY_CELL_H, t->max_cols * TTY_CELL_W, h * TTY_CELL_H);
 }
 
 void scroll_screen(struct kestrel_tty *t)
@@ -255,21 +301,47 @@ void scroll_screen(struct kestrel_tty *t)
     if (!t || !t->active) return;
     if (!tty_lock(t)) return;
     cursor_hide(t);
-    scroll_locked(t);
+    scroll_region(t, 0, t->max_rows - 1, 1);
+    t->cursor_row = t->max_rows - 1;
+    t->wrap_pending = false;
     cursor_refresh(t);
     tty_unlock(t);
+}
+
+/* Line feed: down one row, scrolling the region at its bottom margin. */
+static void index_down(struct kestrel_tty *t)
+{
+    t->wrap_pending = false;
+    if (t->cursor_row == t->scroll_bot) scroll_region(t, t->scroll_top, t->scroll_bot, 1);
+    else if (t->cursor_row < t->max_rows - 1) t->cursor_row++;
+}
+
+static void reverse_index(struct kestrel_tty *t)
+{
+    t->wrap_pending = false;
+    if (t->cursor_row == t->scroll_top) scroll_region(t, t->scroll_top, t->scroll_bot, -1);
+    else if (t->cursor_row > 0) t->cursor_row--;
 }
 
 static void newline(struct kestrel_tty *t)
 {
     t->cursor_col = 0;
-    if (++t->cursor_row >= t->max_rows) scroll_locked(t);
+    index_down(t);
 }
 
 static void put_glyph(struct kestrel_tty *t, unsigned char ch)
 {
+    if (t->wrap_pending) newline(t);                    /* deferred wrap, as in xterm */
     cell_set(t, t->cursor_col, t->cursor_row, ch);
-    if (++t->cursor_col >= t->max_cols) newline(t);    /* wrap to the next row */
+    if (t->cursor_col + 1 < t->max_cols) t->cursor_col++;
+    else t->wrap_pending = true;
+}
+
+static void move_to(struct kestrel_tty *t, int col, int row)
+{
+    t->cursor_col = col < 0 ? 0 : col >= t->max_cols ? t->max_cols - 1 : col;
+    t->cursor_row = row < 0 ? 0 : row >= t->max_rows ? t->max_rows - 1 : row;
+    t->wrap_pending = false;
 }
 
 static void clear_locked(struct kestrel_tty *t)
@@ -279,8 +351,10 @@ static void clear_locked(struct kestrel_tty *t)
             memset(row_ptr(t, py), 0x00, (size_t)t->native_width * (size_t)t->bytes_pp);
         publish(t, 0, 0, t->native_width, t->native_height);
     }
-    for (int y = 0; y < t->max_rows; y++) blank_row(t, y);
+    for (int y = 0; y < t->max_rows; y++)
+        for (int x = 0; x < t->max_cols; x++) *cell_at(t, x, y) = (struct tty_cell){ ' ', t->fg, TTY_BG };
     t->cursor_col = t->cursor_row = 0;
+    t->wrap_pending = false;
     t->cursor_visible = false;
 }
 
@@ -293,58 +367,328 @@ void tty_clear(struct kestrel_tty *t)
     tty_unlock(t);
 }
 
-/* ANSI SGR subset: 0 reset, 1 bold (bright), 30-37/90-97 fg, 40-47/100-107
- * bg, 39/49 defaults; also ESC[2J (clear) and ESC[H (home). */
-static const uint32_t ansi[16] = {
-    0x000000, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xC0C0C0,
-    0x666666, 0xF14C4C, 0x23D18B, 0xF5F543, 0x3B8EEA, 0xD670D6, 0x29B8DB, 0xFFFFFF,
-};
+/* ---- escape sequences ------------------------------------------------------ */
+enum { ES_NONE, ES_ESC, ES_CSI, ES_OSC, ES_OSC_ESC, ES_CHARSET };
 
-static void apply_sgr(struct kestrel_tty *t, int v)
+static void reset_locked(struct kestrel_tty *t, bool clear)
 {
-    if (v == 0)                    { t->fg = TTY_FG; t->bg = TTY_BG; }
-    else if (v == 1)               t->fg = t->fg == TTY_FG ? 0xFFFFFF : t->fg;
-    else if (v >= 30 && v <= 37)   t->fg = ansi[v - 30];
-    else if (v >= 90 && v <= 97)   t->fg = ansi[v - 90 + 8];
-    else if (v >= 40 && v <= 47)   t->bg = ansi[v - 40];
-    else if (v >= 100 && v <= 107) t->bg = ansi[v - 100 + 8];
-    else if (v == 39)              t->fg = TTY_FG;
-    else if (v == 49)              t->bg = TTY_BG;
+    t->fg = TTY_FG; t->bg = TTY_BG; t->fg_low = -1;
+    t->bold = t->reverse = false;
+    t->scroll_top = 0; t->scroll_bot = t->max_rows - 1;
+    t->esc_state = ES_NONE;
+    t->utf_left = t->utf_n = 0;
+    t->cursor_hidden = false;
+    t->app_cursor = false;
+    t->wrap_pending = false;
+    t->saved.col = t->saved.row = 0;
+    t->saved.fg = TTY_FG; t->saved.bg = TTY_BG; t->saved.fg_low = -1;
+    t->saved.bold = t->saved.reverse = false;
+    if (clear) clear_locked(t);
 }
 
-static void escape(struct kestrel_tty *t, char ch)
+void tty_reset(struct kestrel_tty *t, bool clear)
 {
-    if (t->esc_state == 1) {
-        if (ch == '[') { t->esc_state = 2; t->esc_n = 0; t->esc_val = -1; return; }
-        t->esc_state = 0;
+    if (!t || !t->active) return;
+    if (!tty_lock(t)) return;
+    cursor_hide(t);
+    reset_locked(t, clear);
+    cursor_refresh(t);
+    tty_unlock(t);
+}
+
+static void save_cursor(struct kestrel_tty *t)
+{
+    t->saved.col = t->cursor_col; t->saved.row = t->cursor_row;
+    t->saved.fg = t->fg; t->saved.bg = t->bg; t->saved.fg_low = t->fg_low;
+    t->saved.bold = t->bold; t->saved.reverse = t->reverse;
+}
+
+static void restore_cursor(struct kestrel_tty *t)
+{
+    move_to(t, t->saved.col, t->saved.row);
+    t->fg = t->saved.fg; t->bg = t->saved.bg; t->fg_low = t->saved.fg_low;
+    t->bold = t->saved.bold; t->reverse = t->saved.reverse;
+}
+
+static void reply(struct kestrel_tty *t, const char *fmt, ...)
+{
+    if (!t->reply) return;
+    char buf[32];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n > 0 && n < (int)sizeof buf) t->reply(t->reply_ctx, buf, (size_t)n);
+}
+
+/* xterm's 256-colour palette: the 16 ANSI colours, a 6x6x6 cube, 24 greys. */
+static uint32_t color256(int i)
+{
+    if (i < 16) return ansi[i];
+    if (i < 232) {
+        static const uint8_t lv[6] = { 0, 95, 135, 175, 215, 255 };
+        i -= 16;
+        return (uint32_t)lv[i / 36] << 16 | (uint32_t)lv[i / 6 % 6] << 8 | lv[i % 6];
+    }
+    uint32_t g = (uint32_t)(8 + 10 * (i - 232));
+    return g << 16 | g << 8 | g;
+}
+
+/* CSI parameter i: missing or 0 gives `def`. */
+static int arg(const struct kestrel_tty *t, int i, int def)
+{
+    int v = i < t->esc_n ? t->esc_args[i] : -1;
+    return v <= 0 ? def : v;
+}
+
+static void sgr(struct kestrel_tty *t)
+{
+    int n = t->esc_n ? t->esc_n : 1;
+    for (int i = 0; i < n; i++) {
+        int v = i < t->esc_n && t->esc_args[i] > 0 ? t->esc_args[i] : 0;
+        if ((v == 38 || v == 48) && i + 1 < t->esc_n) {          /* 38;5;n and 38;2;r;g;b */
+            uint32_t c;
+            if (t->esc_args[i + 1] == 5 && i + 2 < t->esc_n) {
+                c = color256(t->esc_args[i + 2] & 255);
+                i += 2;
+            } else if (t->esc_args[i + 1] == 2 && i + 4 < t->esc_n) {
+                c = (uint32_t)(t->esc_args[i + 2] & 255) << 16 | (uint32_t)(t->esc_args[i + 3] & 255) << 8 |
+                    (uint32_t)(t->esc_args[i + 4] & 255);
+                i += 4;
+            } else {
+                break;
+            }
+            if (v == 38) { t->fg = c; t->fg_low = -1; } else t->bg = c;
+            continue;
+        }
+        if (v == 0)                    { t->fg = TTY_FG; t->bg = TTY_BG; t->fg_low = -1; t->bold = t->reverse = false; }
+        else if (v == 1)               t->bold = true;
+        else if (v == 22)              t->bold = false;
+        else if (v == 7)               t->reverse = true;
+        else if (v == 27)              t->reverse = false;
+        else if (v >= 30 && v <= 37)   { t->fg = ansi[v - 30]; t->fg_low = v - 30; }
+        else if (v >= 90 && v <= 97)   { t->fg = ansi[v - 90 + 8]; t->fg_low = -1; }
+        else if (v >= 40 && v <= 47)   t->bg = ansi[v - 40];
+        else if (v >= 100 && v <= 107) t->bg = ansi[v - 100 + 8];
+        else if (v == 39)              { t->fg = TTY_FG; t->fg_low = -1; }
+        else if (v == 49)              t->bg = TTY_BG;
+        /* 2 dim, 3 italic, 4 underline, 5 blink, 8 hidden...: not shown */
+    }
+}
+
+/* Insert (n > 0) or delete (n < 0) |n| characters at the cursor; the rest
+ * of the row shifts, blanks fill in at the right edge or the cursor. */
+static void shift_row(struct kestrel_tty *t, int n)
+{
+    int col = t->cursor_col, row = t->cursor_row, w = t->max_cols - col, a = n > 0 ? n : -n;
+    if (a > w) a = w;
+    struct tty_cell *r = cell_at(t, 0, row);
+    if (n > 0) {
+        memmove(r + col + a, r + col, sizeof *r * (size_t)(w - a));
+        erase_cells(t, row, col, col + a, false);
+    } else {
+        memmove(r + col, r + col + a, sizeof *r * (size_t)(w - a));
+        erase_cells(t, row, t->max_cols - a, t->max_cols, false);
+    }
+    paint_cells(t, row, col, t->max_cols, true);
+}
+
+static void csi_dispatch(struct kestrel_tty *t, char ch, bool vt)
+{
+    int n1 = arg(t, 0, 1), row = t->cursor_row, col = t->cursor_col;
+    if (t->esc_priv == '?') {                           /* DEC private modes */
+        if (ch != 'h' && ch != 'l') return;
+        for (int i = 0; i < t->esc_n; i++) {
+            if (t->esc_args[i] == 25) t->cursor_hidden = ch == 'l';
+            else if (t->esc_args[i] == 1) t->app_cursor = ch == 'h';
+        }
         return;
     }
-    if (ch >= '0' && ch <= '9') { t->esc_val = (t->esc_val < 0 ? 0 : t->esc_val) * 10 + (ch - '0'); return; }
-    if (ch == ';') { if (t->esc_n < 8) t->esc_args[t->esc_n++] = t->esc_val < 0 ? 0 : t->esc_val; t->esc_val = -1; return; }
-    if (t->esc_n < 8) t->esc_args[t->esc_n++] = t->esc_val < 0 ? 0 : t->esc_val;
-    if (ch == 'm') for (int i = 0; i < t->esc_n; i++) apply_sgr(t, t->esc_args[i]);
-    else if (ch == 'J' && t->esc_args[0] == 2) clear_locked(t);
-    else if (ch == 'H') t->cursor_col = t->cursor_row = 0;
-    t->esc_state = 0;
+    if (t->esc_priv) return;                            /* ESC[>c and friends */
+    switch (ch) {
+    case 'A': move_to(t, col, row - n1); break;
+    case 'B': case 'e': move_to(t, col, row + n1); break;
+    case 'C': case 'a': move_to(t, col + n1, row); break;
+    case 'D': move_to(t, col - n1, row); break;
+    case 'E': move_to(t, 0, row + n1); break;
+    case 'F': move_to(t, 0, row - n1); break;
+    case 'G': case '`': move_to(t, n1 - 1, row); break;
+    case 'd': move_to(t, col, n1 - 1); break;
+    case 'H': case 'f': move_to(t, arg(t, 1, 1) - 1, n1 - 1); break;
+    case 'J': {
+        int m = arg(t, 0, 0);
+        if (m == 2 && !vt) { clear_locked(t); break; }  /* kernel writers: clear and home */
+        if (m == 0) {
+            erase_cells(t, row, col, t->max_cols, true);
+            for (int y = row + 1; y < t->max_rows; y++) erase_cells(t, y, 0, t->max_cols, true);
+        } else if (m == 1) {
+            for (int y = 0; y < row; y++) erase_cells(t, y, 0, t->max_cols, true);
+            erase_cells(t, row, 0, col + 1, true);
+        } else {
+            for (int y = 0; y < t->max_rows; y++) erase_cells(t, y, 0, t->max_cols, true);
+        }
+        break;
+    }
+    case 'K': {
+        int m = arg(t, 0, 0);
+        erase_cells(t, row, m == 0 ? col : 0, m == 1 ? col + 1 : t->max_cols, true);
+        break;
+    }
+    case 'L': if (row >= t->scroll_top && row <= t->scroll_bot) scroll_region(t, row, t->scroll_bot, -n1); break;
+    case 'M': if (row >= t->scroll_top && row <= t->scroll_bot) scroll_region(t, row, t->scroll_bot, n1); break;
+    case '@': shift_row(t, n1); break;
+    case 'P': shift_row(t, -n1); break;
+    case 'X': erase_cells(t, row, col, col + n1, true); break;
+    case 'm': sgr(t); break;
+    case 'n':
+        if (arg(t, 0, 0) == 5) reply(t, "\033[0n");
+        else if (arg(t, 0, 0) == 6) reply(t, "\033[%d;%dR", row + 1, col + 1);
+        break;
+    case 'c': reply(t, "\033[?6c"); break;               /* "VT102", like the Linux console */
+    case 'r': {
+        int top = n1 - 1, bot = arg(t, 1, t->max_rows) - 1;
+        if (bot >= t->max_rows) bot = t->max_rows - 1;
+        if (top < bot) { t->scroll_top = top; t->scroll_bot = bot; move_to(t, 0, 0); }
+        break;
+    }
+    case 's': save_cursor(t); break;
+    case 'u': restore_cursor(t); break;
+    default: break;                                     /* modes, LEDs, ...: ignored */
+    }
 }
 
-static void putc_locked(struct kestrel_tty *t, char c)
+static void esc_dispatch(struct kestrel_tty *t, char ch)
+{
+    t->esc_state = ES_NONE;
+    switch (ch) {
+    case '[': t->esc_state = ES_CSI; t->esc_n = 0; t->esc_val = -1; t->esc_priv = 0; break;
+    case ']': t->esc_state = ES_OSC; break;             /* window title etc.: skipped */
+    case '(': case ')': case '*': case '+': t->esc_state = ES_CHARSET; break;
+    case '7': save_cursor(t); break;
+    case '8': restore_cursor(t); break;
+    case 'c': reset_locked(t, true); break;
+    case 'D': index_down(t); break;
+    case 'E': newline(t); break;
+    case 'M': reverse_index(t); break;
+    default: break;                                     /* ESC = / ESC > (keypad) and others */
+    }
+}
+
+static void csi_char(struct kestrel_tty *t, char ch, bool vt)
+{
+    if (ch >= '0' && ch <= '9') {
+        if (t->esc_val < 0) t->esc_val = 0;
+        if (t->esc_val < 100000) t->esc_val = t->esc_val * 10 + (ch - '0');
+        return;
+    }
+    if (ch == ';' || ch == ':') {
+        if (t->esc_n < 16) t->esc_args[t->esc_n++] = t->esc_val;
+        t->esc_val = -1;
+        return;
+    }
+    if (ch >= 0x3C && ch <= 0x3F) { if (!t->esc_n && t->esc_val < 0) t->esc_priv = ch; return; }
+    if (ch >= 0x20 && ch <= 0x2F) return;               /* intermediate bytes: ignored */
+    if (t->esc_n < 16 && (t->esc_val >= 0 || t->esc_n)) t->esc_args[t->esc_n++] = t->esc_val;
+    t->esc_state = ES_NONE;
+    csi_dispatch(t, ch, vt);
+}
+
+/* ---- characters -------------------------------------------------------------- */
+/* Code point -> glyph of the Windows-1252 font. */
+static unsigned char unicode_glyph(uint32_t cp)
+{
+    static const uint16_t w1252[32] = {
+        0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+        0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178,
+    };
+    if ((cp >= 0x20 && cp < 0x7F) || (cp >= 0xA0 && cp <= 0xFF)) return (unsigned char)cp;
+    for (int i = 0; i < 32; i++) if (w1252[i] && w1252[i] == cp) return (unsigned char)(0x80 + i);
+    /* look-alikes for what the font does not have */
+    switch (cp) {
+    case 0x2500: case 0x2501: case 0x2504: case 0x2505: case 0x2508: case 0x2509:
+    case 0x254C: case 0x254D: case 0x2550: case 0x2010: case 0x2011: case 0x2012: case 0x2015: case 0x2212:
+        return '-';
+    case 0x2502: case 0x2503: case 0x2506: case 0x2507: case 0x250A: case 0x250B:
+    case 0x254E: case 0x254F: case 0x2551:
+        return '|';
+    case 0x2190: return '<';
+    case 0x2192: return '>';
+    case 0x2191: return '^';
+    case 0x2193: return 'v';
+    case 0x25CF: case 0x2219: return 0x95;              /* bullet */
+    case 0x2588: case 0x2591: case 0x2592: case 0x2593: return '#';
+    }
+    if (cp >= 0x2500 && cp <= 0x257F) return '+';       /* corners and junctions */
+    return '?';
+}
+
+/* A UTF-8 sequence broken off by another byte: show its bytes as they are. */
+static void utf_flush(struct kestrel_tty *t)
+{
+    for (int i = 0; i < t->utf_n; i++) put_glyph(t, t->utf_raw[i]);
+    t->utf_n = t->utf_left = 0;
+}
+
+static void putc_locked(struct kestrel_tty *t, char c, bool vt)
 {
     unsigned char ch = (unsigned char)c;
-    if (t->esc_state) { escape(t, c); return; }
-    switch (ch) {
-    case 0x1B: t->esc_state = 1; return;
-    case '\n': newline(t); return;
-    case '\r': t->cursor_col = 0; return;
-    case '\t': do put_glyph(t, ' '); while (t->cursor_col % 8 && t->cursor_col != 0); return;
-    case '\b':                                  /* non-destructive, like a VT100 */
-        if (t->cursor_col > 0) t->cursor_col--;
-        else if (t->cursor_row > 0) { t->cursor_row--; t->cursor_col = t->max_cols - 1; }
-        return;
-    case 0x07: case 0x00: return;               /* bell, NUL */
+    if (t->utf_left) {
+        if ((ch & 0xC0) == 0x80) {
+            t->utf_raw[t->utf_n++] = ch;
+            t->utf_cp = t->utf_cp << 6 | (ch & 0x3Fu);
+            if (--t->utf_left == 0) { t->utf_n = 0; put_glyph(t, unicode_glyph(t->utf_cp)); }
+            return;
+        }
+        utf_flush(t);
     }
-    if (ch < 0x20 || ch == 0x7F) return;        /* other control codes: ignore */
-    put_glyph(t, ch);                           /* 0x20-0x7E and 0x80-0xFF glyphs */
+    if (t->esc_state == ES_OSC || t->esc_state == ES_OSC_ESC) {   /* until BEL or ESC \ */
+        if (ch == 0x07) { t->esc_state = ES_NONE; return; }
+        if (t->esc_state == ES_OSC_ESC) {
+            t->esc_state = ES_NONE;
+            if (ch != '\\') esc_dispatch(t, c);
+            return;
+        }
+        if (ch == 0x1B) t->esc_state = ES_OSC_ESC;
+        return;
+    }
+    if (ch >= 0x80) {
+        t->esc_state = ES_NONE;
+        if (ch >= 0xC2 && ch <= 0xF4) {                 /* start of a UTF-8 sequence */
+            t->utf_left = ch >= 0xF0 ? 3 : ch >= 0xE0 ? 2 : 1;
+            t->utf_cp = ch & (0x3Fu >> t->utf_left);
+            t->utf_raw[0] = ch;
+            t->utf_n = 1;
+            return;
+        }
+        put_glyph(t, ch);                               /* not UTF-8: the byte's own glyph */
+        return;
+    }
+    if (ch < 0x20 || ch == 0x7F) {                      /* control characters act even inside a sequence */
+        switch (ch) {
+        case 0x1B: t->esc_state = ES_ESC; return;
+        case 0x18: case 0x1A: t->esc_state = ES_NONE; return;   /* CAN, SUB */
+        case '\n': case 0x0B: case 0x0C:
+            if (vt) index_down(t); else newline(t);
+            return;
+        case '\r': t->cursor_col = 0; t->wrap_pending = false; return;
+        case '\t':
+            t->wrap_pending = false;
+            t->cursor_col = (t->cursor_col / 8 + 1) * 8;
+            if (t->cursor_col >= t->max_cols) t->cursor_col = t->max_cols - 1;
+            return;
+        case '\b':
+            if (t->wrap_pending) t->wrap_pending = false;
+            else if (t->cursor_col > 0) t->cursor_col--;
+            else if (!vt && t->cursor_row > 0) { t->cursor_row--; t->cursor_col = t->max_cols - 1; }
+            return;
+        default: return;                                /* BEL, NUL, SO/SI, DEL, ... */
+        }
+    }
+    switch (t->esc_state) {
+    case ES_ESC:     esc_dispatch(t, c); return;
+    case ES_CSI:     csi_char(t, c, vt); return;
+    case ES_CHARSET: t->esc_state = ES_NONE; return;
+    default:         put_glyph(t, ch); return;
+    }
 }
 
 void tty_putc(struct kestrel_tty *t, char c)
@@ -352,7 +696,7 @@ void tty_putc(struct kestrel_tty *t, char c)
     if (!t || !t->active) return;
     if (!tty_lock(t)) return;
     cursor_hide(t);
-    putc_locked(t, c);
+    putc_locked(t, c, false);
     cursor_refresh(t);
     tty_unlock(t);
 }
@@ -367,19 +711,22 @@ void tty_put_glyph(struct kestrel_tty *t, unsigned char c)
     tty_unlock(t);
 }
 
-void tty_write(struct kestrel_tty *t, const char *s, size_t n)
+static void write_common(struct kestrel_tty *t, const char *s, size_t n, bool vt)
 {
     if (!t || !t->active || !s) return;
     while (n) {
         size_t chunk = n < 256 ? n : 256;       /* let other writers of this TTY in between */
         if (!tty_lock(t)) return;               /* busy, and we cannot wait (IRQ context) */
         cursor_hide(t);
-        for (size_t i = 0; i < chunk; i++) putc_locked(t, s[i]);
+        for (size_t i = 0; i < chunk; i++) putc_locked(t, s[i], vt);
         cursor_refresh(t);
         tty_unlock(t);
         s += chunk; n -= chunk;
     }
 }
+
+void tty_write(struct kestrel_tty *t, const char *s, size_t n) { write_common(t, s, n, false); }
+void tty_write_vt(struct kestrel_tty *t, const char *s, size_t n) { write_common(t, s, n, true); }
 
 void tty_puts(struct kestrel_tty *t, const char *s) { if (s) tty_write(t, s, strlen(s)); }
 
@@ -393,7 +740,7 @@ void tty_printf(struct kestrel_tty *t, const char *fmt, ...)
     tty_write(t, buf, (size_t)n < sizeof buf ? (size_t)n : sizeof buf - 1);
 }
 
-void tty_set_color(struct kestrel_tty *t, uint32_t fg, uint32_t bg) { if (t) { t->fg = fg; t->bg = bg; } }
+void tty_set_color(struct kestrel_tty *t, uint32_t fg, uint32_t bg) { if (t) { t->fg = fg; t->bg = bg; t->fg_low = -1; } }
 
 /* Line-editor backspace: move left (wrapping back over a line break) and
  * overwrite that cell with a blank in the background colour. */
@@ -402,7 +749,8 @@ void tty_backspace(struct kestrel_tty *t)
     if (!t || !t->active) return;
     if (!tty_lock(t)) return;
     cursor_hide(t);
-    if (t->cursor_col > 0) t->cursor_col--;
+    if (t->wrap_pending) t->wrap_pending = false;       /* the last column itself */
+    else if (t->cursor_col > 0) t->cursor_col--;
     else if (t->cursor_row > 0) { t->cursor_row--; t->cursor_col = t->max_cols - 1; }
     cell_set(t, t->cursor_col, t->cursor_row, ' ');
     cursor_refresh(t);
@@ -566,6 +914,9 @@ static bool tty_setup(struct kestrel_tty *t, int index, const struct display_hea
     if (!t->cells) return false;
     t->fg = TTY_FG;
     t->bg = TTY_BG;
+    t->fg_low = -1;
+    t->scroll_bot = t->max_rows - 1;
+    t->saved.fg = TTY_FG; t->saved.bg = TTY_BG; t->saved.fg_low = -1;
     t->cursor_enabled = true;
     t->active = true;
     return true;

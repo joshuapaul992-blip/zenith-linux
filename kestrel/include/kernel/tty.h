@@ -11,6 +11,9 @@
  *   rendering   draw_char(tty, ...)           one 8 x 16 glyph cell
  *               scroll_screen(tty)            shift this monitor's text up
  *   layout      tty_putc / tty_write / ...    cursor, wrapping, ANSI colours
+ *               tty_write_vt()                a terminal program's output: the
+ *                                             Linux console's escape codes,
+ *                                             UTF-8 (see "Terminal" below)
  *   cursor      tty_cursor_tick()             timer IRQ: blinks every TTY at
  *                                             its own cell, on its own phase
  *   input       tty_hotkey()                  keyboard ISR: Ctrl+Alt+Fn moves
@@ -30,7 +33,24 @@
  * (try-lock) and keeps blinking every other monitor, and the scheduler keeps
  * switching between the shells. Callers that run with interrupts disabled
  * (interrupt handlers, the kernel log from them) only try the lock and skip a
- * busy TTY, since its holder cannot run until they return. */
+ * busy TTY, since its holder cannot run until they return.
+ *
+ * Terminal: the console's shells run on a pty whose output is drawn with
+ * tty_write_vt() (vt.c). That interprets the Linux console subset of
+ * ECMA-48 (TERM=linux): cursor movement and addressing, erase in line and
+ * display, insert/delete characters and lines, scroll regions, save/restore
+ * cursor, SGR (bold, reverse, 8/16/256 colours and 24-bit colour), cursor
+ * show/hide, application cursor keys, and the status and cursor-position
+ * reports (answered through the `reply` hook). Lines wrap the way xterm and
+ * the Linux console do: a character in the last column leaves the cursor
+ * there, and the next printable character moves to the next line first.
+ * Text is UTF-8; code points the font has (Windows-1252, i.e. Latin-1 plus
+ * the curly quotes, dashes, euro sign and so on) use their glyph, and box
+ * drawing and arrows get a look-alike. A byte that is not valid UTF-8 shows
+ * its own Windows-1252 glyph, so 8-bit text still reads. tty_write() (the
+ * kernel log, kush) uses the same parser, except that a newline also returns
+ * the carriage, Backspace at the start of a row goes back to the end of the
+ * row above, and ESC[2J also homes the cursor. */
 #ifndef KESTREL_TTY_H
 #define KESTREL_TTY_H
 
@@ -73,11 +93,27 @@ struct kestrel_tty {
     int       cursor_col, cursor_row;   /* where the next character goes            */
     struct tty_cell *cells;             /* max_rows x max_cols shadow of the text   */
     uint32_t  fg, bg;                   /* current colours                          */
-    int       esc_state, esc_val, esc_n, esc_args[8];
+    int       fg_low;                   /* fg is ANSI colour 0-7 (bold brightens it), else -1 */
+    bool      bold, reverse;            /* SGR 1 and 7                              */
+    bool      wrap_pending;             /* last column written: wrap before the next */
+    int       scroll_top, scroll_bot;   /* scroll region (rows, inclusive)          */
+    int       esc_state, esc_val, esc_n, esc_args[16];
+    char      esc_priv;                 /* CSI private marker ('?', '>', ...)       */
+    uint32_t  utf_cp;                   /* UTF-8 decoder: code point so far          */
+    int       utf_left, utf_n;          /* continuation bytes still due / seen       */
+    uint8_t   utf_raw[4];               /* the sequence's bytes, for a broken one    */
+    struct { int col, row, fg_low; uint32_t fg, bg; bool bold, reverse; } saved;   /* ESC 7 */
+    bool      app_cursor;               /* DECCKM: cursor keys send ESC O x          */
+    /* Answers to the status and cursor-position reports (ESC[5n, ESC[6n,
+     * ESC[c) go to the terminal's input; NULL: not answered. Called with
+     * the TTY locked. */
+    void    (*reply)(void *ctx, const char *s, size_t n);
+    void     *reply_ctx;
 
     /* ---- cursor -------------------------------------------------------- */
     bool      cursor_visible;           /* blink phase: block is on screen now      */
     bool      cursor_enabled;
+    bool      cursor_hidden;            /* ESC[?25l from the program on it          */
     int       cursor_drawn_col, cursor_drawn_row;
     uint64_t  next_blink;               /* uptime_ms() of the next toggle           */
 
@@ -122,6 +158,12 @@ void scroll_screen(struct kestrel_tty *t);
 void tty_putc(struct kestrel_tty *t, char c);           /* \n \r \t \b ESC[...m ESC[2J ESC[H */
 void tty_put_glyph(struct kestrel_tty *t, unsigned char c);
 void tty_write(struct kestrel_tty *t, const char *s, size_t n);
+/* Output of a program on a terminal (a console pty): pure line feed, no
+ * reverse wrap; see "Terminal" above. */
+void tty_write_vt(struct kestrel_tty *t, const char *s, size_t n);
+/* Back to the power-on state: colours, scroll region, cursor shown, parser
+ * idle; the text stays unless `clear`. */
+void tty_reset(struct kestrel_tty *t, bool clear);
 void tty_puts(struct kestrel_tty *t, const char *s);
 void tty_printf(struct kestrel_tty *t, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 void tty_set_color(struct kestrel_tty *t, uint32_t fg, uint32_t bg);

@@ -6,6 +6,8 @@
 #   bin/xterm                         the terminal emulator (static-PIE, musl)
 #   share/X11/app-defaults/XTerm      its resources (menus, key bindings)
 #   share/terminfo/x/xterm*           terminal descriptions (TERMINFO points here)
+#   share/terminfo/l/linux            the text console's (TERM=linux), for
+#                                     ncurses programs run there
 #
 # XTERM_SRC  an unpacked xterm release (Ubuntu's xterm_390.orig.tar.gz);
 #            patches/*.patch are applied to it
@@ -67,7 +69,7 @@ echo "  BUILD   xterm"
 make -j"${MAKEJ:-8}" >>"$BUILD/xterm.log" 2>&1 || { grep -E "error|undefined" "$BUILD/xterm.log" | head -20; exit 1; }
 
 rm -rf "$ROOT"
-mkdir -p "$ROOT/bin" "$ROOT/share/X11/app-defaults" "$ROOT/share/terminfo/x"
+mkdir -p "$ROOT/bin" "$ROOT/share/X11/app-defaults" "$ROOT/share/terminfo/x" "$ROOT/share/terminfo/l"
 strip -o "$ROOT/bin/xterm" "$OUT/xterm"
 cp "$SRC/XTerm.ad" "$ROOT/share/X11/app-defaults/XTerm"
 TI=$(for d in /usr/share/terminfo /lib/terminfo /etc/terminfo; do [ -f "$d/x/xterm" ] && echo "$d" && break; done)
@@ -75,5 +77,6 @@ TI=$(for d in /usr/share/terminfo /lib/terminfo /etc/terminfo; do [ -f "$d/x/xte
 for t in xterm xterm-256color xterm-color xterm-new; do
     [ -f "$TI/x/$t" ] && cp -L "$TI/x/$t" "$ROOT/share/terminfo/x/$t"
 done
+[ -f "$TI/l/linux" ] && cp -L "$TI/l/linux" "$ROOT/share/terminfo/l/linux"
 touch "$ROOT/.stamp"
 echo "xterm: installed into $ROOT"

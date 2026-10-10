@@ -17,6 +17,11 @@
  * the keyboard signals (VINTR, VQUIT, VSUSP) for its foreground process
  * group, SIGWINCH on TIOCSWINSZ, and SIGHUP when the master closes.
  *
+ * Console ptys (pty_console_*) are the text terminals' line discipline: the
+ * kernel holds the master for good (kernel/vt.c feeds it keys and draws its
+ * output) and the slave is /dev/ttyN itself. Its sessions end with
+ * pty_console_hangup() instead of a master close.
+ *
  * Locking: single CPU, interrupts off around queue updates. */
 #include <kernel/vfs.h>
 #include <kernel/task.h>
@@ -41,6 +46,8 @@ struct pty {
     int      index;
     int      masters, slaves;       /* open files on each side                */
     bool     slave_seen;            /* a slave was opened (master reads EIO after) */
+    bool     console;               /* master held by the kernel (vt.c)        */
+    struct vnode *slave_vn;         /* the slave's node: /dev/pts/N, or /dev/ttyN */
     struct ktermios tio;
     struct kwinsize ws;
     int      session, fg_pgrp;      /* controlling tty of this session        */
@@ -63,6 +70,7 @@ static struct vnode *pts_nodes[PTY_MAX];
 static const struct vnode_ops master_ops, slave_ops;
 
 static bool canon(const struct pty *p) { return p->tio.c_lflag & TL_ICANON; }
+static struct vnode *slave_node(const struct pty *p) { return p->slave_vn ? p->slave_vn : pts_nodes[p->index]; }
 
 /* ---- queues ------------------------------------------------------------- */
 static void out_put(struct pty *p, uint8_t c)
@@ -284,14 +292,13 @@ static struct pty *pty_of(struct file *f)
 }
 
 /* ---- master side ----------------------------------------------------------- */
-static ssize_t master_read(struct file *f, void *buf, size_t len)
+static ssize_t out_read(struct pty *p, void *buf, size_t len, bool nonblock)
 {
-    struct pty *p = pty_of(f);
     if (!len) return 0;
     uint64_t fl = irq_save();
     while (!p->out_count) {
-        if (p->slave_seen && !p->slaves) { irq_restore(fl); return -EIO; }   /* slave side closed */
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
+        if (!p->console && p->slave_seen && !p->slaves) { irq_restore(fl); return -EIO; }   /* slave side closed */
+        if (nonblock) { irq_restore(fl); return -EAGAIN; }
         if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(&p->out);
     }
@@ -304,14 +311,18 @@ static ssize_t master_read(struct file *f, void *buf, size_t len)
     return (ssize_t)n;
 }
 
-static ssize_t master_write(struct file *f, const void *buf, size_t len)
+static ssize_t master_read(struct file *f, void *buf, size_t len)
 {
-    struct pty *p = pty_of(f);
+    return out_read(pty_of(f), buf, len, f->flags & O_NONBLOCK);
+}
+
+static ssize_t in_write(struct pty *p, const void *buf, size_t len, bool nonblock)
+{
     uint64_t fl = irq_save();
     size_t done = 0;
     while (done < len) {
         if (!canon(p) && p->in_count >= IN_BUF) {      /* canonical input is dropped when full */
-            if (f->flags & O_NONBLOCK) break;
+            if (nonblock) break;
             if (signal_pending()) { irq_restore(fl); return done ? (ssize_t)done : -ERESTARTSYS; }
             sleep_on(&p->in);
             continue;
@@ -322,6 +333,11 @@ static ssize_t master_write(struct file *f, const void *buf, size_t len)
     wakeup(&p->out);                                    /* echo for master readers */
     irq_restore(fl);
     return done ? (ssize_t)done : -EAGAIN;
+}
+
+static ssize_t master_write(struct file *f, const void *buf, size_t len)
+{
+    return in_write(pty_of(f), buf, len, f->flags & O_NONBLOCK);
 }
 
 static int master_poll(struct file *f, int events)
@@ -565,11 +581,64 @@ int pty_open_ctty(int flags, struct file **out)
     if (!t->ctty || t->ctty > PTY_MAX) return -ENXIO;
     struct pty *p = &ptys[t->ctty - 1];
     if (!p->used || !p->masters) return -EIO;
-    struct file *f = vfs_file_new(pts_nodes[p->index], flags);
+    struct file *f = vfs_file_new(slave_node(p), flags);
     if (!f) return -ENOMEM;
     p->slaves++;
     *out = f;
     return 0;
+}
+
+/* ---- console ptys (kernel/vt.c) ------------------------------------------ */
+int pty_console_create(struct vnode *tty_node, int rows, int cols)
+{
+    uint64_t fl = irq_save();
+    struct pty *p = NULL;
+    for (int i = PTY_MAX - 1; i >= 0; i--) if (!ptys[i].used) { p = &ptys[i]; break; }   /* /dev/pts/0 stays for xterm */
+    if (!p) { irq_restore(fl); return -ENOSPC; }
+    int idx = (int)(p - ptys);
+    memset(p, 0, __builtin_offsetof(struct pty, master_vn));
+    p->used = true;
+    p->index = idx;
+    p->console = true;
+    p->masters = 1;                                     /* the kernel's, never closed */
+    pty_defaults(p);
+    p->ws.ws_row = (uint16_t)rows;
+    p->ws.ws_col = (uint16_t)cols;
+    p->slave_vn = tty_node;
+    tty_node->ops = &slave_ops;                         /* /dev/ttyN is now this pty's slave */
+    tty_node->ctx = (void *)(intptr_t)idx;
+    irq_restore(fl);
+    return idx;
+}
+
+ssize_t pty_console_read(int idx, void *buf, size_t len) { return out_read(&ptys[idx], buf, len, false); }
+
+void pty_console_input(int idx, const void *buf, size_t len) { in_write(&ptys[idx], buf, len, false); }
+
+/* The session on a console ended: hang it up like a closed master would,
+ * then make the pty as good as new for the next one (the window size stays). */
+void pty_console_hangup(int idx)
+{
+    struct pty *p = &ptys[idx];
+    uint64_t fl = irq_save();
+    if (p->session) {
+        group_signal(p, SIGHUP);
+        struct tcb *lead = task_find(p->session);
+        if (lead && lead->state != TASK_ZOMBIE && lead->user) signal_send(lead, SIGHUP);
+    }
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = task_slot(i);
+        if (t->state != TASK_UNUSED && t->ctty == idx + 1) t->ctty = 0;
+    }
+    struct kwinsize ws = p->ws;
+    pty_defaults(p);
+    p->ws = ws;
+    p->session = p->fg_pgrp = 0;
+    p->slave_seen = false;
+    flush_input(p);
+    wakeup(&p->in);
+    wakeup(&p->out);
+    irq_restore(fl);
 }
 
 void pty_init(struct vnode *devroot)

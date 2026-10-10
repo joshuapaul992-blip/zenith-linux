@@ -14,6 +14,7 @@
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/time.h>
+#include <kernel/termios.h>
 
 extern void enter_user(uint64_t rip, uint64_t rsp) __attribute__((noreturn));
 
@@ -63,6 +64,7 @@ struct elf64_phdr {
 struct spawn_args {
     char  path[128];
     char  stdio[32];            /* device for fds 0-2 ("" = the caller's TTY) */
+    bool  ctty;                 /* stdio is a terminal: make it the controlling one */
     int   argc;
     char *argv[EXEC_MAX_ARGS];
 };
@@ -280,13 +282,18 @@ static int process_main(void *arg)
     irq_restore(f);
 
     static char *const envp[] = { "PATH=/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0", "SHELL=/bin/sh" };
+    static char *const console_envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", "SHELL=/bin/sh", "USER=root",
+                                           "LOGNAME=root" };
     struct exec_args ea = { a->argc, (int)(sizeof envp / sizeof *envp), a->argv, (char **)envp };
+    if (a->ctty) { ea.envc = (int)(sizeof console_envp / sizeof *console_envp); ea.envp = (char **)console_envp; }
     uint64_t entry = 0, sp = 0;
     if (exec_load_image(t, a->path, &ea, &entry, &sp) < 0) {
         kfree(a);
         return 127;
     }
     open_stdio(t, a->stdio);
+    if (a->ctty && t->fds[0] && t->fds[0]->vn->ops->fioctl)    /* a new session leader takes it */
+        t->fds[0]->vn->ops->fioctl(t->fds[0], TIOCSCTTY, 0);
     kprintf("exec: pid %d: %s entry %lx, stack %lx, brk %lx, %lu user pages\n", t->pid, a->path, entry, sp, t->brk,
             uvm_pages(pml4));
     strlcpy(t->exe, a->path, sizeof t->exe);
@@ -309,7 +316,7 @@ int exec_wait(int pid) { return task_wait(pid); }
 
 int exec_spawn(const char *path, int argc, char *const argv[]) { return exec_spawn_io(path, argc, argv, NULL); }
 
-int exec_spawn_io(const char *path, int argc, char *const argv[], const char *stdio)
+static int spawn(const char *path, int argc, char *const argv[], const char *stdio, bool ctty)
 {
     if (!path || argc < 1 || argc > EXEC_MAX_ARGS) return -EINVAL;
     struct stat st;
@@ -318,6 +325,7 @@ int exec_spawn_io(const char *path, int argc, char *const argv[], const char *st
     if (!a) return -ENOMEM;
     strlcpy(a->path, path, sizeof a->path);
     if (stdio) strlcpy(a->stdio, stdio, sizeof a->stdio);
+    a->ctty = ctty;
     a->argc = argc;
     for (int i = 0; i < argc; i++) {
         a->argv[i] = kstrdup(argv[i]);
@@ -327,4 +335,14 @@ int exec_spawn_io(const char *path, int argc, char *const argv[], const char *st
     struct tcb *t = task_create(name, process_main, a);
     if (!t) { for (int i = 0; i < argc; i++) kfree(a->argv[i]); kfree(a); return -EAGAIN; }
     return t->pid;
+}
+
+int exec_spawn_io(const char *path, int argc, char *const argv[], const char *stdio)
+{
+    return spawn(path, argc, argv, stdio, false);
+}
+
+int exec_spawn_tty(const char *path, int argc, char *const argv[], const char *tty)
+{
+    return spawn(path, argc, argv, tty, true);
 }

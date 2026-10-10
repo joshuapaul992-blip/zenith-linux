@@ -666,6 +666,12 @@ void vfs_init(void)
         "devfs    /dev          devfs    rw,nocreate\n"
         "proc     /proc         procfs   ro\n"
         "sysfs    /sys          sysfs    ro\n");
+    ramfs_write_file("/etc/profile",
+        "# /etc/profile -- read by the login shells on the text terminals (kernel/vt.c)\n"
+        "PS1='\\[\\e[92m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[94m\\]\\w\\[\\e[0m\\]\\$ '\n"
+        "export PS1\n"
+        "cd \"$HOME\" 2>/dev/null\n"
+        "echo \"$(uname -sr) on $(tty). Ctrl+Alt+F1..F12: other monitors; startx: the desktop.\"\n");
     ramfs_write_file("/etc/motd",
         "Welcome to Kestrel -- a freestanding x86_64 POSIX-style kernel.\n"
         "Everything above was read through open/read/getdents64 system calls.\n");

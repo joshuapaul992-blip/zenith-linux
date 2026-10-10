@@ -139,6 +139,12 @@ void devfs_init(const char *mountpoint);
 /* fs/pty.c: /dev/ptmx and /dev/pts/N (created by devfs_init) */
 void          pty_init(struct vnode *devroot);
 int           pty_open_ctty(int flags, struct file **out);    /* /dev/tty of a pty session */
+/* Console ptys (kernel/vt.c): the kernel holds the master; `tty_node`
+ * (/dev/ttyN) becomes the slave. Returns the pty index or -errno. */
+int           pty_console_create(struct vnode *tty_node, int rows, int cols);
+ssize_t       pty_console_read(int idx, void *buf, size_t len);         /* output, blocks */
+void          pty_console_input(int idx, const void *buf, size_t len);  /* typed bytes */
+void          pty_console_hangup(int idx);      /* session over: SIGHUP, fresh termios */
 
 struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
                              const struct vnode_ops *ops, void *ctx);
