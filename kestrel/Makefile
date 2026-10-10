@@ -12,6 +12,7 @@
 #  make xlibre       build the X server for Kestrel (see ports/xlibre/build.sh)
 #  make icewm        build the IceWM window manager (see ports/icewm/build.sh)
 #  make busybox      build BusyBox: /bin/sh and tools (see ports/busybox/build.sh)
+#  make xterm        build xterm (see ports/xterm/build.sh)
 #  make debug        QEMU halted with a gdb stub on :1234
 #  make check        verify the Multiboot2 header with grub-file
 #  make fonts        regenerate drivers/font_*.c from the BDF sources
@@ -96,7 +97,7 @@ QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
 #   make iso KERNEL_CMDLINE="ahci.selftest=rw ahci.verify=5"
 KERNEL_CMDLINE ?=
 
-.PHONY: FORCE xlibre icewm busybox all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
+.PHONY: FORCE xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts clean distclean
 
 all: $(KERNEL)
 
@@ -215,8 +216,16 @@ busybox:
 	@test -n "$(BUSYBOX_SRC)" || { echo "usage: make busybox BUSYBOX_SRC=<unpacked busybox release>"; exit 1; }
 	@ports/busybox/build.sh $(BUSYBOX_SRC) $(BUILD)
 
+# xterm (ports/xterm), after the X libraries:
+#   make xterm XTERM_SRC=<unpacked xterm release>
+XTERM_SRC  ?=
+XTERM_ROOT := $(BUILD)/xterm-root
+xterm:
+	@test -n "$(XTERM_SRC)" || { echo "usage: make xterm XTERM_SRC=<unpacked xterm release>"; exit 1; }
+	@ports/xterm/build.sh $(XTERM_SRC) $(BUILD)
+
 ROOTFS_STAGE := $(BUILD)/rootfs
-$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp)
+$(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) user/shtest.sh $(wildcard $(XLIBRE_ROOT)/.stamp) $(wildcard $(ICEWM_ROOT)/.stamp) $(wildcard $(BUSYBOX_ROOT)/.stamp) $(wildcard $(XTERM_ROOT)/.stamp)
 	@rm -rf $(ROOTFS_STAGE)
 	@mkdir -p $(ROOTFS_STAGE)/bin
 	@cp -r rootfs/. $(ROOTFS_STAGE)/
@@ -225,6 +234,7 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) user/shtest.sh
 	@if [ -f $(XLIBRE_ROOT)/.stamp ]; then cp -r $(XLIBRE_ROOT)/bin $(XLIBRE_ROOT)/share $(ROOTFS_STAGE)/; fi
 	@if [ -f $(ICEWM_ROOT)/.stamp ]; then cp -r $(ICEWM_ROOT)/bin $(ICEWM_ROOT)/share $(ICEWM_ROOT)/etc $(ROOTFS_STAGE)/; fi
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
+	@if [ -f $(XTERM_ROOT)/.stamp ]; then cp -r $(XTERM_ROOT)/bin $(XTERM_ROOT)/share $(ROOTFS_STAGE)/; fi
 	@touch $@
 
 USBIMG := $(BUILD)/kestrel-usb.img

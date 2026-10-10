@@ -14,6 +14,7 @@
 #include <kernel/vfs.h>
 #include <kernel/uvm.h>
 #include <kernel/process.h>
+#include <kernel/time.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp);
 extern void thread_trampoline(void);
@@ -210,11 +211,18 @@ void sched_tick(void)
     if (cur->pid == 0) ticks_idle++;
     else if (cur->user) ticks_user++;
     else ticks_system++;
-    for (int i = 1; i < MAX_TASKS; i++)
+    uint64_t ms = time_ms();
+    for (int i = 1; i < MAX_TASKS; i++) {
         if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_tick <= now) {
             tasks[i].state = TASK_READY;
             need_resched = true;
         }
+        if (tasks[i].alarm_at && ms >= tasks[i].alarm_at && tasks[i].state != TASK_ZOMBIE &&
+            tasks[i].state != TASK_UNUSED) {          /* ITIMER_REAL expired */
+            tasks[i].alarm_at = tasks[i].alarm_every ? ms + tasks[i].alarm_every : 0;
+            signal_send(&tasks[i], SIGALRM);
+        }
+    }
     if (cur->pid == 0) { if (need_resched) schedule(); return; }
     if (preempt && (--cur->quantum <= 0 || need_resched)) schedule();
 }

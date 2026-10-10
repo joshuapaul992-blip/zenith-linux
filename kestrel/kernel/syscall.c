@@ -672,6 +672,170 @@ static int64_t sys_pselect6(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, u
     return do_select(n, rp, wp, ep, tmo);
 }
 
+/* readlink: there are no symbolic links, except /proc/self/exe */
+static int64_t do_readlink(uint64_t path, uint64_t buf, uint64_t len)
+{
+    if (bad_ptr(path)) return -EFAULT;
+    if ((int64_t)len <= 0) return -EINVAL;
+    if (bad_buf(buf, len)) return -EFAULT;
+    const char *p = (const char *)path;
+    struct tcb *t = current_task();
+    if (!strcmp(p, "/proc/self/exe") && t->exe[0]) {
+        size_t n = strlen(t->exe);
+        if (n > len) n = len;
+        memcpy((void *)buf, t->exe, n);                 /* not NUL-terminated, like Linux */
+        return (int64_t)n;
+    }
+    if (!strncmp(p, "/proc/self/fd/", 14)) {            /* ttyname(): the file behind a descriptor */
+        int fd = 0;
+        const char *q = p + 14;
+        if (!*q) return -ENOENT;
+        for (; *q >= '0' && *q <= '9'; q++) fd = fd * 10 + (*q - '0');
+        if (*q) return -ENOENT;
+        struct file **f = fd_slot(fd);
+        if (!f) return -ENOENT;
+        char path[VFS_PATH_MAX];
+        int r = vfs_path_of((*f)->vn, path, sizeof path);
+        if (r < 0) return r;
+        size_t n = strlen(path);
+        if (n > len) n = len;
+        memcpy((void *)buf, path, n);
+        return (int64_t)n;
+    }
+    struct stat st;
+    int r = vfs_stat(p, &st);
+    return r < 0 ? r : -EINVAL;                         /* exists, but is not a link */
+}
+static int64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return do_readlink(path, buf, len); }
+static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint64_t len, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if ((int)dirfd != -100 && !bad_ptr(path) && ((const char *)path)[0] != '/') return -ENOSYS;  /* AT_FDCWD only */
+    return do_readlink(path, buf, len);
+}
+
+/* ITIMER_REAL timers: SIGALRM from the scheduler tick (proc/task.c). */
+struct ktimeval { int64_t sec, usec; };
+static uint64_t tv_ms(const struct ktimeval *tv) { return (uint64_t)tv->sec * 1000 + (uint64_t)(tv->usec + 999) / 1000; }
+static void ms_tv(uint64_t ms, struct ktimeval *tv) { tv->sec = (int64_t)(ms / 1000); tv->usec = (int64_t)(ms % 1000) * 1000; }
+static void timer_get(struct tcb *t, struct ktimeval out[2])
+{
+    uint64_t now = time_ms();
+    ms_tv(t->alarm_every, &out[0]);
+    ms_tv(t->alarm_at > now ? t->alarm_at - now : (t->alarm_at ? 1 : 0), &out[1]);
+}
+static int64_t sys_getitimer(uint64_t which, uint64_t cur, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (which != 0) return -EINVAL;                     /* ITIMER_REAL only */
+    if (bad_buf(cur, 32)) return -EFAULT;
+    timer_get(current_task(), (struct ktimeval *)cur);
+    return 0;
+}
+static int64_t sys_setitimer(uint64_t which, uint64_t nv, uint64_t ov, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    if (which != 0) return -EINVAL;
+    if (nv && bad_buf(nv, 32)) return -EFAULT;
+    if (ov && bad_buf(ov, 32)) return -EFAULT;
+    if (ov) timer_get(t, (struct ktimeval *)ov);
+    if (nv) {
+        const struct ktimeval *v = (const struct ktimeval *)nv;
+        if (v[0].usec < 0 || v[0].usec >= 1000000 || v[1].usec < 0 || v[1].usec >= 1000000) return -EINVAL;
+        uint64_t value = tv_ms(&v[1]);
+        t->alarm_every = tv_ms(&v[0]);
+        t->alarm_at = value ? time_ms() + value : 0;
+    }
+    return 0;
+}
+static int64_t sys_alarm(uint64_t sec, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    uint64_t now = time_ms();
+    int64_t left = t->alarm_at > now ? (int64_t)((t->alarm_at - now + 999) / 1000) : 0;
+    t->alarm_every = 0;
+    t->alarm_at = sec ? now + sec * 1000 : 0;
+    return left;
+}
+
+/* prctl: process names (busybox renames its no-exec applets), and a few
+ * options that are accepted without effect. */
+static int64_t sys_prctl(uint64_t op, uint64_t arg, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct tcb *t = current_task();
+    switch (op) {
+    case 15:                                            /* PR_SET_NAME */
+        if (bad_ptr(arg)) return -EFAULT;
+        strlcpy(t->name, (const char *)arg, 16 < sizeof t->name ? 16 : sizeof t->name);
+        return 0;
+    case 16:                                            /* PR_GET_NAME */
+        if (bad_buf(arg, 16)) return -EFAULT;
+        strlcpy((char *)arg, t->name, 16);
+        return 0;
+    case 1: return 0;                                   /* PR_SET_PDEATHSIG: never sent */
+    case 3: return 1;                                   /* PR_GET_DUMPABLE */
+    case 4: return 0;                                   /* PR_SET_DUMPABLE */
+    default: return -EINVAL;
+    }
+}
+
+/* times/getrusage: a process's CPU time is all counted as user time
+ * (system calls included); children's times are not accumulated. */
+static int64_t sys_times(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (p) {
+        if (bad_buf(p, 32)) return -EFAULT;
+        uint64_t *tms = (uint64_t *)p;
+        tms[0] = current_task()->cpu_ticks * 100 / PIT_HZ;  /* USER_HZ */
+        tms[1] = tms[2] = tms[3] = 0;
+    }
+    return (int64_t)(time_ms() / 10);
+}
+static int64_t sys_getrusage(uint64_t who, uint64_t p, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if ((int64_t)who != 0 && (int64_t)who != -1) return -EINVAL;   /* RUSAGE_SELF, _CHILDREN */
+    if (bad_buf(p, 144)) return -EFAULT;
+    memset((void *)p, 0, 144);
+    if (who == 0) {
+        uint64_t us = current_task()->cpu_ticks * (1000000 / PIT_HZ);
+        ((int64_t *)p)[0] = (int64_t)(us / 1000000);     /* ru_utime */
+        ((int64_t *)p)[1] = (int64_t)(us % 1000000);
+    }
+    return 0;
+}
+
+/* sysinfo(2), Linux x86_64 layout */
+struct ksysinfo {
+    int64_t  uptime;
+    uint64_t loads[3], totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+    uint16_t procs, pad;
+    uint32_t pad2;
+    uint64_t totalhigh, freehigh;
+    uint32_t mem_unit;
+    char     reserved[4];
+};
+static int64_t sys_sysinfo(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    if (bad_buf(p, sizeof(struct ksysinfo))) return -EFAULT;
+    struct ksysinfo *si = (struct ksysinfo *)p;
+    memset(si, 0, sizeof *si);
+    si->uptime = (int64_t)(time_ms() / 1000);
+    si->totalram = pmm_total_bytes();
+    si->freeram = pmm_free_bytes();
+    int n = 0;
+    for (int i = 0; i < MAX_TASKS; i++) if (task_slot(i)->state != TASK_UNUSED) n++;
+    si->procs = (uint16_t)n;
+    si->mem_unit = 1;
+    return 0;
+}
+
 static int64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
@@ -947,6 +1111,54 @@ static int64_t sys_sendfile(uint64_t out_fd, uint64_t in_fd, uint64_t offp, uint
     return total;
 }
 
+/* ---- user and group ids: one uid and one gid per process (real = effective
+ * = saved); root may switch to any id, everyone else only to their own ---- */
+static int64_t set_id(uint32_t *field, int64_t want)
+{
+    struct tcb *t = current_task();
+    if (want == -1) return 0;                           /* "unchanged" */
+    if (want < 0) return -EINVAL;
+    if (t->uid != 0 && (uint32_t)want != *field) return -EPERM;
+    *field = (uint32_t)want;
+    return 0;
+}
+static int64_t sys_setuid(uint64_t id, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return set_id(&current_task()->uid, (int64_t)(int32_t)id); }
+static int64_t sys_setgid(uint64_t id, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return set_id(&current_task()->gid, (int64_t)(int32_t)id); }
+/* setreuid/setresuid (and the gid variants): with one id per process, the
+ * effective id is the one that counts; the others must agree or be -1. */
+static int64_t set_ids(uint32_t *field, int64_t r, int64_t e, int64_t s)
+{
+    int64_t want = e != -1 ? e : r != -1 ? r : s;
+    if ((r != -1 && r != want) || (s != -1 && s != want)) {
+        if (current_task()->uid != 0) return -EPERM;
+    }
+    return set_id(field, want);
+}
+static int64_t sys_setreuid(uint64_t r, uint64_t e, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return set_ids(&current_task()->uid, (int32_t)r, (int32_t)e, -1); }
+static int64_t sys_setregid(uint64_t r, uint64_t e, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return set_ids(&current_task()->gid, (int32_t)r, (int32_t)e, -1); }
+static int64_t sys_setresuid(uint64_t r, uint64_t e, uint64_t sv, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return set_ids(&current_task()->uid, (int32_t)r, (int32_t)e, (int32_t)sv); }
+static int64_t sys_setresgid(uint64_t r, uint64_t e, uint64_t sv, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return set_ids(&current_task()->gid, (int32_t)r, (int32_t)e, (int32_t)sv); }
+static int64_t get_ids(uint32_t v, uint64_t r, uint64_t e, uint64_t sv)
+{
+    if (bad_buf(r, 4) || bad_buf(e, 4) || bad_buf(sv, 4)) return -EFAULT;
+    *(uint32_t *)r = *(uint32_t *)e = *(uint32_t *)sv = v;
+    return 0;
+}
+static int64_t sys_getresuid(uint64_t r, uint64_t e, uint64_t sv, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return get_ids(current_task()->uid, r, e, sv); }
+static int64_t sys_getresgid(uint64_t r, uint64_t e, uint64_t sv, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return get_ids(current_task()->gid, r, e, sv); }
+static int64_t sys_getgroups(uint64_t n, uint64_t list, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)n; (void)list; (void)a3; (void)a4; (void)a5; (void)a6; return 0; }   /* no supplementary groups */
+static int64_t sys_setgroups(uint64_t n, uint64_t list, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)list; (void)a3; (void)a4; (void)a5; (void)a6; return current_task()->uid == 0 || n == 0 ? 0 : -EPERM; }
+
 /* ---- resource limits: fixed by the kernel, reported Linux-style ------------ */
 #define RLIM_INF (~0ull)
 static void rlimit_of(int res, uint64_t out[2])
@@ -1083,6 +1295,16 @@ void syscall_init(void)
     REG(SYS_tkill, sys_tkill);         REG(SYS_tgkill, sys_tgkill);
     REG(SYS_getrlimit, sys_getrlimit); REG(SYS_setrlimit, sys_setrlimit);
     REG(SYS_prlimit64, sys_prlimit64); REG(SYS_sendfile, sys_sendfile);
+    REG(SYS_setuid, sys_setuid);       REG(SYS_setgid, sys_setgid);
+    REG(SYS_setreuid, sys_setreuid);   REG(SYS_setregid, sys_setregid);
+    REG(SYS_setresuid, sys_setresuid); REG(SYS_setresgid, sys_setresgid);
+    REG(SYS_getresuid, sys_getresuid); REG(SYS_getresgid, sys_getresgid);
+    REG(SYS_getgroups, sys_getgroups); REG(SYS_setgroups, sys_setgroups);
+    REG(SYS_readlink, sys_readlink);   REG(SYS_readlinkat, sys_readlinkat);
+    REG(SYS_getitimer, sys_getitimer); REG(SYS_setitimer, sys_setitimer);
+    REG(SYS_alarm, sys_alarm);         REG(SYS_sysinfo, sys_sysinfo);
+    REG(SYS_prctl, sys_prctl);         REG(SYS_times, sys_times);
+    REG(SYS_getrusage, sys_getrusage);
     REG(SYS_wait4, sys_wait4);        REG(SYS_kill, sys_kill);
     REG(SYS_gettimeofday, sys_enosys);
 

@@ -1,6 +1,8 @@
 /* fs/procfs.c -- /proc: process and kernel state, generated on every read */
 #include <kernel/vfs.h>
 #include <kernel/task.h>
+#include <kernel/uvm.h>
+#include <kernel/cpu.h>
 #include <kernel/mm.h>
 #include <kernel/arch.h>
 #include <kernel/string.h>
@@ -152,6 +154,159 @@ static size_t gen_usb(char *buf, size_t cap, void *ctx) { (void)ctx; return usb_
 static size_t gen_partitions(char *buf, size_t cap, void *ctx) { (void)ctx; return blk_proc(buf, cap); }
 static size_t gen_bootvol(char *buf, size_t cap, void *ctx) { (void)ctx; return bootvol_proc(buf, cap); }
 
+/* Load averages are not tracked (0.00); running/total and the last pid are. */
+static size_t gen_loadavg(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    int total = 0, running = 0, last = 0;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = task_slot(i);
+        if (t->state == TASK_UNUSED) continue;
+        total++;
+        if (t->state == TASK_RUNNING || t->state == TASK_READY) running++;
+        if (t->pid > last) last = t->pid;
+    }
+    P("0.00 0.00 0.00 %d/%d %d\n", running, total, last);
+    return n;
+}
+
+/* ---- per-process directories: /proc/PID/{stat,status,cmdline,comm} and
+ * /proc/self -----------------------------------------------------------
+ * A fixed pool of directories (one per task slot is enough) is attached to
+ * /proc for live processes and detached again when they go; nothing is
+ * freed, so a file kept open on a dead process just reads its successor's
+ * data or nothing. The pool entry is the files' ctx; NULL means "self". */
+struct pid_dir {
+    struct vnode *dir;
+    int  pid;
+    bool attached;
+};
+static struct pid_dir pid_dirs[MAX_TASKS];
+static struct vnode *proc_root;
+
+static struct tcb *pid_task(void *ctx)
+{
+    if (!ctx) return current_task();
+    struct pid_dir *d = ctx;
+    struct tcb *t = task_find(d->pid);
+    return t && t->state != TASK_UNUSED ? t : NULL;
+}
+
+static char state_char(const struct tcb *t)
+{
+    switch (t->state) {
+    case TASK_RUNNING: case TASK_READY: return 'R';
+    case TASK_ZOMBIE: return 'Z';
+    default: return 'S';
+    }
+}
+
+static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
+{
+    size_t n = 0;
+    struct tcb *t = pid_task(ctx);
+    if (!t) return 0;
+    uint64_t ticks = t->cpu_ticks * 100 / PIT_HZ;              /* USER_HZ */
+    uint64_t start = t->start_tick * 100 / PIT_HZ;
+    uint64_t pages = t->user && t->pml4 && !t->vm_borrowed ? uvm_pages(t->pml4) : 0;
+    int tty = t->ctty ? (136 << 8) | (t->ctty - 1) : 0;
+    /* pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
+     * majflt cmajflt utime stime cutime cstime priority nice threads
+     * itrealvalue starttime vsize rss ... (52 fields) */
+    P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 1 0 %lu %lu %lu",
+      t->pid, t->name, state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
+      ticks, start, pages * 4096, pages);
+    P(" 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 %d\n", t->exit_code);
+    return n;
+}
+
+static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
+{
+    size_t n = 0;
+    struct tcb *t = pid_task(ctx);
+    if (!t) return 0;
+    static const char *const names[] = { "?", "R (running)", "R (running)", "S (sleeping)", "S (sleeping)",
+                                         "Z (zombie)" };
+    uint64_t pages = t->user && t->pml4 && !t->vm_borrowed ? uvm_pages(t->pml4) : 0;
+    P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
+      t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->pid, t->pid, t->ppid);
+    P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", t->uid, t->uid, t->uid, t->uid,
+      t->gid, t->gid, t->gid, t->gid);
+    if (t->user) P("VmSize:\t%lu kB\nVmRSS:\t%lu kB\n", pages * 4, pages * 4);
+    P("Threads:\t1\nSigPnd:\t%016lx\nSigBlk:\t%016lx\n", t->sig_pending, t->sig_mask);
+    return n;
+}
+
+static size_t gen_pid_cmdline(char *buf, size_t cap, void *ctx)
+{
+    struct tcb *t = pid_task(ctx);
+    if (!t || !t->cmdline_len) return 0;                /* kernel threads: empty, as on Linux */
+    size_t n = t->cmdline_len < cap ? t->cmdline_len : cap;
+    memcpy(buf, t->cmdline, n);
+    return n;
+}
+
+static size_t gen_pid_comm(char *buf, size_t cap, void *ctx)
+{
+    size_t n = 0;
+    struct tcb *t = pid_task(ctx);
+    if (t) P("%s\n", t->name);
+    return n;
+}
+
+static void pid_files(struct vnode *dir, void *ctx)
+{
+    pseudo_file(dir, "stat", gen_pid_stat, ctx);
+    pseudo_file(dir, "status", gen_pid_status, ctx);
+    pseudo_file(dir, "cmdline", gen_pid_cmdline, ctx);
+    pseudo_file(dir, "comm", gen_pid_comm, ctx);
+}
+
+static void detach(struct vnode *parent, struct vnode *c)
+{
+    for (struct vnode **pp = &parent->children; *pp; pp = &(*pp)->sibling)
+        if (*pp == c) { *pp = c->sibling; c->sibling = NULL; return; }
+}
+
+static void proc_refresh(struct vnode *dir)
+{
+    uint64_t fl = irq_save();
+    for (int i = 0; i < MAX_TASKS; i++) {               /* gone: detach */
+        struct pid_dir *d = &pid_dirs[i];
+        if (!d->attached) continue;
+        struct tcb *t = task_find(d->pid);
+        if (!t || t->state == TASK_UNUSED) { detach(dir, d->dir); d->attached = false; }
+    }
+    for (int i = 0; i < MAX_TASKS; i++) {               /* new: attach a free entry */
+        struct tcb *t = task_slot(i);
+        if (t->state == TASK_UNUSED) continue;
+        bool have = false;
+        for (int j = 0; j < MAX_TASKS && !have; j++) have = pid_dirs[j].attached && pid_dirs[j].pid == t->pid;
+        if (have) continue;
+        for (int j = 0; j < MAX_TASKS; j++) {
+            struct pid_dir *d = &pid_dirs[j];
+            if (d->attached) continue;
+            if (!d->dir) {                              /* first use: build it */
+                irq_restore(fl);
+                d->dir = vfs_node_new(dir->fs, "", VDIR, 0555, NULL);
+                if (d->dir) pid_files(d->dir, d);
+                fl = irq_save();
+                if (!d->dir) break;
+            }
+            d->pid = t->pid;
+            snprintf(d->dir->name, sizeof d->dir->name, "%d", t->pid);
+            d->dir->parent = dir;
+            d->dir->sibling = dir->children;            /* attach */
+            dir->children = d->dir;
+            d->attached = true;
+            break;
+        }
+    }
+    irq_restore(fl);
+}
+
+static const struct vnode_ops proc_root_ops = { .refresh = proc_refresh };
+
 void procfs_init(const char *mountpoint)
 {
     struct mount *m;
@@ -160,6 +315,7 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "uptime",      gen_uptime, NULL);
     pseudo_file(r, "meminfo",     gen_meminfo, NULL);
     pseudo_file(r, "stat",        gen_stat, NULL);
+    pseudo_file(r, "loadavg",     gen_loadavg, NULL);
     pseudo_file(r, "cpuinfo",     gen_cpuinfo, NULL);
     pseudo_file(r, "mounts",      gen_mounts, NULL);
     pseudo_file(r, "filesystems", gen_filesystems, NULL);
@@ -172,5 +328,9 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "usb",         gen_usb, NULL);
     pseudo_file(r, "partitions",  gen_partitions, NULL);
     pseudo_file(r, "bootvol",     gen_bootvol, NULL);
+    struct vnode *self = vfs_node_new(m, "self", VDIR, 0555, NULL);   /* the calling process */
+    if (self) { vfs_node_add(r, self); pid_files(self, NULL); }
+    proc_root = r;
+    r->ops = &proc_root_ops;
     vfs_mount(m, mountpoint);
 }

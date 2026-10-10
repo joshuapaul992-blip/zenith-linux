@@ -36,5 +36,14 @@ EOF
 check "here-document"         [ "$(tail -n 1 /tmp/heredoc)" = beta ]
 check "subshell isolation"    [ "$(x=1; (x=2); echo $x)" = 1 ]
 check "uname"                 [ "$(uname -s)" = Kestrel ]
+check "/proc/self/stat"       [ "$(cut -d' ' -f1 /proc/self/stat)" -gt 0 ]
+check "/proc/PID/cmdline"     grep -q shtest.sh /proc/$$/cmdline
+check "readlink /proc/self/fd"  [ "$(readlink /proc/self/fd/0)" = "$(readlink /proc/self/fd/0)" ] && [ -n "$(readlink /proc/self/fd/1)" ]
+check "ps lists processes"    sh -c 'ps | grep -q "/bin/sh /bin/shtest.sh"'
+/bin/sleep 30 &                               # the external program: ash's own sleep is a builtin
+sleep 1                                       # let it exec (until then it is a forked sh)
+check "killall by name"       sh -c 'killall sleep'
+wait $!; st=$?
+check "...the sleep died"     [ $st -eq 143 ]
 if [ $fail -eq 0 ]; then echo "shtest: all checks passed"; else echo "shtest: FAILED ($fail)"; fi
 exit $fail

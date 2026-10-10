@@ -42,6 +42,9 @@ struct vnode_ops {
     /* Optional: create the open file (devices that hand out a new object per
      * open, e.g. /dev/ptmx). Called after vfs_open's permission checks. */
     int     (*open)(struct vnode *vn, int flags, struct file **out);
+    /* Optional, directories: bring the children up to date before a lookup
+     * or listing (/proc's per-process directories). */
+    void    (*refresh)(struct vnode *dir);
 };
 
 /* poll(2) bits */

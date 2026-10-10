@@ -15,6 +15,7 @@
 #include <spawn.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <sys/time.h>
 
 extern char **environ;
 static int failures;
@@ -24,6 +25,8 @@ static volatile sig_atomic_t got_usr1, got_usr2, got_chld;
 static void on_usr1(int s) { (void)s; got_usr1++; }
 static void on_usr2(int s) { (void)s; got_usr2++; }
 static void on_chld(int s) { (void)s; got_chld++; }
+static volatile sig_atomic_t got_alrm;
+static void on_alrm(int s) { (void)s; got_alrm++; }
 static volatile double fp_in_handler;
 static void on_fp(int s) { volatile double x = s; for (int i = 0; i < 10; i++) x = x * 1.5 + 0.25; fp_in_handler = x; }
 
@@ -233,6 +236,28 @@ int main(int argc, char **argv)
     st = wait_status(pid);
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGPIPE, "...with the default action the writer dies of SIGPIPE");
     close(pfd[1]);
+
+    /* timers: alarm() and a periodic ITIMER_REAL */
+    static volatile sig_atomic_t alarms;
+    struct sigaction al;
+    memset(&al, 0, sizeof al);
+    al.sa_handler = on_alrm;
+    sigaction(SIGALRM, &al, NULL);
+    got_alrm = 0;
+    alarm(1);
+    pause();
+    CHECK(got_alrm == 1, "alarm(1) + pause(): SIGALRM arrives");
+    struct itimerval it = { { 0, 50000 }, { 0, 50000 } }, off = { { 0, 0 }, { 0, 0 } };
+    got_alrm = 0;
+    setitimer(ITIMER_REAL, &it, NULL);
+    while (got_alrm < 3) pause();
+    setitimer(ITIMER_REAL, &off, NULL);
+    (void)alarms;
+    CHECK(got_alrm == 3, "setitimer: a periodic 50 ms timer fires repeatedly");
+
+    char exe[128] = { 0 };
+    ssize_t el = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    CHECK(el > 0 && strstr(exe, "proctest"), "readlink(/proc/self/exe) names the program");
 
     pid = fork();
     if (pid == 0) abort();

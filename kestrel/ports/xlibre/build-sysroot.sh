@@ -6,7 +6,8 @@
 # release tarballs (*.orig.tar.* from Ubuntu's source packages work:
 # `apt-get source --download-only xorgproto xtrans libxau libxdmcp xcb-proto
 # libxcb libx11 libxkbfile libfontenc libxfont pixman zlib libxext libxrender
-# libxfixes libxdamage libxcomposite libxpm libpng1.6`).
+# libxfixes libxdamage libxcomposite libxpm libpng1.6 libice libsm libxt
+# libxmu libxaw ncurses`).
 set -eu
 SRC=$(cd "$1" && pwd)
 SYSROOT=$(mkdir -p "$2" && cd "$2" && pwd)
@@ -92,6 +93,17 @@ autotools  libxdamage
 autotools  libxcomposite --disable-doc --without-xmlto
 autotools  libxpm --disable-open-zfile --disable-stat-zfile
 autotools  libpng1.6 --disable-tools
+
+# X toolkit (Xt + Athena widgets) and terminfo, for xterm
+autotools  libice --disable-docs --disable-specs --without-xmlto --without-fop
+autotools  libsm --disable-docs --without-xmlto --without-fop --without-libuuid
+autotools  libxt --disable-specs --without-xmlto --without-fop --with-appdefaultdir=/boot/share/X11/app-defaults
+autotools  libxmu --disable-docs --without-xmlto --without-fop
+autotools  libxaw --disable-specs --without-xmlto --without-fop --disable-xaw6
+autotools  ncurses --without-cxx --without-cxx-binding --without-ada --without-progs --without-tests \
+           --without-manpages --without-debug --enable-widec --disable-db-install --enable-pc-files \
+           --with-pkg-config-libdir="$SYSROOT/lib/pkgconfig" --with-terminfo-dirs=/boot/share/terminfo \
+           --with-default-terminfo-dir=/boot/share/terminfo --disable-home-terminfo --without-shared
 
 # libsha1 (ours)
 if [ ! -f "$WORK/libsha1.done" ]; then

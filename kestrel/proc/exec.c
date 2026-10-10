@@ -128,7 +128,6 @@ static int load_elf(struct tcb *t, const char *path, uint64_t *entry, uint64_t *
         memset((void *)(va + ph[i].p_filesz), 0, ph[i].p_memsz - ph[i].p_filesz);
         if (!*phdr_va && ph[i].p_offset == 0) *phdr_va = va + eh.e_phoff;   /* headers inside segment */
         if (va + ph[i].p_memsz > end) end = va + ph[i].p_memsz;
-        kprintf("exec: %s: segment %lx-%lx (%lu bytes from file)\n", path, va, va + ph[i].p_memsz, ph[i].p_filesz);
     }
     if (!end) { kprintf("exec: %s: no loadable segment\n", path); rc = -ENOEXEC; goto out; }
     *entry = base + eh.e_entry;
@@ -184,6 +183,14 @@ static uint64_t build_stack(struct tcb *t, const struct exec_args *a, uint64_t e
 
 int exec_load_image(struct tcb *t, const char *path, const struct exec_args *a, uint64_t *entry, uint64_t *sp)
 {
+    size_t n = 0;                                       /* /proc/PID/cmdline */
+    for (int i = 0; i < a->argc && n < sizeof t->cmdline; i++) {
+        size_t l = strlen(a->argv[i]) + 1;
+        if (n + l > sizeof t->cmdline) l = sizeof t->cmdline - n;
+        memcpy(t->cmdline + n, a->argv[i], l);
+        n += l;
+    }
+    t->cmdline_len = (uint16_t)n;
     uint64_t phdr_va = 0;
     int phnum = 0;
     int rc = load_elf(t, path, entry, &phdr_va, &phnum);
@@ -225,6 +232,7 @@ static int process_main(void *arg)
     open_stdio(t, a->stdio);
     kprintf("exec: pid %d: %s entry %lx, stack %lx, brk %lx, %lu user pages\n", t->pid, a->path, entry, sp, t->brk,
             uvm_pages(pml4));
+    strlcpy(t->exe, a->path, sizeof t->exe);
     kfree(a);
 
     /* clean SSE state for the process: x87 reset, MXCSR default. Interrupts

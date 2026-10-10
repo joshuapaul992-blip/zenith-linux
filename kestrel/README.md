@@ -503,10 +503,13 @@ proc/exec.c                  ELF64 loader, System V initial stack, kernel-starte
 proc/process.c               fork/vfork/clone, execve, wait4, sessions, signals
 fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), file objects,
                              getdents64, ramfs files, generated "pseudo" files
-              devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor
+              devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor,
+                             ptmx and pts/ (fs/pty.c)
                              (KFB_GET_INFO, KDSETMODE, KFB_BLIT) (+ block devices)
               tarfs.c        read-only ustar file system on a block device (the /boot volume)
-              procfs.c       /proc: version uptime meminfo stat cpuinfo mounts filesystems tasks
+              pty.c          pseudo-terminals: line discipline, termios, controlling terminals
+              procfs.c       /proc: version uptime meminfo stat loadavg cpuinfo mounts filesystems tasks,
+                             PID/{stat,status,cmdline,comm}, self/
                              interrupts cmdline kmsg syscalls
               sysfs.c        /sys: kernel/ class/graphics/fb0/ firmware/ devices/system/cpu/ power/
 kernel/       kernel.c       initialisation sequence, init and worker threads
@@ -536,6 +539,8 @@ ports/xlibre/                X server port: sysroot/server build scripts, hw-kes
                              xdemo test client
 ports/icewm/                 IceWM build script and Kestrel configuration
 ports/toolchain/             musl-g++ (C++ with libsupc++), pkg-config and CMake wrappers
+ports/busybox/               BusyBox build (/bin/sh and the command-line tools)
+ports/xterm/                 xterm build and its musl patch
 rootfs/                      contents of the boot volume payload
 ui/bootmgr.c                 boot manager, F8 screen, tools
 include/kernel/posix.h       errno, O_* flags, struct stat, dirent64, utsname (Linux ABI layout)
@@ -550,7 +555,7 @@ Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), select, pselect6 (no signal mask), access, umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, fork, vfork, clone (`fork`/`vfork`-style only: no threads), execve, wait4, setsid, setpgid, getpgid, getpgrp, getsid, kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, getuid, getgid, geteuid, getegid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
+**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), select, pselect6 (no signal mask), sendfile, access, readlink/readlinkat (no symbolic links; `/proc/self/exe` and `/proc/self/fd/N` resolve), umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, fork, vfork, clone (`fork`/`vfork`-style only: no threads), execve, wait4, setsid, setpgid, getpgid, getpgrp, getsid, kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; only root may change them), getrlimit, setrlimit, prlimit64 (fixed limits), alarm, getitimer, setitimer (`ITIMER_REAL`), times, getrusage, sysinfo, prctl (`PR_SET_NAME`/`PR_GET_NAME`), exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
 
 **Stubs returning `-ENOSYS`:** gettimeofday (musl uses clock_gettime).
 
@@ -569,10 +574,10 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 - From the shell: `run hello` (bare names are looked up in `/boot/bin`).
 - Unattended: boot with `kestrel.exec=/boot/bin/hello,arg1,arg2`. Output goes to the kernel log (serial and `REPORT.TXT`), followed by the exit status: 42 means every check passed.
 - Several programs: `+` separates them, and an entry of the form `Ns` waits N seconds before starting the rest, e.g. `kestrel.exec=/boot/bin/Xkestrel,:0+2s+/boot/bin/icewm`.
-- Environment: every program starts with `PATH=/boot/bin`, `HOME=/`, `TERM=kestrel` and `DISPLAY=:0`.
+- Environment: programs started by the kernel get `PATH=/bin`, `HOME=/`, `TERM=kestrel`, `DISPLAY=:0` and `SHELL=/bin/sh`. `/bin` shows the boot volume's `/boot/bin` (a bind mount).
 - Fault isolation: `hello crash` writes to kernel memory and must end with "killed (signal 11)".
 
-**musl libc:** programs linked with the stock x86_64 musl (`musl-gcc -static-pie`) run unchanged, because Kestrel uses the Linux syscall numbers and ABI. `user/libctest.c` (installed as `/boot/bin/libctest`) checks 38 things a ported program relies on: stdio, malloc (brk and mmap paths), floating-point formatting, files and directories, time, pipes, `poll` timeouts, `select`, `O_NONBLOCK`, `dup`, EOF/`POLLHUP` and `getrandom`. Exit status 0 means every check passed. A ring-3 program that calls an unimplemented syscall is named in the kernel log (first three calls per number).
+**musl libc:** programs linked with the stock x86_64 musl (`musl-gcc -static-pie`) run unchanged, because Kestrel uses the Linux syscall numbers and ABI. `user/libctest.c` (installed as `/boot/bin/libctest`) checks 35 things a ported program relies on: stdio, malloc (brk and mmap paths), floating-point formatting, files and directories, time, pipes, `poll` timeouts, `select`, `O_NONBLOCK`, `dup`, EOF/`POLLHUP` and `getrandom`. Exit status 0 means every check passed. A ring-3 program that calls an unimplemented syscall is named in the kernel log (first three calls per number).
 
 **Pipes and poll:** pipes have a 16 KiB buffer and follow POSIX blocking rules; with no signals, a write to a pipe without readers returns `-EPIPE`. `poll` re-checks readiness every millisecond until something is ready or the timeout expires. Files and devices without their own poll hook are always ready.
 
@@ -604,9 +609,9 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 - **Default actions:** terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH. There is no job control: stop signals are ignored.
 - **CPU faults** in ring 3 still end the process immediately, without calling a SIGSEGV handler.
 
-`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 30 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE and abort.
+`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 31 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE, `alarm` and periodic `setitimer`, `readlink("/proc/self/exe")`, and abort.
 
-Not done yet: W^X page permissions, copy-on-write, file-backed `mmap`, threads, timers (`alarm`, `setitimer`), job control, and `SCM_RIGHTS`.
+Not done yet: W^X page permissions, copy-on-write, file-backed `mmap`, threads, job control (stop/continue), and `SCM_RIGHTS`.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -693,6 +698,43 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 
 **Not yet:** icewmbg (backgrounds), icewm-session, more programs for the menus, and fonts other than `fixed`.
 
+## Terminals: pseudo-terminals, a shell, xterm
+
+**Pseudo-terminals** (`fs/pty.c`) work like Linux's Unix98 ptys, so musl's `posix_openpt`/`grantpt`/`unlockpt`/`ptsname`, `openpty`, `tcgetattr`/`tcsetattr`, `isatty` and `ttyname` work unchanged.
+- **Devices:** opening `/dev/ptmx` gives a new master; its slave is `/dev/pts/N` (16 pairs).
+- **Line discipline:** canonical editing (erase, word erase, kill, EOF), echo with `^X` for control characters, `ICRNL`/`INLCR`/`IGNCR`, output `OPOST`/`ONLCR`, and raw mode with `VMIN`/`VTIME`.
+- **Controlling terminal:** set with `TIOCSCTTY`, or when a session leader opens a slave. `/dev/tty` then opens it; `TIOCGPGRP`/`TIOCSPGRP` set the foreground process group.
+- **Signals:** Ctrl+C, Ctrl+\ and Ctrl+Z send SIGINT, SIGQUIT and SIGTSTP to the foreground group (SIGTSTP is ignored: no job control). `TIOCSWINSZ` sends SIGWINCH. Closing the master sends SIGHUP to the session.
+- **Hang-up:** after the slave side closes, master reads fail with EIO (as on Linux).
+- **Test:** `user/ptytest.c` checks all of this in 18 tests.
+
+**A shell** (`ports/busybox`): BusyBox 1.36 provides `/bin/sh` (ash) and about 400 tools in one 1.2 MB static-PIE musl binary.
+- **Install:** every applet is a hard link to it. The boot volume keeps the links: tarfs supports hard links, and `make usbimg` preserves them. `/boot/bin` is bound on `/bin`, so `/bin/sh` is where scripts expect it.
+- **Building:** `make busybox BUSYBOX_SRC=<unpacked busybox release>`.
+- **Test:** `user/shtest.sh` (`kestrel.exec=/bin/sh,/bin/shtest.sh`) checks pipes, redirection, background jobs, `kill`, traps, here-documents, `/proc`, `ps` and `killall` in 22 tests.
+- **One exec** of a BusyBox tool takes about 40–80 ms in QEMU; the binary is read from the boot volume each time.
+
+**`/proc/PID/`** has `stat`, `status`, `cmdline` and `comm` in Linux's formats; `/proc/self/` is the caller. That is what `ps`, `top`, `pidof` and `killall` read.
+
+**xterm** (`ports/xterm`): xterm 390 built against Xt, Xaw, Xmu, SM and ICE, added to the musl sysroot, and ncurses.
+- **Configuration:** core fonts, no FreeType, luit, setuid, utmp helper, input methods or Tek4014.
+- **Install:** resources go to `/boot/share/X11/app-defaults/XTerm`; the terminfo entries for `xterm*` go to `/boot/share/terminfo`.
+- **Patch:** one patch makes xterm call `setsid()` with musl too. glibc implies `_POSIX_SOURCE`, which xterm tests for.
+- **Configure:** `HAVE_GRANTPT_PTY_ISATTY` is set because configure cannot run its test program when cross-compiling.
+
+```sh
+make xlibre ...                                  # X server and the X libraries (sysroot)
+make xterm XTERM_SRC=<unpacked xterm release>
+make busybox BUSYBOX_SRC=<unpacked busybox release>
+make usbimg
+```
+
+**Trying it:** boot with `kestrel.exec=/bin/Xkestrel,:0+2s+/bin/icewm`, then choose XTerm in IceWM's start menu (or add `+3s+/bin/xterm`).
+
+**Checked in QEMU** with an xHCI keyboard and mouse: commands typed into the shell run, including pipes, `ps`, `top` and `stty size`; Ctrl+C interrupts a running `sleep`; `exit` closes the window, and IceWM reaps xterm.
+
+**Not yet:** fonts other than `fixed`, job control (Ctrl+Z, `fg`/`bg`), and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
+
 ## Memory map at boot
 
 | Range | Use |
@@ -708,7 +750,7 @@ The structure is laid out for these, in order:
 
 1. **User mode:** done (see "User programs"). Still missing: W^X and a fault-safe `copy_from_user`.
 2. **fork/execve/wait4:** done (see "Processes"); copy-on-write next.
-3. **Signals:** done, apart from timers, job control and handlers for CPU faults.
+3. **Signals:** done, apart from job control and handlers for CPU faults.
 4. **libc:** done for musl (static-PIE, unmodified). The XLibre X server runs on it (see "X11").
 5. **A writable file system** (FAT or ext2) on the block layer, next to the read-only tarfs.
 6. **ACPI parsing** for power-off on real hardware. The emulator ports are used today.

@@ -161,6 +161,10 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->umask = p->umask;
     c->tty = p->tty;
     c->ctty = p->ctty;
+    memcpy(c->exe, p->exe, sizeof c->exe);
+    memcpy(c->cmdline, p->cmdline, sizeof c->cmdline);
+    c->cmdline_len = p->cmdline_len;
+    c->alarm_at = c->alarm_every = 0;                   /* timers are not inherited */
     c->exit_signal = (int)(flags & 0xff);
     memcpy(c->sigact, p->sigact, sizeof c->sigact);
     c->sig_mask = p->sig_mask;
@@ -277,6 +281,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
         t->sigact[s].mask = 0;
     }
     t->saved_mask_valid = false;
+    strlcpy(t->exe, path, sizeof t->exe);
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     strlcpy(t->name, base, sizeof t->name);
     fl = irq_save();

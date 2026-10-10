@@ -2,6 +2,7 @@
 #
 # Entries run through IceWM's fork() + execvp(); programs not found in
 # PATH (/bin, which shows /boot/bin) are hidden.
+prog "XTerm" xterm xterm
 prog "X demo" - xdemo
 menufile Programs folder programs
 menufile Tool_bar folder toolbar

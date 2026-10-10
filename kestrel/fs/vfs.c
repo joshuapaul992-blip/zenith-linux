@@ -101,6 +101,7 @@ static struct vnode *cwd_node(void)
 
 static struct vnode *child_named(struct vnode *dir, const char *name)
 {
+    if (dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
     for (struct vnode *c = dir->children; c; c = c->sibling)
         if (strcmp(c->name, name) == 0) return c->mounted ? c->mounted : c;
     return NULL;
@@ -450,6 +451,7 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
 {
     struct vnode *dir = f->vn;
     if (dir->type != VDIR) return -ENOTDIR;
+    if (f->off == 0 && dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
     size_t pos = 0;
     for (;;) {
         uint64_t idx = f->off;

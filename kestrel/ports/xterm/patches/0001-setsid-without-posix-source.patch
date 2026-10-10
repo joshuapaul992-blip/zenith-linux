@@ -1,0 +1,19 @@
+Kestrel: start the shell in its own session with musl too.
+
+glibc defines _POSIX_SOURCE implicitly; musl does not, so xterm's child
+skipped setsid(), opened the pty slave without being a session leader,
+and could not make it its controlling terminal (TIOCSCTTY: EPERM).
+
+--- a/main.c
++++ b/main.c
+@@ -4356,8 +4356,9 @@
+ 	    /*
+ 	     * now in child process
+ 	     */
+-#if defined(_POSIX_SOURCE) || defined(SVR4) || defined(__convex__) || defined(__SCO__) || defined(__QNX__)
++/* Kestrel: musl does not imply _POSIX_SOURCE, but Linux has setsid() */
++#if defined(_POSIX_SOURCE) || defined(SVR4) || defined(__convex__) || defined(__SCO__) || defined(__QNX__) || defined(__linux__)
+ 	    int pgrp = setsid();	/* variable may not be used... */
+ #else
+ 	    int pgrp = getpid();
+ #endif

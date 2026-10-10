@@ -75,6 +75,8 @@ int main(int argc, char **argv)
     struct termios tio;
     CHECK(s >= 0 && isatty(s) && tcgetattr(s, &tio) == 0 && (tio.c_lflag & ICANON) && (tio.c_lflag & ECHO),
           "slave opens; isatty; default termios is canonical with echo");
+    char *tn = ttyname(s);
+    CHECK(tn && !strcmp(tn, name), "ttyname(slave) == ptsname(master)");
 
     char buf[256];
     write(m, "hello\n", 6);

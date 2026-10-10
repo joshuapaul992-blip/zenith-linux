@@ -76,6 +76,10 @@ struct tcb {
     /* processes (proc/process.c) */
     int       pgid, sid;        /* process group, session                  */
     int       ctty;             /* controlling terminal: pty index + 1      */
+    char      exe[128];         /* program path (/proc/self/exe)           */
+    char      cmdline[256];     /* argv, NUL-separated (/proc/PID/cmdline)  */
+    uint16_t  cmdline_len;
+    uint64_t  alarm_at, alarm_every;    /* ITIMER_REAL in ms: next expiry, period */
     int       exit_signal;      /* sent to the parent at exit (SIGCHLD)    */
     int       term_signal;      /* killed by this signal; 0 = exit()       */
     bool      vm_borrowed;      /* vfork child: pml4 belongs to the parent  */
