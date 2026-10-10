@@ -2,13 +2,19 @@
  *  process.h -- POSIX processes: fork/vfork/clone, execve, wait4, sessions,
  *  and signals (proc/process.c)
  *
- *  Processes are the scheduler's tasks with t->user set. fork() copies the
- *  whole user address space (uvm_clone; no copy-on-write yet). vfork() and
- *  clone(CLONE_VM | CLONE_VFORK), musl's posix_spawn path, let the child
- *  borrow the parent's address space while the parent sleeps until the child
- *  calls execve() or exits. Threads (CLONE_THREAD) are not supported.
+ *  Processes are thread groups of the scheduler's tasks with t->user set.
+ *  fork() gives the child a copy-on-write copy of the address space (vm.c).
+ *  vfork() and clone(CLONE_VM | CLONE_VFORK), musl's posix_spawn path, let
+ *  the child borrow the parent's address space while the parent sleeps until
+ *  the child calls execve() or exits. clone() shares what its flags say:
+ *  memory (CLONE_VM), descriptors (CLONE_FILES), cwd and umask (CLONE_FS),
+ *  signal actions (CLONE_SIGHAND), and with CLONE_THREAD the process itself
+ *  (pid, parent, pending signals, exit status) -- pthread_create. Every
+ *  thread has its own tid, kernel stack, TLS base (FS), signal mask and
+ *  thread-directed pending signals. exit() ends a thread, exit_group() and
+ *  fatal signals the process; execve() first ends the other threads.
  *
- *  Signals follow Linux: 64 signals, per-process handlers and mask, the
+ *  Signals follow Linux: 64 signals, per-process handlers, per-thread masks, the
  *  x86_64 rt_sigframe on the user stack (siginfo, ucontext with the saved
  *  registers and FPU state), return through the handler's SA_RESTORER
  *  trampoline into rt_sigreturn. Signals are delivered when the process
@@ -76,12 +82,18 @@ struct int_frame;
 
 /* ---- hooks for the scheduler -------------------------------------------- */
 bool process_zombie_kept(const struct tcb *t);  /* parent will wait4() for it */
-void process_exit(struct tcb *t);               /* t is exiting              */
+void process_thread_exit(struct tcb *t);        /* exiting, user memory still there:
+                                                   clear_child_tid, robust futexes */
+void process_exit(struct tcb *t);               /* t is exiting (interrupts off) */
+__attribute__((noreturn)) void proc_exit_group(int code);
 
 /* ---- signals --------------------------------------------------------------- */
+/* To t's process (any thread of it may take the signal): */
 int  signal_send(struct tcb *t, int sig);       /* 0, or -ESRCH (sent by the kernel) */
 struct ksig_info;
 int  signal_send_info(struct tcb *t, int sig, const struct ksig_info *info);
+/* To thread t only (tgkill, SIGPIPE). */
+int  signal_send_thread(struct tcb *t, int sig, const struct ksig_info *info);
 /* The current process faulted (idt.c): deliver sig with this siginfo, even
  * if it is blocked or ignored (then the default action applies). */
 void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err);

@@ -16,6 +16,7 @@
 #include <kernel/posix.h>
 #include <kernel/uaccess.h>
 #include <kernel/vm.h>
+#include <kernel/futex.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
 
@@ -23,14 +24,23 @@ extern void user_return(struct int_frame *f) __attribute__((noreturn));
 #define CLONE_FS             0x00000200
 #define CLONE_FILES          0x00000400
 #define CLONE_SIGHAND        0x00000800
+#define CLONE_PTRACE         0x00002000
 #define CLONE_VFORK          0x00004000
+#define CLONE_PARENT         0x00008000
 #define CLONE_THREAD         0x00010000
+#define CLONE_SYSVSEM        0x00040000
 #define CLONE_SETTLS         0x00080000
 #define CLONE_PARENT_SETTID  0x00100000
 #define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_DETACHED       0x00400000
+#define CLONE_UNTRACED       0x00800000
 #define CLONE_CHILD_SETTID   0x01000000
-#define CLONE_SUPPORTED      (0xff | CLONE_VM | CLONE_VFORK | CLONE_SETTLS | CLONE_PARENT_SETTID | \
-                              CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID)
+#define CLONE_IO             0x80000000u
+/* Namespaces, pidfds, cgroups are not supported: they fail with EINVAL. */
+#define CLONE_SUPPORTED      (0xff | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_PTRACE | \
+                              CLONE_VFORK | CLONE_PARENT | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | \
+                              CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED | CLONE_UNTRACED | \
+                              CLONE_CHILD_SETTID | CLONE_IO)
 
 #define WNOHANG     1
 
@@ -59,15 +69,34 @@ static char *ustrdup(uint64_t p, size_t max, int64_t *err)
     }
 }
 
-/* ---- process tree ---------------------------------------------------------- */
-static bool alive(const struct tcb *t) { return t && t->state != TASK_UNUSED && t->state != TASK_ZOMBIE; }
+/* ---- process tree ----------------------------------------------------------
+ * A process is a thread group. Its leader's tcb (pid == tgid) stands for the
+ * process: it stays (a zombie if need be) until every thread has exited and
+ * the parent has collected the status. Other threads are reaped as soon as
+ * they exit. A process is alive while any of its threads is. */
+static bool thread_alive(const struct tcb *t) { return t && t->state != TASK_UNUSED && t->state != TASK_ZOMBIE; }
+static bool is_leader(const struct tcb *t) { return t->pid == t->tgid; }
+static bool proc_alive(const struct tcb *t)
+{
+    return t && t->state != TASK_UNUSED && t->signal && t->signal->nr_threads > 0;
+}
+static bool same_group(const struct tcb *a, const struct tcb *b) { return a->signal == b->signal; }
+
+/* The leader of process `pid` (any of its thread ids also finds it). */
+static struct tcb *process_of(int pid)
+{
+    struct tcb *t = task_find(pid);
+    if (!t || is_leader(t)) return t;
+    return task_find(t->tgid);
+}
 
 bool process_zombie_kept(const struct tcb *t)
 {
-    if (!t->user) return false;
+    if (!t->user || !is_leader(t)) return false;        /* threads: reaped at once */
+    if (t->signal && t->signal->nr_threads > 0) return true;    /* its threads still run */
     struct tcb *p = task_find(t->ppid);
-    if (!alive(p) || !p->user) return false;
-    const struct k_sigaction *k = &p->sigact[SIGCHLD - 1];
+    if (!proc_alive(p) || !p->user) return false;
+    const struct k_sigaction *k = &p->sighand->action[SIGCHLD - 1];
     return !(k->handler == SIG_IGN || (k->flags & SA_NOCLDWAIT));
 }
 
@@ -79,23 +108,80 @@ static void vfork_release(struct tcb *t)
     }
 }
 
+/* Send a thread-directed signal to every other live thread of t's group. */
+static void kill_other_threads(struct tcb *t)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *o = task_slot(i);
+        if (o != t && thread_alive(o) && same_group(o, t)) signal_send_thread(o, SIGKILL, NULL);
+    }
+}
+
+/* The calling thread is leaving (interrupts on, its address space still
+ * there): the user-memory side of a thread exit. */
+void process_thread_exit(struct tcb *t)
+{
+    if (!t->mm) return;
+    if (t->robust_list) {                               /* locks it still holds: owner died */
+        uint64_t head = t->robust_list;
+        t->robust_list = 0;
+        futex_exit_robust(head, t->pid);
+    }
+    if (t->tid_address) {                               /* CLONE_CHILD_CLEARTID: pthread_join */
+        uint64_t a = t->tid_address;
+        t->tid_address = 0;
+        if (t->mm->users > 1 && !put_user_u32((void *)a, 0)) futex_wake(a, 1, true);
+    }
+}
+
+/* t is exiting (interrupts off, files and memory already gone). */
 void process_exit(struct tcb *t)
 {
     vfork_release(t);
+    struct signal_struct *g = t->signal;
+    g->nr_threads--;
+    wakeup(&g->exit_wait);                              /* execve waiting for the others */
+    if (g->nr_threads > 0) return;
+
+    /* The last thread: the process is gone. */
     for (int i = 0; i < MAX_TASKS; i++) {               /* orphans: reaped by the kernel */
         struct tcb *c = task_slot(i);
-        if (c != t && c->state != TASK_UNUSED && c->ppid == t->pid && c->pid) c->ppid = 0;
+        if (c->state != TASK_UNUSED && c->pid && c->ppid == t->tgid && !same_group(c, t)) c->ppid = 0;
     }
+    struct tcb *lead = is_leader(t) ? t : task_find(t->tgid);
+    if (!lead) return;
+    if (g->group_exit) {                                /* exit_group() or a fatal signal */
+        lead->exit_code = g->group_exit_code;
+        lead->term_signal = g->group_term_signal;
+    }
+    wakeup(lead);                                       /* task_wait() */
     if (!t->user) return;
-    struct tcb *p = task_find(t->ppid);
-    if (alive(p) && p->user) {
-        if (t->exit_signal) {
-            struct ksig_info ci = { .code = t->term_signal ? CLD_KILLED : CLD_EXITED, .pid = t->pid, .uid = t->uid,
-                                    .status = t->term_signal ? t->term_signal : (t->exit_code & 0xff) };
-            signal_send_info(p, t->exit_signal, &ci);
+    struct tcb *p = task_find(lead->ppid);
+    if (proc_alive(p) && p->user) {
+        if (lead->exit_signal) {
+            struct ksig_info ci = { .code = lead->term_signal ? CLD_KILLED : CLD_EXITED, .pid = lead->pid,
+                                    .uid = lead->uid,
+                                    .status = lead->term_signal ? lead->term_signal : (lead->exit_code & 0xff) };
+            signal_send_info(p, lead->exit_signal, &ci);
         }
-        wakeup(p);                                      /* wait4() sleeps on itself */
+        wakeup(p->signal);                              /* wait4() sleeps on its process */
     }
+}
+
+/* exit_group(): end every thread of the process with this status. */
+__attribute__((noreturn)) void proc_exit_group(int code)
+{
+    struct tcb *t = current_task();
+    struct signal_struct *g = t->signal;
+    uint64_t fl = irq_save();
+    if (!g->group_exit) {                               /* a fatal signal may have come first */
+        g->group_exit = true;
+        g->group_exit_code = code & 0xff;
+        g->group_term_signal = 0;
+        kill_other_threads(t);
+    }
+    irq_restore(fl);
+    task_exit(code & 0xff);
 }
 
 /* ---- fork / vfork / clone ------------------------------------------------- */
@@ -115,20 +201,33 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
 {
     struct tcb *p = current_task();
     if (!p->user || !p->uframe) return -EINVAL;
-    if (flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES | CLONE_FS)) return -ENOSYS;   /* threads */
     if (flags & ~(uint64_t)CLONE_SUPPORTED) return -EINVAL;
-    if ((flags & CLONE_VM) && !(flags & CLONE_VFORK)) return -ENOSYS;                 /* threads */
+    if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -EINVAL;     /* as Linux */
+    if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -EINVAL;
+    if ((flags & CLONE_PARENT) && !p->ppid) return -EINVAL;
     if ((flags & CLONE_PARENT_SETTID) && !user_range_ok(ptid, 4)) return -EFAULT;
     if ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) && !user_range_ok(ctid, 4)) return -EFAULT;
     if ((flags & CLONE_SETTLS) && tls && !uvm_range_ok(tls, 1)) return -EINVAL;
     if (newsp && !user_range_ok(newsp, 0)) return -EINVAL;
+    bool thread = flags & CLONE_THREAD;
+    if (p->signal->group_exit) return -EAGAIN;          /* the process is dying */
 
-    bool share = flags & CLONE_VM;
-    struct mm *mm;
-    if (share) { mm = p->mm; mm_get(mm); }
-    else if (!(mm = mm_fork(p->mm))) return -ENOMEM;   /* copy-on-write */
-    struct int_frame *cf = kmalloc(sizeof *cf);
-    if (!cf) { mm_put(mm); return -ENOMEM; }
+    /* Everything that can fail, before the child exists. */
+    struct mm *mm = NULL;
+    struct files_struct *files = NULL;
+    struct fs_struct *fs = NULL;
+    struct sighand_struct *sh = NULL;
+    struct int_frame *cf = NULL;
+    if (flags & CLONE_VM) { mm = p->mm; mm_get(mm); }
+    else if (!(mm = mm_fork(p->mm))) return -ENOMEM;    /* copy-on-write */
+    if (flags & CLONE_FILES) { files = p->files; __atomic_add_fetch(&files->refs, 1, __ATOMIC_ACQ_REL); }
+    else files = files_dup(p->files);
+    if (flags & CLONE_FS) { fs = p->fs; __atomic_add_fetch(&fs->refs, 1, __ATOMIC_ACQ_REL); }
+    else fs = fs_new(p->fs->cwd, p->fs->umask);
+    if (flags & CLONE_SIGHAND) { sh = p->sighand; __atomic_add_fetch(&sh->refs, 1, __ATOMIC_ACQ_REL); }
+    else sh = sighand_new(p->sighand);
+    cf = kmalloc(sizeof *cf);
+    if (!files || !fs || !sh || !cf) goto nomem;
     *cf = *p->uframe;
     cf->rax = 0;                                        /* the child's return value */
     if (newsp) cf->rsp = newsp;
@@ -136,38 +235,38 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
 
     uint64_t fl = irq_save();                           /* the child must not run half-built */
     struct tcb *c = task_create(p->name, fork_child_entry, cf);
-    if (!c) {
-        irq_restore(fl);
-        kfree(cf);
-        mm_put(mm);
-        return -EAGAIN;
+    if (!c) { irq_restore(fl); kfree(cf); cf = NULL; mm_put(mm); mm = NULL; goto again; }
+    files_put(c->files); c->files = files;
+    fs_put(c->fs); c->fs = fs;
+    sighand_put(c->sighand); c->sighand = sh;
+    if (thread) {                                       /* same process: share the group */
+        signal_put(c->signal);
+        c->signal = p->signal;
+        __atomic_add_fetch(&p->signal->refs, 1, __ATOMIC_ACQ_REL);
+        p->signal->nr_threads++;
+        c->tgid = p->tgid;
+        c->ppid = p->ppid;
+        c->exit_signal = 0;                             /* only the process notifies its parent */
+    } else {
+        c->ppid = (flags & CLONE_PARENT) ? p->ppid : p->tgid;
+        c->exit_signal = (int)(flags & 0xff);
     }
-    c->ppid = p->pid;
     c->pgid = p->pgid;
     c->sid = p->sid;
     c->user = true;
     c->mm = mm;
     c->pml4 = c->cr3 = mm->pml4;
-    c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);
+    c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);   /* each thread: its own TLS block */
     c->tid_address = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
+    c->robust_list = 0;
     __asm__ volatile("fxsave %0" : "=m"(c->fpu));       /* the parent's live SSE state */
-    for (int fd = 0; fd < MAX_FDS; fd++) {
-        c->fds[fd] = p->fds[fd];
-        c->fd_cloexec[fd] = p->fd_cloexec[fd];
-        if (c->fds[fd]) c->fds[fd]->refcnt++;
-    }
-    c->cwd = p->cwd;
     c->uid = p->uid;
     c->gid = p->gid;
-    c->umask = p->umask;
     c->tty = p->tty;
     c->ctty = p->ctty;
     memcpy(c->exe, p->exe, sizeof c->exe);
     memcpy(c->cmdline, p->cmdline, sizeof c->cmdline);
     c->cmdline_len = p->cmdline_len;
-    c->alarm_at = c->alarm_every = 0;                   /* timers are not inherited */
-    c->exit_signal = (int)(flags & 0xff);
-    memcpy(c->sigact, p->sigact, sizeof c->sigact);
     c->sig_mask = p->sig_mask;
     c->sig_pending = 0;
     if (flags & CLONE_VFORK) c->vfork_parent = p->pid;
@@ -179,6 +278,19 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
         sleep_on(&c->vfork_parent);
     irq_restore(fl);
     return pid;
+
+nomem:
+    kfree(cf);
+    files_put(files);
+    fs_put(fs);
+    sighand_put(sh);
+    mm_put(mm);
+    return -ENOMEM;
+again:
+    files_put(files);
+    fs_put(fs);
+    sighand_put(sh);
+    return -EAGAIN;
 }
 
 /* ---- execve ---------------------------------------------------------------- */
@@ -231,6 +343,41 @@ static const uint8_t *clean_fpu(void)
     return img;
 }
 
+/* execve in a multi-threaded process: end the other threads first. The
+ * caller becomes the only thread, and takes over the process id if it was
+ * not the leader. Fails if the whole process is being killed meanwhile. */
+static int de_thread(struct tcb *t)
+{
+    struct signal_struct *g = t->signal;
+    uint64_t fl = irq_save();
+    if (g->nr_threads > 1) {
+        if (g->group_exit || g->exec_kill) { irq_restore(fl); return -EAGAIN; }
+        g->exec_kill = true;
+        kill_other_threads(t);
+        while (g->nr_threads > 1) {
+            if (g->group_exit) { g->exec_kill = false; irq_restore(fl); return -EINTR; }
+            sleep_on(&g->exit_wait);
+        }
+        g->exec_kill = false;
+    }
+    if (!is_leader(t)) {
+        struct tcb *lead = task_find(t->tgid);          /* exited: a zombie kept for the pid */
+        int old = t->pid;
+        t->pid = t->tgid;
+        if (lead) {
+            t->ppid = lead->ppid;
+            t->exit_signal = lead->exit_signal;
+            t->start_tick = lead->start_tick;
+            t->waiters += lead->waiters;                /* task_wait() callers follow the pid */
+            lead->waiters = 0;
+            lead->pid = old;                            /* now an ordinary dead thread: reaped */
+            wakeup(lead);
+        }
+    }
+    irq_restore(fl);
+    return 0;
+}
+
 int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
 {
     struct tcb *t = current_task();
@@ -261,6 +408,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     irq_restore(fl);
     uint64_t entry = 0, sp = 0;
     rc = exec_load_image(t, path, &ea, &entry, &sp);
+    if (rc >= 0) rc = de_thread(t);                     /* other threads go before the old image */
     if (rc < 0) {
         fl = irq_save();
         t->mm = old;
@@ -274,15 +422,33 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     /* point of no return: drop the old image (a vfork parent keeps using it) */
     mm_put(old);
     vfork_release(t);
+    /* Tables shared with another process (CLONE_FILES, CLONE_SIGHAND without
+     * threads) are copied first: the new program must not change theirs. */
+    if (t->files->refs > 1) {
+        struct files_struct *nf = files_dup(t->files);
+        if (nf) { struct files_struct *of = t->files; t->files = nf; files_put(of); }
+    }
+    if (t->sighand->refs > 1) {
+        struct sighand_struct *nh = sighand_new(t->sighand);
+        if (nh) { struct sighand_struct *oh = t->sighand; t->sighand = nh; sighand_put(oh); }
+    }
+    struct files_struct *ft = t->files;
     for (int fd = 0; fd < MAX_FDS; fd++)
-        if (t->fds[fd] && t->fd_cloexec[fd]) { vfs_close(t->fds[fd]); t->fds[fd] = NULL; t->fd_cloexec[fd] = 0; }
+        if (ft->fd[fd] && ft->cloexec[fd]) {
+            struct file *x = ft->fd[fd];
+            ft->fd[fd] = NULL;
+            ft->cloexec[fd] = 0;
+            vfs_close(x);
+        }
+    struct k_sigaction *act = t->sighand->action;
     for (int s = 0; s < NSIG; s++) {                    /* caught signals revert to default */
-        if (t->sigact[s].handler != SIG_IGN) t->sigact[s].handler = SIG_DFL;
-        t->sigact[s].flags = 0;
-        t->sigact[s].restorer = 0;
-        t->sigact[s].mask = 0;
+        if (act[s].handler != SIG_IGN) act[s].handler = SIG_DFL;
+        act[s].flags = 0;
+        act[s].restorer = 0;
+        act[s].mask = 0;
     }
     t->saved_mask_valid = false;
+    t->robust_list = 0;
     strlcpy(t->exe, path, sizeof t->exe);
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     strlcpy(t->name, base, sizeof t->name);
@@ -313,7 +479,8 @@ out:
 /* ---- wait4 ----------------------------------------------------------------- */
 static bool wait_matches(const struct tcb *self, const struct tcb *c, int64_t pid)
 {
-    if (c->state == TASK_UNUSED || c->ppid != self->pid || c == self || !c->user) return false;
+    if (c->state == TASK_UNUSED || !c->user || !is_leader(c) || c->ppid != self->tgid || same_group(c, self))
+        return false;
     if (pid > 0) return c->pid == pid;
     if (pid == -1) return true;
     if (pid == 0) return c->pgid == self->pgid;
@@ -334,7 +501,7 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
             struct tcb *c = task_slot(i);
             if (!wait_matches(self, c, pid)) continue;
             any = true;
-            if (c->state == TASK_ZOMBIE) z = c;
+            if (c->state == TASK_ZOMBIE && c->signal->nr_threads == 0) z = c;   /* every thread gone */
         }
         if (!any) { irq_restore(fl); return -ECHILD; }
         if (z) {
@@ -348,31 +515,46 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
         }
         if (options & WNOHANG) { irq_restore(fl); return 0; }
         if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(self);                                 /* a child's exit wakes us */
+        sleep_on(self->signal);                         /* a child's exit wakes the process */
     }
 }
 
 /* ---- sessions and process groups ------------------------------------------ */
+/* Set the process group and session of every thread of t's process. */
+static void set_ids(struct tcb *t, int pgid, int sid, bool drop_ctty)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *o = task_slot(i);
+        if (o->state == TASK_UNUSED || !same_group(o, t)) continue;
+        o->pgid = pgid;
+        if (sid) o->sid = sid;
+        if (drop_ctty) o->ctty = 0;
+    }
+}
+
 int64_t proc_setsid(void)
 {
     struct tcb *t = current_task();
+    uint64_t fl = irq_save();
     for (int i = 0; i < MAX_TASKS; i++) {               /* must not lead a group already */
         struct tcb *o = task_slot(i);
-        if (o->state != TASK_UNUSED && o->pgid == t->pid && o->user) return -EPERM;
+        if (o->state != TASK_UNUSED && o->user && o->pgid == t->tgid) { irq_restore(fl); return -EPERM; }
     }
-    t->sid = t->pgid = t->pid;
-    t->ctty = 0;                                        /* a new session has no terminal */
+    set_ids(t, t->tgid, t->tgid, true);                 /* a new session has no terminal */
+    irq_restore(fl);
     return t->sid;
 }
 
 int64_t proc_setpgid(int64_t pid, int64_t pgid)
 {
     struct tcb *self = current_task();
-    struct tcb *t = pid ? task_find((int)pid) : self;
-    if (!alive(t) || !t->user || (t != self && t->ppid != self->pid)) return -ESRCH;
+    struct tcb *t = pid ? process_of((int)pid) : self;
+    if (!proc_alive(t) || !t->user || (!same_group(t, self) && t->ppid != self->tgid)) return -ESRCH;
     if (pgid < 0) return -EINVAL;
-    if (t->sid == t->pid) return -EPERM;                /* session leader */
-    t->pgid = pgid ? (int)pgid : t->pid;
+    if (t->sid == t->tgid) return -EPERM;               /* session leader */
+    uint64_t fl = irq_save();
+    set_ids(t, pgid ? (int)pgid : t->tgid, 0, false);
+    irq_restore(fl);
     return 0;
 }
 
@@ -388,7 +570,13 @@ int64_t proc_getsid(int64_t pid)
     return t && t->state != TASK_UNUSED ? t->sid : -ESRCH;
 }
 
-/* ---- signals ------------------------------------------------------------- */
+/* ---- signals -----------------------------------------------------------------
+ * The mask and a pending set are per thread; the actions (sighand) and a
+ * second pending set (signal->shared_pending) belong to the process. A
+ * signal sent to a process (kill, the terminal, SIGCHLD, SIGALRM) goes into
+ * the shared set, and one thread that does not block it is woken to take it;
+ * a signal sent to a thread (tgkill, a CPU fault) only that thread takes. A
+ * fatal signal ends the whole process. */
 static bool default_ignored(int sig)
 {
     switch (sig) {
@@ -403,37 +591,67 @@ static bool default_ignored(int sig)
 static bool ignored(const struct tcb *t, int sig)
 {
     if (sig == SIGKILL) return false;
-    const struct k_sigaction *k = &t->sigact[sig - 1];
+    const struct k_sigaction *k = &t->sighand->action[sig - 1];
     return k->handler == SIG_IGN || (k->handler == SIG_DFL && default_ignored(sig));
 }
 
-int signal_send_info(struct tcb *t, int sig, const struct ksig_info *info)
+static uint64_t blocked_of(const struct tcb *t) { return t->sig_mask & ~UNBLOCKABLE; }
+
+int signal_send_thread(struct tcb *t, int sig, const struct ksig_info *info)
 {
-    if (!alive(t) || !t->user) return -ESRCH;
+    if (!thread_alive(t) || !t->user) return -ESRCH;
     if (sig == 0) return 0;
     if (sig < 1 || sig > NSIG) return -EINVAL;
     if (ignored(t, sig)) return 0;                      /* discarded at generation */
     uint64_t fl = irq_save();
-    if (!(t->sig_pending & sigbit(sig))) {              /* standard signals do not queue */
-        if (info) t->siginfo[sig - 1] = *info;
-        else t->siginfo[sig - 1] = (struct ksig_info){ .code = SI_KERNEL };
-    }
+    if (!(t->sig_pending & sigbit(sig)))                /* standard signals do not queue */
+        t->siginfo[sig - 1] = info ? *info : (struct ksig_info){ .code = SI_KERNEL };
     t->sig_pending |= sigbit(sig);
-    if (sig == SIGKILL || !(t->sig_mask & sigbit(sig))) task_interrupt(t);
+    if (!(blocked_of(t) & sigbit(sig))) task_interrupt(t);
+    irq_restore(fl);
+    return 0;
+}
+
+int signal_send_info(struct tcb *t, int sig, const struct ksig_info *info)
+{
+    if (!proc_alive(t) || !t->user) return -ESRCH;
+    if (sig == 0) return 0;
+    if (sig < 1 || sig > NSIG) return -EINVAL;
+    if (ignored(t, sig)) return 0;
+    struct signal_struct *g = t->signal;
+    uint64_t fl = irq_save();
+    if (sig == SIGKILL) {                               /* every thread, at once */
+        for (int i = 0; i < MAX_TASKS; i++) {
+            struct tcb *o = task_slot(i);
+            if (thread_alive(o) && same_group(o, t)) signal_send_thread(o, SIGKILL, info);
+        }
+        irq_restore(fl);
+        return 0;
+    }
+    if (!(g->shared_pending & sigbit(sig)))
+        g->shared_info[sig - 1] = info ? *info : (struct ksig_info){ .code = SI_KERNEL };
+    g->shared_pending |= sigbit(sig);
+    /* wake one thread that will take it: t itself if it can */
+    struct tcb *w = thread_alive(t) && !(blocked_of(t) & sigbit(sig)) ? t : NULL;
+    for (int i = 0; i < MAX_TASKS && !w; i++) {
+        struct tcb *o = task_slot(i);
+        if (thread_alive(o) && same_group(o, t) && !(blocked_of(o) & sigbit(sig))) w = o;
+    }
+    if (w) task_interrupt(w);
     irq_restore(fl);
     return 0;
 }
 
 int signal_send(struct tcb *t, int sig) { return signal_send_info(t, sig, NULL); }
 
-/* A synchronous fault of the current process (idt.c). Like Linux's
+/* A synchronous fault of the current thread (idt.c). Like Linux's
  * force_sig_fault(): a fault cannot be ignored or blocked -- if it is, the
  * action reverts to the default (the process dies) instead of returning to
  * the faulting instruction forever. */
 void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err)
 {
     struct tcb *t = current_task();
-    struct k_sigaction *k = &t->sigact[sig - 1];
+    struct k_sigaction *k = &t->sighand->action[sig - 1];
     uint64_t fl = irq_save();
     if (k->handler == SIG_IGN || (t->sig_mask & sigbit(sig))) {
         k->handler = SIG_DFL;
@@ -444,22 +662,33 @@ void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint6
     irq_restore(fl);
 }
 
+static uint64_t pending_of(const struct tcb *t) { return t->sig_pending | t->signal->shared_pending; }
+
 bool signal_pending(void)
 {
     struct tcb *t = current_task();
-    return t->user && (t->sig_pending & ~(t->sig_mask & ~UNBLOCKABLE));
+    return t->user && (pending_of(t) & ~blocked_of(t));
 }
 
 static bool fault_signal(int sig) { return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE || sig == SIGTRAP; }
 
-__attribute__((noreturn)) static void die(struct tcb *t, int sig, uint64_t rip)
+/* The thread dies of sig; unless execve is clearing out the other threads,
+ * the whole process goes with it (status: killed by sig). */
+__attribute__((noreturn)) static void die(struct tcb *t, int sig, uint64_t rip, const struct ksig_info *i)
 {
-    const struct ksig_info *i = &t->siginfo[sig - 1];
-    if (fault_signal(sig) && i->trapno)
-        kprintf("process %d (%s): killed by signal %d (code %d, address %lx) at RIP=%lx\n",
-                t->pid, t->name, sig, i->code, i->addr, rip);
-    else
-        kprintf("process %d (%s): killed by signal %d\n", t->pid, t->name, sig);
+    struct signal_struct *g = t->signal;
+    cli();
+    if (!g->group_exit && !(g->exec_kill && sig == SIGKILL)) {
+        if (fault_signal(sig) && i->trapno)
+            kprintf("process %d (%s): thread %d killed by signal %d (code %d, address %lx) at RIP=%lx\n",
+                    t->tgid, t->name, t->pid, sig, i->code, i->addr, rip);
+        else
+            kprintf("process %d (%s): killed by signal %d\n", t->tgid, t->name, sig);
+        g->group_exit = true;
+        g->group_exit_code = 128 + sig;
+        g->group_term_signal = sig;
+        kill_other_threads(t);
+    }
     t->term_signal = sig;
     sti();
     task_exit(128 + sig);
@@ -508,7 +737,8 @@ static bool user_code(uint64_t a) { return uvm_range_ok(a, 1); }
 /* Build the frame in kernel memory, then copy it to the user stack in one
  * checked copy: a bad or unmapped stack (or one another thread unmaps right
  * now) makes delivery fail cleanly, and the process dies of SIGSEGV. */
-static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_sigaction *k)
+static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_sigaction *k,
+                        const struct ksig_info *si)
 {
     if (!(k->flags & SA_RESTORER) || !user_code(k->handler) || !user_code(k->restorer)) return false;
     uint64_t sp = f->rsp - 128;                         /* skip the red zone */
@@ -525,7 +755,6 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_si
     irq_restore(fl);
     if (bad) return false;
 
-    const struct ksig_info *si = &t->siginfo[sig - 1];
     fr.pretcode = k->restorer;
     struct sigctx *m = &fr.uc.mc;
     m->r8 = f->r8; m->r9 = f->r9; m->r10 = f->r10; m->r11 = f->r11;
@@ -579,24 +808,32 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
     struct tcb *t = current_task();
     if (!t->user || (f->cs & 3) != 3) return;
     int64_t ret = syscall ? (int64_t)f->rax : 0;
+    struct signal_struct *g = t->signal;
     for (;;) {
-        uint64_t ready = t->sig_pending & ~(t->sig_mask & ~UNBLOCKABLE);
+        uint64_t ready = pending_of(t) & ~blocked_of(t);
         if (!ready) break;
-        int sig = __builtin_ctzll(ready) + 1;
-        t->sig_pending &= ~sigbit(sig);
-        struct k_sigaction *k = &t->sigact[sig - 1];
+        int sig = (ready & sigbit(SIGKILL)) ? SIGKILL : __builtin_ctzll(ready) + 1;
+        struct ksig_info info;
+        if (t->sig_pending & sigbit(sig)) {             /* this thread's own first */
+            t->sig_pending &= ~sigbit(sig);
+            info = t->siginfo[sig - 1];
+        } else {
+            g->shared_pending &= ~sigbit(sig);
+            info = g->shared_info[sig - 1];
+        }
+        struct k_sigaction *k = &t->sighand->action[sig - 1];
         if (sig == SIGKILL || k->handler == SIG_DFL) {
             if (sig != SIGKILL && default_ignored(sig)) continue;
-            die(t, sig, f->rip);
+            die(t, sig, f->rip, &info);
         }
         if (k->handler == SIG_IGN) continue;
         if (syscall) {
             if (ret == -ERESTARTSYS && (k->flags & SA_RESTART)) restart(f, nr);
             else if (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND) f->rax = (uint64_t)-EINTR;
         }
-        if (!setup_frame(t, f, sig, k)) {
-            t->siginfo[SIGSEGV - 1] = (struct ksig_info){ .code = SI_KERNEL };
-            die(t, SIGSEGV, f->rip);
+        if (!setup_frame(t, f, sig, k, &info)) {
+            struct ksig_info segv = { .code = SI_KERNEL };
+            die(t, SIGSEGV, f->rip, &segv);
         }
         return;                                         /* one handler per return */
     }
@@ -631,9 +868,9 @@ int64_t sig_return(void)
     t->sig_mask = uc.sigmask & ~UNBLOCKABLE;
     t->iret_return = true;                              /* rcx and r11 matter now */
     return (int64_t)m->rax;
-bad:
-    t->siginfo[SIGSEGV - 1] = (struct ksig_info){ .code = SI_KERNEL };
-    die(t, SIGSEGV, f->rip);
+bad:;
+    struct ksig_info segv = { .code = SI_KERNEL };
+    die(t, SIGSEGV, f->rip, &segv);
 }
 
 int64_t sig_action(uint64_t sig, uint64_t act, uint64_t oact, uint64_t size)
@@ -641,14 +878,20 @@ int64_t sig_action(uint64_t sig, uint64_t act, uint64_t oact, uint64_t size)
     struct tcb *t = current_task();
     if (size != 8 || sig < 1 || sig > NSIG) return -EINVAL;
     if (act && (sig == SIGKILL || sig == SIGSTOP)) return -EINVAL;
-    struct k_sigaction k, old = t->sigact[sig - 1];
+    struct k_sigaction k, old = t->sighand->action[sig - 1];
     if (act && copy_from_user(&k, (const void *)act, sizeof k)) return -EFAULT;
     if (oact && copy_to_user((void *)oact, &old, sizeof old)) return -EFAULT;
     if (act) {
         k.mask &= ~UNBLOCKABLE;
         uint64_t fl = irq_save();
-        t->sigact[sig - 1] = k;
-        if (ignored(t, (int)sig)) t->sig_pending &= ~sigbit((int)sig);
+        t->sighand->action[sig - 1] = k;
+        if (ignored(t, (int)sig)) {                     /* pending ones are discarded, in every thread */
+            t->signal->shared_pending &= ~sigbit((int)sig);
+            for (int i = 0; i < MAX_TASKS; i++) {
+                struct tcb *o = task_slot(i);
+                if (o->state != TASK_UNUSED && o->sighand == t->sighand) o->sig_pending &= ~sigbit((int)sig);
+            }
+        }
         irq_restore(fl);
     }
     return 0;
@@ -677,7 +920,7 @@ int64_t sig_pending_set(uint64_t set, uint64_t size)
 {
     struct tcb *t = current_task();
     if (size != 8) return -EINVAL;
-    uint64_t v = t->sig_pending & t->sig_mask;
+    uint64_t v = pending_of(t) & t->sig_mask;
     return copy_to_user((void *)set, &v, 8) ? -EFAULT : 0;
 }
 
@@ -710,28 +953,35 @@ int64_t sig_kill(int64_t pid, int64_t sig)
 {
     struct tcb *self = current_task();
     if (sig < 0 || sig > NSIG) return -EINVAL;
-    struct ksig_info info = { .code = SI_USER, .pid = self->pid, .uid = self->uid };
+    struct ksig_info info = { .code = SI_USER, .pid = self->tgid, .uid = self->uid };
     if (pid > 0) {
-        struct tcb *t = task_find((int)pid);
+        struct tcb *t = process_of((int)pid);
         if (!t || t->state == TASK_UNUSED) return -ESRCH;
         if (!t->user) return -EPERM;                    /* kernel threads */
-        if (t->state == TASK_ZOMBIE) return 0;
+        if (!proc_alive(t)) return 0;                   /* a zombie */
         return signal_send_info(t, (int)sig, &info);
     }
     int pgid = pid == 0 ? self->pgid : (int)-pid;
     bool found = false;
-    for (int i = 0; i < MAX_TASKS; i++) {
+    for (int i = 0; i < MAX_TASKS; i++) {               /* each process once: through its leader */
         struct tcb *t = task_slot(i);
-        if (!alive(t) || !t->user) continue;
-        if (pid == -1 ? t == self : t->pgid != pgid) continue;
+        if (!proc_alive(t) || !t->user || !is_leader(t)) continue;
+        if (pid == -1 ? same_group(t, self) : t->pgid != pgid) continue;
         found = true;
         signal_send_info(t, (int)sig, &info);
     }
     return found ? 0 : -ESRCH;
 }
 
+/* tgkill(tgid, tid, sig) and tkill(tid, sig) (tgid 0): one thread. */
 int64_t sig_tgkill(int64_t tgid, int64_t tid, int64_t sig)
 {
-    if (tid <= 0 || (tgid > 0 && tgid != tid)) return -ESRCH;   /* one thread per process */
-    return sig_kill(tid, sig);
+    struct tcb *self = current_task();
+    if (sig < 0 || sig > NSIG) return -EINVAL;
+    if (tid <= 0 || tgid < 0) return -EINVAL;
+    struct tcb *t = task_find((int)tid);
+    if (!thread_alive(t) || (tgid > 0 && t->tgid != tgid)) return -ESRCH;
+    if (!t->user) return -EPERM;
+    struct ksig_info info = { .code = SI_TKILL, .pid = self->tgid, .uid = self->uid };
+    return signal_send_thread(t, (int)sig, &info);
 }

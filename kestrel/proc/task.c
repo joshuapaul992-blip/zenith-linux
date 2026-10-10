@@ -49,6 +49,91 @@ const char *task_state_name(enum task_state s)
     return s <= TASK_ZOMBIE ? n[s] : "?";
 }
 
+/* ---- shared process state ------------------------------------------------- */
+struct files_struct *files_new(void)
+{
+    struct files_struct *f = kzalloc(sizeof *f);
+    if (f) f->refs = 1;
+    return f;
+}
+
+struct files_struct *files_dup(struct files_struct *src)
+{
+    struct files_struct *f = files_new();
+    if (!f) return NULL;
+    uint64_t fl = irq_save();
+    for (int i = 0; i < MAX_FDS; i++) {
+        f->fd[i] = vfs_file_get(src->fd[i]);
+        f->cloexec[i] = src->cloexec[i];
+    }
+    irq_restore(fl);
+    return f;
+}
+
+void files_put(struct files_struct *f)
+{
+    if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    for (int i = 0; i < MAX_FDS; i++) if (f->fd[i]) { struct file *x = f->fd[i]; f->fd[i] = NULL; vfs_close(x); }
+    kfree(f);
+}
+
+struct fs_struct *fs_new(struct vnode *cwd, uint32_t umask)
+{
+    struct fs_struct *f = kzalloc(sizeof *f);
+    if (!f) return NULL;
+    f->refs = 1;
+    f->cwd = cwd;
+    f->umask = umask;
+    return f;
+}
+
+void fs_put(struct fs_struct *f)
+{
+    if (f && __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) == 0) kfree(f);
+}
+
+struct sighand_struct *sighand_new(const struct sighand_struct *copy)
+{
+    struct sighand_struct *h = kzalloc(sizeof *h);
+    if (!h) return NULL;
+    if (copy) memcpy(h->action, copy->action, sizeof h->action);
+    h->refs = 1;
+    return h;
+}
+
+void sighand_put(struct sighand_struct *h)
+{
+    if (h && __atomic_sub_fetch(&h->refs, 1, __ATOMIC_ACQ_REL) == 0) kfree(h);
+}
+
+struct signal_struct *signal_new(void)
+{
+    struct signal_struct *g = kzalloc(sizeof *g);
+    if (!g) return NULL;
+    g->refs = 1;
+    g->nr_threads = 1;
+    return g;
+}
+
+void signal_put(struct signal_struct *g)
+{
+    if (g && __atomic_sub_fetch(&g->refs, 1, __ATOMIC_ACQ_REL) == 0) kfree(g);
+}
+
+/* Fresh per-process state for a new task (a kernel thread, or the start of
+ * a fork before the clone flags decide what is shared). */
+static bool task_state_new(struct tcb *t, struct tcb *from)
+{
+    t->files = files_new();
+    t->fs = fs_new(from && from->fs ? from->fs->cwd : NULL, from && from->fs ? from->fs->umask : 022);
+    t->sighand = sighand_new(NULL);
+    t->signal = signal_new();
+    if (t->files && t->fs && t->sighand && t->signal) return true;
+    files_put(t->files); fs_put(t->fs); sighand_put(t->sighand); signal_put(t->signal);
+    t->files = NULL; t->fs = NULL; t->sighand = NULL; t->signal = NULL;
+    return false;
+}
+
 void sched_init(void)
 {
     /* Adopt the boot thread as pid 0. It runs the boot manager and then
@@ -62,6 +147,7 @@ void sched_init(void)
     t->kstack_size = (size_t)(boot_stack_top - boot_stack);
     t->cr3 = read_cr3();
     t->quantum = SCHED_QUANTUM;
+    if (!task_state_new(t, NULL)) panic("sched: out of memory");
     cur = t;
     tss_set_kernel_stack((uint64_t)boot_stack_top);
     syscall_kernel_rsp = (uint64_t)boot_stack_top;
@@ -99,7 +185,10 @@ bool task_stack_guard_hit(const struct tcb *t, uint64_t addr)
 
 static void reap_one(struct tcb *t)
 {
-    for (int fd = 0; fd < MAX_FDS; fd++) if (t->fds[fd]) vfs_close(t->fds[fd]);
+    files_put(t->files); t->files = NULL;              /* normally dropped at exit already */
+    fs_put(t->fs); t->fs = NULL;
+    sighand_put(t->sighand); t->sighand = NULL;
+    signal_put(t->signal); t->signal = NULL;
     if (t->mm) { mm_put(t->mm); t->mm = NULL; }       /* normally gone at exit already */
     t->pml4 = 0;
     kstack_free(t->kstack);
@@ -142,6 +231,26 @@ void task_interrupt(struct tcb *t)
     }
 }
 
+void task_block_self(void *chan, uint64_t deadline_ms)
+{
+    cur->wait_chan = chan;
+    if (deadline_ms) {
+        uint64_t now = time_ms();
+        cur->wake_tick = pit_ticks() + (deadline_ms > now ? (deadline_ms - now) * PIT_HZ / 1000 : 0);
+        cur->state = TASK_SLEEPING;
+    } else {
+        cur->state = TASK_BLOCKED;
+    }
+}
+
+void task_wake(struct tcb *t)
+{
+    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
+        t->state = TASK_READY;
+        need_resched = true;
+    }
+}
+
 struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
 {
     uint64_t f = irq_save();
@@ -156,6 +265,7 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
 
     t->kstack = kstack_alloc();
     if (!t->kstack) { t->state = TASK_UNUSED; return NULL; }
+    if (!task_state_new(t, cur)) { kstack_free(t->kstack); t->kstack = NULL; t->state = TASK_UNUSED; return NULL; }
     t->kstack_size = KSTACK_SIZE;
 
     /* Fake context_switch frame: r15 r14 r13 r12 rbp rbx rflags rip */
@@ -168,16 +278,14 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     *--sp = 0; *--sp = 0; *--sp = 0;        /* r13 r14 r15             */
     t->rsp = (uint64_t)sp;
 
-    t->pid = next_pid++;
-    t->ppid = cur ? cur->pid : 0;
+    t->pid = t->tgid = next_pid++;
+    t->ppid = cur ? cur->tgid : 0;
     t->pgid = t->sid = t->pid;
     strlcpy(t->name, name, sizeof t->name);
     t->cr3 = read_cr3();
     t->quantum = SCHED_QUANTUM;
     t->start_tick = pit_ticks();
-    t->cwd = cur ? cur->cwd : NULL;
     t->tty = cur ? cur->tty : 0;
-    t->umask = 022;
     t->state = TASK_READY;
     kprintf("sched: created pid %d (%s)\n", t->pid, t->name);
     return t;
@@ -262,9 +370,10 @@ void sched_tick(void)
             tasks[i].state = TASK_READY;
             need_resched = true;
         }
-        if (tasks[i].alarm_at && ms >= tasks[i].alarm_at && tasks[i].state != TASK_ZOMBIE &&
-            tasks[i].state != TASK_UNUSED) {          /* ITIMER_REAL expired */
-            tasks[i].alarm_at = tasks[i].alarm_every ? ms + tasks[i].alarm_every : 0;
+        struct signal_struct *g = tasks[i].signal;      /* ITIMER_REAL: per process, on its leader */
+        if (g && g->alarm_at && ms >= g->alarm_at && tasks[i].pid == tasks[i].tgid &&
+            tasks[i].state != TASK_ZOMBIE && tasks[i].state != TASK_UNUSED) {
+            g->alarm_at = g->alarm_every ? ms + g->alarm_every : 0;
             signal_send(&tasks[i], SIGALRM);
         }
     }
@@ -330,11 +439,17 @@ void task_sleep_ms(uint64_t ms)
 
 void task_exit(int code)
 {
+    cur->exit_code = code;
+    /* User threads: clear_child_tid + futex wake, robust futexes -- while
+     * the address space is still there (this touches user memory). */
+    if (cur->user) { sti(); process_thread_exit(cur); }
     cli();
     kprintf("sched: pid %d (%s) exited with status %d\n", cur->pid, cur->name, code);
-    /* close now, not at reap time: pipe and socket peers must see EOF */
-    for (int fd = 0; fd < MAX_FDS; fd++) if (cur->fds[fd]) { vfs_close(cur->fds[fd]); cur->fds[fd] = NULL; }
-    cur->exit_code = code;
+    /* close now, not at reap time: pipe and socket peers must see EOF (the
+     * table goes when the last thread sharing it is gone) */
+    struct files_struct *files = cur->files;
+    cur->files = NULL;
+    files_put(files);
     /* Give the address space back now, not when the parent reaps us: memory
      * comes back at once (the OOM killer relies on that). Run on the kernel
      * page tables from here on. */
@@ -348,13 +463,14 @@ void task_exit(int code)
         mm_put(mm);
         cli();
     }
-    process_exit(cur);                          /* parent, children, vfork */
+    process_exit(cur);                          /* thread group, parent, children, vfork */
     cur->state = TASK_ZOMBIE;
     wakeup(cur);                                /* anyone waiting on us */
     schedule();
     panic("zombie task %d was rescheduled", cur->pid);
 }
 
+/* Wait for process (or kernel thread) `pid` to end: every thread of it. */
 int task_wait(int pid)
 {
     uint64_t f = irq_save();
@@ -363,7 +479,14 @@ int task_wait(int pid)
         if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid) { t = &tasks[i]; break; }
     if (!t || t == cur) { irq_restore(f); return -ECHILD; }
     t->waiters++;
-    while (t->state != TASK_ZOMBIE) sleep_on(t);
+    for (;;) {
+        if (t->pid != pid) {                    /* a thread's execve took over the pid: */
+            t = task_find(pid);                 /* the waiter count moved with it        */
+            if (!t) { irq_restore(f); return -ECHILD; }
+        }
+        if (t->state == TASK_ZOMBIE && (!t->signal || t->signal->nr_threads == 0)) break;
+        sleep_on(t);
+    }
     int code = t->exit_code;
     t->waiters--;
     irq_restore(f);

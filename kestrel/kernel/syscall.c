@@ -28,6 +28,7 @@
 #include <kernel/kinput.h>
 #include <kernel/vm.h>
 #include <kernel/vmobj.h>
+#include <kernel/futex.h>
 
 extern void syscall_entry(void);
 
@@ -53,7 +54,7 @@ static struct file *fget(int fd)
     struct tcb *t = current_task();
     if (fd < 0 || fd >= MAX_FDS) return NULL;
     uint64_t fl = irq_save();
-    struct file *f = vfs_file_get(t->fds[fd]);
+    struct file *f = vfs_file_get(t->files->fd[fd]);
     irq_restore(fl);
     return f;
 }
@@ -65,9 +66,9 @@ static int fd_alloc(struct tcb *t, int min, struct file *f, bool cloexec)
 {
     uint64_t fl = irq_save();
     for (int fd = min < 0 ? 0 : min; fd < MAX_FDS; fd++)
-        if (!t->fds[fd]) {
-            t->fds[fd] = f;
-            t->fd_cloexec[fd] = cloexec;
+        if (!t->files->fd[fd]) {
+            t->files->fd[fd] = f;
+            t->files->cloexec[fd] = cloexec;
             irq_restore(fl);
             return fd;
         }
@@ -80,9 +81,9 @@ static struct file *fd_take(struct tcb *t, int fd)
 {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
     uint64_t fl = irq_save();
-    struct file *f = t->fds[fd];
-    t->fds[fd] = NULL;
-    t->fd_cloexec[fd] = 0;
+    struct file *f = t->files->fd[fd];
+    t->files->fd[fd] = NULL;
+    t->files->cloexec[fd] = 0;
     irq_restore(fl);
     return f;
 }
@@ -461,7 +462,7 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t path, uint64_t times, uint
 
 /* ---- processes ---------------------------------------------------------- */
 static int64_t sys_getpid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->pid; }
+{ UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->tgid; }      /* the process; gettid: the thread */
 
 static int64_t sys_getppid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->ppid; }
@@ -476,7 +477,10 @@ static int64_t sys_sched_yield(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a
 { UNUSED6(a1, a2, a3, a4, a5, a6); sched_yield(); return 0; }
 
 static int64_t sys_exit(uint64_t code, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; task_exit((int)(code & 0xff)); }
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; task_exit((int)(code & 0xff)); }      /* this thread */
+
+static int64_t sys_exit_group(uint64_t code, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; proc_exit_group((int)(code & 0xff)); }
 
 static int timespec_ok(const struct timespec *ts) { return ts->tv_sec >= 0 && ts->tv_nsec >= 0 && ts->tv_nsec < 1000000000; }
 
@@ -798,6 +802,52 @@ static int64_t sys_set_tid_address(uint64_t ptr, uint64_t a2, uint64_t a3, uint6
 static int64_t sys_gettid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { UNUSED6(a1, a2, a3, a4, a5, a6); return current_task()->pid; }
 
+/* ---- threads ------------------------------------------------------------- */
+static int64_t sys_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t utime, uint64_t uaddr2, uint64_t val3)
+{ return sys_futex_call(uaddr, (int)op, (uint32_t)val, utime, uaddr2, (uint32_t)val3); }
+
+/* The head of the robust-futex list (struct robust_list_head: next,
+ * futex_offset, list_op_pending). It is read only when the thread exits. */
+static int64_t sys_set_robust_list(uint64_t head, uint64_t len, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (len != 24) return -EINVAL;
+    current_task()->robust_list = head;
+    return 0;
+}
+
+static int64_t sys_get_robust_list(uint64_t tid, uint64_t uhead, uint64_t ulen, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct tcb *self = current_task(), *t = tid ? task_find((int)tid) : self;
+    if (!t || t->state == TASK_UNUSED || t->state == TASK_ZOMBIE || !t->user) return -ESRCH;
+    if (t->signal != self->signal && t->uid != self->uid && self->uid) return -EPERM;
+    if (put_user_u64((void *)uhead, t->robust_list) || put_user_u64((void *)ulen, 24)) return -EFAULT;
+    return 0;
+}
+
+/* One CPU (for now): the mask always has bit 0. */
+static int64_t sys_sched_getaffinity(uint64_t pid, uint64_t len, uint64_t umask, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    if (len < 8 || (len & 7)) return -EINVAL;
+    if (len > 128) len = 128;
+    uint8_t buf[128] = { 1 };
+    if (copy_to_user((void *)umask, buf, len)) return -EFAULT;
+    return (int64_t)len;
+}
+
+static int64_t sys_sched_setaffinity(uint64_t pid, uint64_t len, uint64_t umask, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    uint8_t first;
+    if (!len) return -EINVAL;
+    if (copy_from_user(&first, (const void *)umask, 1)) return -EFAULT;
+    return (first & 1) ? 0 : -EINVAL;                   /* CPU 0 must be in it */
+}
+
 struct iovec { uint64_t base, len; };
 
 /* readv/writev: the vector is copied in whole, then each segment goes
@@ -858,8 +908,8 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
         r = fd_alloc(t, (int)arg, vfs_file_get(f), cmd == F_DUPFD_CLOEXEC);
         if (r < 0) vfs_close(f);                        /* the reference meant for the table */
         break;
-    case F_GETFD: r = t->fd_cloexec[fd] ? FD_CLOEXEC : 0; break;
-    case F_SETFD: t->fd_cloexec[fd] = (arg & FD_CLOEXEC) != 0; r = 0; break;
+    case F_GETFD: r = t->files->cloexec[fd] ? FD_CLOEXEC : 0; break;
+    case F_SETFD: t->files->cloexec[fd] = (arg & FD_CLOEXEC) != 0; r = 0; break;
     case F_GETFL: r = f->flags & ~O_CLOEXEC; break;
     case 1033: {                                        /* F_ADD_SEALS */
         struct vm_object *o = f->vn->type == VREG ? vfs_vmobject(f->vn) : NULL;
@@ -899,9 +949,9 @@ static int64_t do_dup(int oldfd, int newfd, int flags, bool any)
     if (newfd < 0 || newfd >= MAX_FDS) { fput(f); return -EBADF; }
     if (newfd == oldfd) { fput(f); return flags ? -EINVAL : newfd; }   /* dup3 refuses, dup2 is a no-op */
     uint64_t fl = irq_save();
-    struct file *old = t->fds[newfd];
-    t->fds[newfd] = f;
-    t->fd_cloexec[newfd] = (flags & O_CLOEXEC) != 0;
+    struct file *old = t->files->fd[newfd];
+    t->files->fd[newfd] = f;
+    t->files->cloexec[newfd] = (flags & O_CLOEXEC) != 0;
     irq_restore(fl);
     if (old) vfs_close(old);
     return newfd;
@@ -1133,8 +1183,9 @@ static void ms_tv(uint64_t ms, struct ktimeval *tv) { tv->sec = (int64_t)(ms / 1
 static void timer_get(struct tcb *t, struct ktimeval out[2])
 {
     uint64_t now = time_ms();
-    ms_tv(t->alarm_every, &out[0]);
-    ms_tv(t->alarm_at > now ? t->alarm_at - now : (t->alarm_at ? 1 : 0), &out[1]);
+    struct signal_struct *g = t->signal;
+    ms_tv(g->alarm_every, &out[0]);
+    ms_tv(g->alarm_at > now ? g->alarm_at - now : (g->alarm_at ? 1 : 0), &out[1]);
 }
 static int64_t sys_getitimer(uint64_t which, uint64_t cur, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
@@ -1159,8 +1210,8 @@ static int64_t sys_setitimer(uint64_t which, uint64_t nv, uint64_t ov, uint64_t 
     if (ov && copy_to_user((void *)ov, old, sizeof old)) return -EFAULT;
     if (nv) {
         uint64_t value = tv_ms(&v[1]);
-        t->alarm_every = tv_ms(&v[0]);
-        t->alarm_at = value ? time_ms() + value : 0;
+        t->signal->alarm_every = tv_ms(&v[0]);
+        t->signal->alarm_at = value ? time_ms() + value : 0;
     }
     return 0;
 }
@@ -1169,9 +1220,10 @@ static int64_t sys_alarm(uint64_t sec, uint64_t a2, uint64_t a3, uint64_t a4, ui
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct tcb *t = current_task();
     uint64_t now = time_ms();
-    int64_t left = t->alarm_at > now ? (int64_t)((t->alarm_at - now + 999) / 1000) : 0;
-    t->alarm_every = 0;
-    t->alarm_at = sec ? now + (sec > (1ull << 32) ? (1ull << 32) : sec) * 1000 : 0;
+    struct signal_struct *g = t->signal;
+    int64_t left = g->alarm_at > now ? (int64_t)((g->alarm_at - now + 999) / 1000) : 0;
+    g->alarm_every = 0;
+    g->alarm_at = sec ? now + (sec > (1ull << 32) ? (1ull << 32) : sec) * 1000 : 0;
     return left;
 }
 
@@ -1277,8 +1329,8 @@ static int64_t sys_umask(uint64_t mask, uint64_t a2, uint64_t a3, uint64_t a4, u
 {
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct tcb *t = current_task();
-    uint32_t old = t->umask;
-    t->umask = (uint32_t)mask & 0777;
+    uint32_t old = t->fs->umask;
+    t->fs->umask = (uint32_t)mask & 0777;
     return old;
 }
 
@@ -1676,7 +1728,7 @@ static void rlimit_of(int res, uint64_t out[2])
 static int64_t sys_prlimit64(uint64_t pid, uint64_t res, uint64_t newp, uint64_t oldp, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
-    if (pid && (int)pid != current_task()->pid) return -EPERM;
+    if (pid && (int)pid != current_task()->tgid) return -EPERM;
     if (res > 15) return -EINVAL;
     uint64_t cur[2], n[2];
     rlimit_of((int)res, cur);
@@ -1749,7 +1801,7 @@ void syscall_init(void)
     REG(SYS_lseek, sys_lseek);         REG(SYS_ioctl, sys_ioctl);
     REG(SYS_sched_yield, sys_sched_yield);
     REG(SYS_nanosleep, sys_nanosleep); REG(SYS_getpid, sys_getpid);
-    REG(SYS_exit, sys_exit);           REG(SYS_exit_group, sys_exit);
+    REG(SYS_exit, sys_exit);           REG(SYS_exit_group, sys_exit_group);
     REG(SYS_uname, sys_uname);         REG(SYS_getcwd, sys_getcwd);
     REG(SYS_chdir, sys_chdir);         REG(SYS_mkdir, sys_mkdir);
     REG(SYS_rmdir, sys_rmdir);         REG(SYS_unlink, sys_unlink);
@@ -1769,6 +1821,11 @@ void syscall_init(void)
     REG(SYS_madvise, sys_madvise);     REG(SYS_arch_prctl, sys_arch_prctl);
     REG(SYS_set_tid_address, sys_set_tid_address);
     REG(SYS_gettid, sys_gettid);
+    REG(SYS_futex, sys_futex);
+    REG(SYS_set_robust_list, sys_set_robust_list);
+    REG(SYS_get_robust_list, sys_get_robust_list);
+    REG(SYS_sched_getaffinity, sys_sched_getaffinity);
+    REG(SYS_sched_setaffinity, sys_sched_setaffinity);
     REG(SYS_rt_sigaction, sys_rt_sigaction);
     REG(SYS_rt_sigprocmask, sys_rt_sigprocmask);
     REG(SYS_readv, sys_readv);         REG(SYS_writev, sys_writev);
@@ -1853,7 +1910,7 @@ int syscall_dispatch(struct int_frame *f)
         if (r == -EPIPE && t->user &&
             (nr == SYS_write || nr == SYS_writev ||
              (nr == SYS_sendto && !(f->r10 & MSG_NOSIGNAL)) || (nr == SYS_sendmsg && !(f->rdx & MSG_NOSIGNAL))))
-            signal_send(t, SIGPIPE);
+            signal_send_thread(t, SIGPIPE, NULL);
         cli();
     }
     if (t->user && (f->cs & 3) == 3) signal_deliver(f, nr, true);

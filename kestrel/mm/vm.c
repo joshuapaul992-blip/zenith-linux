@@ -20,6 +20,7 @@
 #include <kernel/posix.h>
 #include <kernel/process.h>
 #include <kernel/uaccess.h>
+#include <kernel/time.h>
 
 #define PTE_P        0x001ull
 #define PTE_W        0x002ull
@@ -257,6 +258,9 @@ static void free_tables(uint64_t *t, int level)
     }
 }
 
+static int      oom_pending;          /* victims whose memory is not back yet */
+static uint64_t oom_since;            /* time_ms() of the last kill           */
+
 void mm_put(struct mm *mm)
 {
     if (!mm || __atomic_sub_fetch(&mm->users, 1, __ATOMIC_ACQ_REL) > 0) return;
@@ -264,6 +268,7 @@ void mm_put(struct mm *mm)
     while (mm->vmas) { struct vma *v = mm->vmas; mm->vmas = v->next; vma_free(v); }
     free_tables((uint64_t *)mm->pml4, 4);
     pmm_free(mm->pml4);
+    if (mm->oom_victim) __atomic_sub_fetch(&oom_pending, 1, __ATOMIC_ACQ_REL);
     kfree(mm);
 }
 
@@ -641,6 +646,21 @@ void vm_mark(struct mm *mm, uint64_t addr, uint32_t flag)
     kmutex_unlock(&mm->lock);
 }
 
+/* Futex key of a shared mapping: the object and the byte offset in it. */
+int vm_shared_key(struct mm *mm, uint64_t addr, struct vm_object **obj, uint64_t *off)
+{
+    int r = -EFAULT;
+    kmutex_lock(&mm->lock);
+    struct vma *v = vma_find(mm, addr);
+    if (v) {
+        r = 0;
+        if (v->flags & VMA_SHARED && v->obj) { *obj = v->obj; *off = v->off + (addr - v->start); }
+        else *obj = NULL;
+    }
+    kmutex_unlock(&mm->lock);
+    return r;
+}
+
 /* ---- /proc/PID/maps --------------------------------------------------------- */
 size_t vm_maps(struct mm *mm, char *buf, size_t cap)
 {
@@ -665,16 +685,24 @@ size_t vm_maps(struct mm *mm, char *buf, size_t cap)
 /* ---- out of memory ------------------------------------------------------------ */
 bool oom_kill(struct tcb *spare)
 {
+    /* A victim is still giving its memory back (freeing a large address
+     * space takes a while): wait for it rather than kill another process.
+     * Five seconds without progress, and the next one goes. */
+    if (__atomic_load_n(&oom_pending, __ATOMIC_ACQUIRE) > 0 && time_ms() - oom_since < 5000) return true;
     struct tcb *victim = NULL;
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = task_slot(i);
         if (t == spare || !t->user || !t->mm || t->state == TASK_UNUSED || t->state == TASK_ZOMBIE) continue;
+        if (t->mm->oom_victim) continue;
         if (!victim || t->mm->rss > victim->mm->rss) victim = t;
     }
     if (!victim) return false;
-    if (!victim->oom_killed) {
+    if (!victim->oom_killed && !victim->signal->group_exit) {
         victim->oom_killed = true;
-        kprintf("oom: out of memory: killing pid %d (%s), %lu KiB resident\n", victim->pid, victim->name,
+        victim->mm->oom_victim = true;
+        __atomic_add_fetch(&oom_pending, 1, __ATOMIC_ACQ_REL);
+        oom_since = time_ms();
+        kprintf("oom: out of memory: killing pid %d (%s), %lu KiB resident\n", victim->tgid, victim->name,
                 victim->mm->rss * 4);
         signal_send(victim, SIGKILL);
     }

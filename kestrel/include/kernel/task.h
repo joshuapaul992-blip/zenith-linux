@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define MAX_TASKS       64
+#define MAX_TASKS       256             /* threads included */
 #define KSTACK_SIZE     (16 * 1024)
 #define TASK_NAME_LEN   24
 #define MAX_FDS         64
@@ -47,10 +47,45 @@ struct k_sigaction {
     uint64_t mask;              /* blocked while the handler runs          */
 };
 
-/* Thread Control Block. Every kernel thread (and, later, every user
- * process' main thread) is described by one of these. */
+/* ---- what the threads of a process share (clone flags decide) ----------- */
+struct files_struct {               /* CLONE_FILES: the descriptor table     */
+    int          refs;
+    struct file *fd[MAX_FDS];
+    uint8_t      cloexec[MAX_FDS];
+};
+
+struct fs_struct {                  /* CLONE_FS: working directory, umask    */
+    int           refs;
+    struct vnode *cwd;
+    uint32_t      umask;
+};
+
+struct sighand_struct {             /* CLONE_SIGHAND: signal actions         */
+    int                refs;
+    struct k_sigaction action[NSIG];
+};
+
+struct signal_struct {              /* CLONE_THREAD: the thread group        */
+    int       refs;                 /* tcbs pointing here                    */
+    int       nr_threads;           /* threads that have not exited          */
+    uint64_t  shared_pending;       /* process-directed signals (kill)       */
+    struct ksig_info shared_info[NSIG];
+    bool      group_exit;           /* exit_group() or a fatal signal        */
+    int       group_exit_code;
+    int       group_term_signal;
+    uint64_t  alarm_at, alarm_every;    /* ITIMER_REAL in ms (per process)   */
+    void     *exit_wait;            /* execve waits here for the others      */
+    bool      exec_kill;            /* execve is ending the other threads:
+                                       their deaths are not the group's      */
+};
+
+/* Thread Control Block: one per kernel thread and per user thread. A user
+ * process is a thread group: its threads share one tgid (= the leader's tid,
+ * what getpid() returns) and the structures above. */
 struct tcb {
-    int       pid, ppid;
+    int       pid;              /* thread id (tid)                          */
+    int       tgid;             /* thread group (process) id                */
+    int       ppid;             /* parent process (tgid)                    */
     char      name[TASK_NAME_LEN];
     enum task_state state;
 
@@ -69,12 +104,12 @@ struct tcb {
     int       exit_code;
     int       waiters;          /* task_wait() callers: not reaped yet   */
 
-    /* POSIX process state */
-    struct file  *fds[MAX_FDS];
-    uint8_t   fd_cloexec[MAX_FDS];      /* FD_CLOEXEC per descriptor        */
-    struct vnode *cwd;
+    /* POSIX process state (shared between threads per the clone flags) */
+    struct files_struct   *files;
+    struct fs_struct      *fs;
+    struct sighand_struct *sighand;
+    struct signal_struct  *signal;
     uint32_t  uid, gid;
-    uint32_t  umask;
     int       tty;              /* system_ttys[] index: /dev/tty, stdin/stdout */
 
     /* user process (ring 3); all zero for kernel threads */
@@ -91,7 +126,7 @@ struct tcb {
     char      exe[128];         /* program path (/proc/self/exe)           */
     char      cmdline[256];     /* argv, NUL-separated (/proc/PID/cmdline)  */
     uint16_t  cmdline_len;
-    uint64_t  alarm_at, alarm_every;    /* ITIMER_REAL in ms: next expiry, period */
+    uint64_t  robust_list;      /* set_robust_list(): head in user memory  */
     int       exit_signal;      /* sent to the parent at exit (SIGCHLD)    */
     int       term_signal;      /* killed by this signal; 0 = exit()       */
     bool      oom_killed;       /* chosen by the OOM killer                 */
@@ -99,15 +134,25 @@ struct tcb {
     struct int_frame *uframe;   /* user registers of the syscall in progress */
     bool      iret_return;      /* leave this syscall through iretq          */
 
-    /* signals */
+    /* signals: mask and thread-directed pending set are per thread */
     uint64_t  sig_pending, sig_mask;
     uint64_t  saved_mask;       /* rt_sigsuspend: mask to restore           */
     bool      saved_mask_valid;
-    struct k_sigaction sigact[NSIG];
     struct ksig_info siginfo[NSIG];
 
     int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
 };
+
+/* shared process state (proc/task.c) */
+struct files_struct   *files_new(void);
+struct files_struct   *files_dup(struct files_struct *src);    /* fork: same open files, own table */
+void                   files_put(struct files_struct *f);       /* closes all at the last put */
+struct fs_struct      *fs_new(struct vnode *cwd, uint32_t umask);
+void                   fs_put(struct fs_struct *f);
+struct sighand_struct *sighand_new(const struct sighand_struct *copy);
+void                   sighand_put(struct sighand_struct *h);
+struct signal_struct  *signal_new(void);
+void                   signal_put(struct signal_struct *g);
 
 void        sched_init(void);
 bool        sched_running(void);
@@ -142,6 +187,11 @@ struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
 void        task_reap(struct tcb *t);   /* free a zombie now (wait4)        */
 void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
+/* Futex-style sleep: mark the current task asleep on `chan` (until
+ * task_wake, a signal, or deadline_ms of time_ms() if non-zero); it stops
+ * running at the caller's next schedule(). Interrupts must be off. */
+void        task_block_self(void *chan, uint64_t deadline_ms);
+void        task_wake(struct tcb *t);       /* make a sleeping task runnable  */
 bool        task_stack_guard_hit(const struct tcb *t, uint64_t addr);  /* in t's guard page */
 const char *task_state_name(enum task_state s);
 uint64_t    sched_context_switches(void);

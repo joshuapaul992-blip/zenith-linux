@@ -5,7 +5,7 @@
 static char oldpwd[CU_PATH_MAX];                /* for "cd -" */
 
 /* pwd: the kernel tracks the working directory as a vnode on the process
- * (tcb->cwd); getcwd(2) turns it back into an absolute path. */
+ * (tcb->fs->cwd); getcwd(2) turns it back into an absolute path. */
 int pwd_main(struct cu_io *io, int argc, char **argv)
 {
     for (int i = 1; i < argc; i++)

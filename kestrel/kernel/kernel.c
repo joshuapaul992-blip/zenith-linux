@@ -468,7 +468,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     kinput_init();                  /* /dev/kinput, for the X server */
     storage_register_devices();     /* sataN + partitions in the block layer */
     ramdisk_init(mbi);              /* Multiboot2 modules (the ISO's boot volume) */
-    current_task()->cwd = vfs_root();
+    current_task()->fs->cwd = vfs_root();
 
     /* Find the Kestrel boot volume by its markers (never by device name),
      * waiting for USB storage to settle; a mandatory volume that is missing

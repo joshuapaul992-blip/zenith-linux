@@ -379,9 +379,9 @@ int exec_load_image(struct tcb *t, const char *path, const struct exec_args *a, 
 static void open_stdio(struct tcb *t, const char *dev)
 {
     for (int fd = 0; fd < 3; fd++) {
-        if (t->fds[fd]) continue;
+        if (t->files->fd[fd]) continue;
         struct file *f;
-        if ((dev[0] && vfs_open(dev, O_RDWR, 0, &f) == 0) || vfs_open("/dev/tty", O_RDWR, 0, &f) == 0 || vfs_open("/dev/console", O_RDWR, 0, &f) == 0) t->fds[fd] = f;
+        if ((dev[0] && vfs_open(dev, O_RDWR, 0, &f) == 0) || vfs_open("/dev/tty", O_RDWR, 0, &f) == 0 || vfs_open("/dev/console", O_RDWR, 0, &f) == 0) t->files->fd[fd] = f;
     }
 }
 
@@ -414,8 +414,9 @@ static int process_main(void *arg)
         return 127;
     }
     open_stdio(t, a->stdio);
-    if (a->ctty && t->fds[0] && t->fds[0]->vn->ops->fioctl)    /* a new session leader takes it */
-        t->fds[0]->vn->ops->fioctl(t->fds[0], TIOCSCTTY, 0);
+    struct file *in = t->files->fd[0];
+    if (a->ctty && in && in->vn->ops->fioctl)          /* a new session leader takes it */
+        in->vn->ops->fioctl(in, TIOCSCTTY, 0);
     kprintf("exec: pid %d: %s entry %lx, stack %lx, brk %lx\n", t->pid, a->path, entry, sp, mm->brk);
     strlcpy(t->exe, a->path, sizeof t->exe);
     kfree(a);

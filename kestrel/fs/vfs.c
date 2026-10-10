@@ -98,7 +98,7 @@ int vfs_mount(struct mount *m, const char *path)
 static struct vnode *cwd_node(void)
 {
     struct tcb *t = current_task();
-    return (t && t->cwd) ? t->cwd : root;
+    return (t && t->fs && t->fs->cwd) ? t->fs->cwd : root;
 }
 
 static struct vnode *child_named(struct vnode *dir, const char *name)
@@ -258,7 +258,7 @@ int vfs_rmdir(const char *path)
     if (vn->children) return -ENOTEMPTY;
     if ((r = check_writable_dir(parent)) < 0) return r;
     struct tcb *t = current_task();
-    if (t && t->cwd == vn) t->cwd = parent;             /* don't leave a dangling cwd */
+    if (t && t->fs && t->fs->cwd == vn) t->fs->cwd = parent;    /* don't leave a dangling cwd */
     node_remove(parent, vn);
     node_free(vn);
     return 0;
@@ -370,7 +370,7 @@ int vfs_chdir(const char *path)
     int r = vfs_lookup(path, &vn);
     if (r < 0) return r;
     if (vn->type != VDIR) return -ENOTDIR;
-    current_task()->cwd = vn;
+    if (current_task()->fs) current_task()->fs->cwd = vn;
     return 0;
 }
 
@@ -392,7 +392,7 @@ int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
         if ((r = walk(path, NULL, &parent, name)) < 0) return r;
         if ((r = check_writable_dir(parent)) < 0) return r;
         struct tcb *t = current_task();
-        vn = vfs_node_new(parent->fs, name, VREG, mode & ~(t ? t->umask : 022) & 0777, &ramfs_ops);
+        vn = vfs_node_new(parent->fs, name, VREG, mode & ~(t && t->fs ? t->fs->umask : 022) & 0777, &ramfs_ops);
         if (!vn) return -ENOMEM;
         vfs_node_add(parent, vn);
     } else if (r < 0) {

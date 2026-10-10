@@ -90,6 +90,7 @@ struct mm {
     struct kmutex lock;         /* regions and page tables                  */
     uint64_t     brk_start, brk;
     uint64_t     rss;           /* user pages mapped (statistics, OOM)      */
+    bool         oom_victim;    /* the OOM killer is waiting for it to go   */
 };
 
 int vm_fault(uint64_t addr, uint64_t err, bool user_mode);   /* 0, -EFAULT, -EACCES, -EIO, -ENOMEM */
@@ -114,6 +115,9 @@ int64_t vm_brk(struct mm *mm, uint64_t addr);
 int     vm_populate(struct mm *mm, uint64_t addr, uint64_t len, bool write);
 void    vm_mark(struct mm *mm, uint64_t addr, uint32_t flag);     /* VMA_STACK, ... */
 void    vm_init(void);                      /* EFER.NXE, before any user mapping */
+/* Futex key: for a shared region, its object and the offset of addr in it
+ * (*obj = NULL for private memory). -EFAULT if nothing is mapped there. */
+int     vm_shared_key(struct mm *mm, uint64_t addr, struct vm_object **obj, uint64_t *off);
 /* /proc/PID/maps */
 size_t  vm_maps(struct mm *mm, char *buf, size_t cap);
 

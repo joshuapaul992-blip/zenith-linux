@@ -224,9 +224,9 @@ static size_t gen_pid_stat(char *buf, size_t cap, void *ctx)
     /* pid (comm) state ppid pgrp session tty_nr tpgid flags minflt cminflt
      * majflt cmajflt utime stime cutime cstime priority nice threads
      * itrealvalue starttime vsize rss ... (52 fields) */
-    P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 1 0 %lu %lu %lu",
+    P("%d (%s) %c %d %d %d %d -1 %u 0 0 0 0 %lu 0 0 0 20 0 %d 0 %lu %lu %lu",
       t->pid, t->name, state_char(t), t->ppid, t->pgid, t->sid, tty, t->user ? 0u : 0x200000u,
-      ticks, start, pages * 4096, pages);
+      ticks, t->signal ? t->signal->nr_threads : 0, start, pages * 4096, pages);
     P(" 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 %d\n", t->exit_code);
     return n;
 }
@@ -240,11 +240,12 @@ static size_t gen_pid_status(char *buf, size_t cap, void *ctx)
                                          "Z (zombie)" };
     uint64_t pages = t->mm ? t->mm->rss : 0;
     P("Name:\t%s\nState:\t%s\nTgid:\t%d\nPid:\t%d\nPPid:\t%d\n", t->name,
-      t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->pid, t->pid, t->ppid);
+      t->state <= TASK_ZOMBIE ? names[t->state] : "?", t->tgid, t->pid, t->ppid);
     P("Uid:\t%u\t%u\t%u\t%u\nGid:\t%u\t%u\t%u\t%u\n", t->uid, t->uid, t->uid, t->uid,
       t->gid, t->gid, t->gid, t->gid);
     if (t->user) P("VmSize:\t%lu kB\nVmRSS:\t%lu kB\n", pages * 4, pages * 4);
-    P("Threads:\t1\nSigPnd:\t%016lx\nSigBlk:\t%016lx\n", t->sig_pending, t->sig_mask);
+    P("Threads:\t%d\nSigPnd:\t%016lx\nShdPnd:\t%016lx\nSigBlk:\t%016lx\n", t->signal ? t->signal->nr_threads : 0,
+      t->sig_pending, t->signal ? t->signal->shared_pending : 0, t->sig_mask);
     return n;
 }
 
@@ -294,11 +295,11 @@ static void proc_refresh(struct vnode *dir)
         struct pid_dir *d = &pid_dirs[i];
         if (!d->attached) continue;
         struct tcb *t = task_find(d->pid);
-        if (!t || t->state == TASK_UNUSED) { detach(dir, d->dir); d->attached = false; }
+        if (!t || t->state == TASK_UNUSED || t->pid != t->tgid) { detach(dir, d->dir); d->attached = false; }
     }
     for (int i = 0; i < MAX_TASKS; i++) {               /* new: attach a free entry */
         struct tcb *t = task_slot(i);
-        if (t->state == TASK_UNUSED) continue;
+        if (t->state == TASK_UNUSED || t->pid != t->tgid) continue;  /* processes; not their threads */
         bool have = false;
         for (int j = 0; j < MAX_TASKS && !have; j++) have = pid_dirs[j].attached && pid_dirs[j].pid == t->pid;
         if (have) continue;

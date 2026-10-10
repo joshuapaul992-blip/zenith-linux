@@ -135,8 +135,9 @@ static void group_signal(struct pty *p, int sig)
     if (!p->fg_pgrp) return;
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = task_slot(i);
-        if (t->state != TASK_UNUSED && t->state != TASK_ZOMBIE && t->user && t->pgid == p->fg_pgrp)
-            signal_send(t, sig);
+        if (t->state != TASK_UNUSED && t->user && t->pid == t->tgid && t->signal->nr_threads > 0 &&
+            t->pgid == p->fg_pgrp)
+            signal_send(t, sig);                        /* to each process once, via its leader */
     }
 }
 
@@ -359,7 +360,7 @@ static void master_release(struct file *f)
     if (p->session) {
         group_signal(p, SIGHUP);
         struct tcb *lead = task_find(p->session);
-        if (lead && lead->state != TASK_ZOMBIE && lead->user) signal_send(lead, SIGHUP);
+        if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send(lead, SIGHUP);
     }
     wakeup(&p->in);
     wakeup(&p->out);
@@ -622,7 +623,7 @@ void pty_console_hangup(int idx)
     if (p->session) {
         group_signal(p, SIGHUP);
         struct tcb *lead = task_find(p->session);
-        if (lead && lead->state != TASK_ZOMBIE && lead->user) signal_send(lead, SIGHUP);
+        if (lead && lead->user && lead->signal && lead->signal->nr_threads > 0) signal_send(lead, SIGHUP);
     }
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = task_slot(i);
