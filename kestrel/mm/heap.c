@@ -1,6 +1,11 @@
 /* mm/heap.c -- first-fit kernel heap with block splitting and coalescing.
- * The arena is a physically contiguous, identity-mapped run of frames
- * reserved once at boot. All operations are IRQ-safe. */
+ * The heap starts as one physically contiguous, identity-mapped arena
+ * reserved at boot and grows by further arenas taken from the frame
+ * allocator when it runs out (at least 1 MiB each). Blocks of all arenas
+ * sit on one address-ordered list; two neighbours on the list are merged
+ * only when they also touch in memory, so arenas never merge. All
+ * operations are IRQ-safe. A failed allocation returns NULL: callers turn
+ * that into -ENOMEM, never into a crash. */
 #include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
@@ -20,6 +25,36 @@ struct block {
 static struct block *head;
 static size_t arena_size, used_bytes;
 
+#define GROW_MIN    (1u << 20)
+
+static bool adjacent(const struct block *a, const struct block *b)
+{
+    return (const uint8_t *)(a + 1) + a->size == (const uint8_t *)b;
+}
+
+/* Add a new arena of at least `need` payload bytes; interrupts are off. */
+static bool heap_grow(size_t need)
+{
+    size_t bytes = need + 2 * sizeof(struct block);
+    if (bytes < GROW_MIN) bytes = GROW_MIN;
+    size_t frames = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint64_t base = pmm_alloc_contig(frames);
+    if (!base) return false;
+    struct block *nb = (struct block *)base;
+    nb->magic = HEAP_MAGIC;
+    nb->size = frames * PAGE_SIZE - sizeof(struct block);
+    nb->free = 1;
+    /* keep the list in address order */
+    struct block *prev = NULL, *b = head;
+    while (b && b < nb) { prev = b; b = b->next; }
+    nb->prev = prev;
+    nb->next = b;
+    if (b) b->prev = nb;
+    if (prev) prev->next = nb; else head = nb;
+    arena_size += frames * PAGE_SIZE;
+    return true;
+}
+
 void heap_init(size_t bytes)
 {
     size_t frames = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
@@ -37,8 +72,10 @@ void heap_init(size_t bytes)
 void *kmalloc(size_t n)
 {
     if (!n) return NULL;
+    if (n > (1ull << 30)) return NULL;
     n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
     uint64_t f = irq_save();
+    for (int attempt = 0; attempt < 2; attempt++) {
     for (struct block *b = head; b; b = b->next) {
         if (!b->free || b->size < n) continue;
         if (b->size >= n + sizeof(struct block) + 64) {      /* split */
@@ -55,6 +92,8 @@ void *kmalloc(size_t n)
         used_bytes += b->size + sizeof(struct block);
         irq_restore(f);
         return b + 1;
+    }
+    if (attempt == 0 && !heap_grow(n)) break;
     }
     irq_restore(f);
     kprintf("heap: out of memory (request %zu bytes)\n", n);
@@ -76,12 +115,12 @@ void kfree(void *p)
     uint64_t f = irq_save();
     b->free = 1;
     used_bytes -= b->size + sizeof(struct block);
-    if (b->next && b->next->free) {                         /* merge right */
+    if (b->next && b->next->free && adjacent(b, b->next)) { /* merge right */
         b->size += sizeof(struct block) + b->next->size;
         b->next = b->next->next;
         if (b->next) b->next->prev = b;
     }
-    if (b->prev && b->prev->free) {                         /* merge left  */
+    if (b->prev && b->prev->free && adjacent(b->prev, b)) { /* merge left  */
         b->prev->size += sizeof(struct block) + b->size;
         b->prev->next = b->next;
         if (b->next) b->next->prev = b->prev;
@@ -97,6 +136,33 @@ void *krealloc(void *p, size_t n)
     void *q = kmalloc(n);
     if (q) { memcpy(q, p, b->size); kfree(p); }
     return q;
+}
+
+/* Give back the tail of a block that turned out larger than needed. */
+void *krealloc_shrink(void *p, size_t n)
+{
+    if (!p) return NULL;
+    struct block *b = (struct block *)p - 1;
+    if (b->magic != HEAP_MAGIC || b->free) panic("krealloc_shrink: bad pointer %p", p);
+    n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
+    uint64_t f = irq_save();
+    if (b->size >= n + sizeof(struct block) + 64) {
+        struct block *nb = (struct block *)((uint8_t *)(b + 1) + n);
+        nb->magic = HEAP_MAGIC;
+        nb->size = b->size - n - sizeof(struct block);
+        nb->free = 0;
+        nb->next = b->next; nb->prev = b;
+        if (b->next) b->next->prev = nb;
+        b->next = nb;
+        used_bytes -= b->size - n;
+        b->size = n;
+        used_bytes += nb->size + sizeof(struct block);
+        irq_restore(f);
+        kfree(nb + 1);                                      /* merges with any free neighbour */
+        return p;
+    }
+    irq_restore(f);
+    return p;
 }
 
 char *kstrdup(const char *s)

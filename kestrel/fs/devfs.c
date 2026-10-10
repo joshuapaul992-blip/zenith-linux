@@ -172,12 +172,6 @@ static const struct vnode_ops kmsg_ops = { .read = kmsg_read, .write = kmsg_writ
 /* ---- fbN: one per monitor, for graphics clients (see kfb.h) ------------- */
 static int fb_owner[MAX_MONITORS];          /* pid holding KD_GRAPHICS, 0 = none */
 
-static bool user_range_ok(uint64_t p, uint64_t len)
-{
-    struct tcb *t = current_task();
-    return !t->user || (len && uvm_mapped(t->pml4, p, len));
-}
-
 static int fb_ioctl(struct vnode *v, unsigned long req, void *arg)
 {
     struct kestrel_tty *t = v->ctx;
@@ -185,8 +179,8 @@ static int fb_ioctl(struct vnode *v, unsigned long req, void *arg)
     const struct display_head *h = display_get(idx);
     switch (req) {
     case KFB_GET_INFO: {
-        if (!user_range_ok((uint64_t)arg, sizeof(struct kfb_info))) return -EFAULT;
-        struct kfb_info *i = arg;
+        if (!arg) return -EFAULT;
+        struct kfb_info *i = arg;                       /* a kernel copy (sys_ioctl) */
         memset(i, 0, sizeof *i);
         i->width = (uint32_t)t->native_width; i->height = (uint32_t)t->native_height;
         i->pitch = (uint32_t)t->native_width * 4; i->bpp = (uint32_t)t->bytes_pp * 8;
@@ -195,7 +189,7 @@ static int fb_ioctl(struct vnode *v, unsigned long req, void *arg)
         return 0;
     }
     case FBIOGET_VSCREENINFO: {
-        if (!user_range_ok((uint64_t)arg, sizeof(struct fb_var_screeninfo_lite))) return -EFAULT;
+        if (!arg) return -EFAULT;
         struct fb_var_screeninfo_lite *si = arg;
         si->xres = (uint32_t)t->native_width; si->yres = (uint32_t)t->native_height;
         si->bits_per_pixel = (uint32_t)t->bytes_pp * 8; si->line_length = (uint32_t)t->native_width * 4;
@@ -219,12 +213,11 @@ static int fb_ioctl(struct vnode *v, unsigned long req, void *arg)
         return -EINVAL;
     }
     case KFB_BLIT: {
-        if (!user_range_ok((uint64_t)arg, sizeof(struct kfb_blit))) return -EFAULT;
-        const struct kfb_blit *b = arg;
+        if (!arg) return -EFAULT;
+        const struct kfb_blit *b = arg;                 /* kernel copy; b->src is a user pointer */
         if (b->w <= 0 || b->h <= 0) return 0;
         if (b->w > 16384 || b->h > 16384 || b->src_pitch < (uint32_t)b->w * 4) return -EINVAL;
-        if (!user_range_ok(b->src, (uint64_t)(b->h - 1) * b->src_pitch + (uint64_t)b->w * 4)) return -EFAULT;
-        return tty_blit(idx, b->x, b->y, b->w, b->h, (const void *)b->src, b->src_pitch);
+        return tty_blit_user(idx, b->x, b->y, b->w, b->h, b->src, b->src_pitch);
     }
     default:
         return -ENOTTY;

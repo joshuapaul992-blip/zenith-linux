@@ -68,12 +68,41 @@ void sched_init(void)
     kprintf("sched: pid 0 (swapper) adopted boot stack, quantum=%dms\n", SCHED_QUANTUM);
 }
 
+/* Kernel stacks: KSTACK_SIZE bytes, identity mapped (drivers may hand stack
+ * buffers to DMA), with the page below made a guard page. Running off the
+ * end of a stack faults on the guard instead of silently corrupting the
+ * neighbouring memory; the double-fault handler reports it. */
+#define KSTACK_PAGES (KSTACK_SIZE / PAGE_SIZE)
+
+static uint8_t *kstack_alloc(void)
+{
+    uint64_t base = pmm_alloc_contig(KSTACK_PAGES + 1);
+    if (!base) return NULL;
+    if (!vmm_set_guard(base, true)) { pmm_free_contig(base, KSTACK_PAGES + 1); return NULL; }
+    return (uint8_t *)(uintptr_t)(base + PAGE_SIZE);
+}
+
+static void kstack_free(uint8_t *stack)
+{
+    uint64_t base = (uint64_t)(uintptr_t)stack - PAGE_SIZE;
+    vmm_set_guard(base, false);                         /* an ordinary page again */
+    pmm_free_contig(base, KSTACK_PAGES + 1);
+}
+
+bool task_stack_guard_hit(const struct tcb *t, uint64_t addr)
+{
+    if (!t || !t->kstack || t->pid == 0) return false;
+    uint64_t guard = (uint64_t)(uintptr_t)t->kstack - PAGE_SIZE;
+    return addr >= guard && addr < guard + PAGE_SIZE;
+}
+
 static void reap_one(struct tcb *t)
 {
     for (int fd = 0; fd < MAX_FDS; fd++) if (t->fds[fd]) vfs_close(t->fds[fd]);
     if (t->pml4 && !t->vm_borrowed) uvm_destroy(t->pml4);
     t->pml4 = 0;
-    kfree(t->kstack);
+    kstack_free(t->kstack);
+    t->kstack = NULL;
     t->state = TASK_UNUSED;
 }
 
@@ -124,7 +153,7 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     t->state = TASK_BLOCKED;            /* not runnable until fully built */
     irq_restore(f);
 
-    t->kstack = kmalloc(KSTACK_SIZE);
+    t->kstack = kstack_alloc();
     if (!t->kstack) { t->state = TASK_UNUSED; return NULL; }
     t->kstack_size = KSTACK_SIZE;
 

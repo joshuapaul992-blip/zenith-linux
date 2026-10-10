@@ -58,6 +58,11 @@ typedef uint32_t gid_t;
 #define ENAMETOOLONG 36
 #define ENOSYS       38
 #define ENOTEMPTY    39
+#define EMSGSIZE     90
+#define EOWNERDEAD  130
+#define ENOTSUP      EOPNOTSUPP
+#define EOVERFLOW    75
+#define ENOTSUPP    524
 
 /* ---- open(2) flags ------------------------------------------------------- */
 #define O_RDONLY     00

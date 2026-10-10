@@ -19,11 +19,20 @@ SECTIONS
 
     .text ALIGN(4K) : {
         KEEP(*(.multiboot2))        /* must be within the first 32 KiB */
+        __text_start = .;
         *(.text .text.*)
+        __text_end = .;
     }
 
     .rodata ALIGN(4K) : {
         *(.rodata .rodata.*)
+    }
+
+    /* <faulting RIP, fixup RIP> pairs for user-memory access (uaccess.asm) */
+    .ex_table ALIGN(8) : {
+        __ex_table_start = .;
+        KEEP(*(.ex_table))
+        __ex_table_end = .;
     }
 
     .data ALIGN(4K) : {

@@ -64,8 +64,8 @@ LDFLAGS   := -nostdlib -static -no-pie -T linker.ld -z max-page-size=0x1000 \
 # ---- sources
 BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
-           arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm
-C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
+           arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm
+C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c mm/vm.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
@@ -112,9 +112,26 @@ $(BUILD)/%.o: %.asm
 	@echo "  NASM    $<"
 	@$(NASM) $(NASMFLAGS) $< -o $@
 
-$(KERNEL): $(OBJS) linker.ld
+# Two links: the first one's function addresses become the symbol table for
+# crash backtraces (tools/ksyms.py), which the second link adds in .rodata --
+# after .text, so no function moves.
+$(BUILD)/ksyms0.c:
+	@mkdir -p $(BUILD)
+	@printf '#include <stdint.h>\nconst unsigned ksym_count = 0;\nconst uint64_t ksym_addr[1];\nconst uint32_t ksym_off[1];\nconst char ksym_names[1];\n' > $@
+
+$(BUILD)/ksyms0.o: $(BUILD)/ksyms0.c
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): $(OBJS) linker.ld tools/ksyms.py $(BUILD)/ksyms0.o
 	@echo "  LD      $@"
-	@$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@$(LD) $(LDFLAGS) -o $(BUILD)/kernel.pass1.elf $(OBJS) $(BUILD)/ksyms0.o
+	@nm -n $(BUILD)/kernel.pass1.elf > $(BUILD)/kernel.pass1.nm
+	@$(PYTHON) tools/ksyms.py $(BUILD)/kernel.pass1.nm $(BUILD)/ksyms.c
+	@$(CC) $(CFLAGS) -c $(BUILD)/ksyms.c -o $(BUILD)/ksyms.o
+	@$(LD) $(LDFLAGS) -o $@ $(OBJS) $(BUILD)/ksyms.o
+	@grep ' [Tt] ' $(BUILD)/kernel.pass1.nm > $(BUILD)/kernel.pass1.text
+	@nm -n $@ | grep ' [Tt] ' | cmp -s - $(BUILD)/kernel.pass1.text || \
+	    { echo "ksyms: function addresses moved between the two links"; exit 1; }
 	@echo "  kernel: $$(stat -c %s $@) bytes"
 
 # ---- bootable ISO (BIOS El Torito + UEFI, whatever GRUB platforms are installed)
@@ -176,7 +193,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

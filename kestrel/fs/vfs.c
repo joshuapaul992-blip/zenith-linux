@@ -489,9 +489,18 @@ int vfs_ioctl(struct file *f, unsigned long req, void *arg)
 
 int vfs_fstat(struct file *f, struct stat *st) { fill_stat(f->vn, st); return 0; }
 
+/* Reference counts change with locked instructions: descriptors are shared
+ * between threads, duplicated by dup/fork and carried in SCM_RIGHTS
+ * messages, and the last vfs_close() alone releases the object. */
+struct file *vfs_file_get(struct file *f)
+{
+    if (f) __atomic_add_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL);
+    return f;
+}
+
 void vfs_close(struct file *f)
 {
-    if (!f || --f->refcnt > 0) return;
+    if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (f->vn && f->vn->ops && f->vn->ops->release) f->vn->ops->release(f);
     kfree(f);
 }

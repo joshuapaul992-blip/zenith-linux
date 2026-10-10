@@ -452,11 +452,9 @@ static void slave_release(struct file *f)
 }
 
 /* ---- ioctls (both sides) ------------------------------------------------- */
-static bool uptr(void *arg, size_t len)
-{
-    struct tcb *t = current_task();
-    return (uint64_t)arg >= 4096 && (!t->user || uvm_mapped(t->pml4, (uint64_t)arg, len));
-}
+/* ioctl arguments arrive in kernel memory: sys_ioctl copies them in and out
+ * (see ioctl_args in kernel/syscall.c), so only NULL needs refusing here. */
+static bool uptr(void *arg, size_t len) { (void)len; return arg != NULL; }
 
 static int pty_ioctl(struct file *f, unsigned long req, void *arg)
 {

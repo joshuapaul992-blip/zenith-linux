@@ -63,6 +63,13 @@ struct int_frame;
 #define SA_NODEFER      0x40000000
 #define SA_RESETHAND    0x80000000u
 
+/* si_code values */
+#define SI_USER         0
+#define SI_KERNEL       0x80
+#define SI_TKILL        (-6)
+#define CLD_EXITED      1
+#define CLD_KILLED      2
+
 /* kernel-internal: never seen by user space */
 #define ERESTARTSYS     512
 #define ERESTARTNOHAND  514
@@ -72,7 +79,12 @@ bool process_zombie_kept(const struct tcb *t);  /* parent will wait4() for it */
 void process_exit(struct tcb *t);               /* t is exiting              */
 
 /* ---- signals --------------------------------------------------------------- */
-int  signal_send(struct tcb *t, int sig);       /* 0, or -ESRCH              */
+int  signal_send(struct tcb *t, int sig);       /* 0, or -ESRCH (sent by the kernel) */
+struct ksig_info;
+int  signal_send_info(struct tcb *t, int sig, const struct ksig_info *info);
+/* The current process faulted (idt.c): deliver sig with this siginfo, even
+ * if it is blocked or ignored (then the default action applies). */
+void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err);
 bool signal_pending(void);                      /* for blocking loops         */
 /* Deliver pending signals to the current process before it returns to
  * ring 3 through `f` (interrupts off). `nr` is the system call being

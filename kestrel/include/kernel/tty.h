@@ -207,4 +207,5 @@ int  tty_set_graphics(int index, bool on);
 /* Copy a w x h rectangle of 32-bpp pixels (in this monitor's format) from
  * `src` (pitch bytes per row) to (x, y) and show it. Clipped. */
 int  tty_blit(int index, int x, int y, int w, int h, const void *src, uint32_t pitch);
+int  tty_blit_user(int index, int x, int y, int w, int h, uint64_t usrc, uint32_t pitch);
 #endif

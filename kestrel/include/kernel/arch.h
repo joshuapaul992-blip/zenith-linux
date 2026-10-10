@@ -14,6 +14,11 @@
 
 void gdt_init(void);
 void tss_set_kernel_stack(uint64_t rsp0);
+#define IST_DOUBLE_FAULT 1
+#define IST_NMI          2
+#define IST_MACHINE_CHECK 3
+/* The IST stack containing addr, if any (backtraces). */
+bool ist_stack_range(uint64_t addr, uint64_t *lo, uint64_t *hi);
 
 /* ---- interrupt frame built by isr.asm / syscall_entry.asm -------------- */
 struct int_frame {

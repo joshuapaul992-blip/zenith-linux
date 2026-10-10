@@ -130,7 +130,8 @@ int     vfs_fstat(struct file *f, struct stat *st);
 int     vfs_poll(struct file *f, int events);   /* ready subset of events (+ERR/HUP) */
 struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
-void    vfs_close(struct file *f);
+void    vfs_close(struct file *f);                  /* drops one reference */
+struct file *vfs_file_get(struct file *f);         /* takes one (atomic), returns f */
 
 /* ---- filesystem drivers ------------------------------------------------- */
 extern const struct vnode_ops ramfs_ops;

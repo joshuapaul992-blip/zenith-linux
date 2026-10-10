@@ -27,6 +27,18 @@ struct int_frame;
 
 #define NSIG            64
 
+/* Why a signal is pending: filled in when it is sent, copied into the
+ * siginfo_t the handler gets (SA_SIGINFO) and into the sigcontext. */
+struct ksig_info {
+    int32_t  code;              /* si_code: SI_USER, SEGV_MAPERR, CLD_EXITED, ... */
+    int32_t  pid;               /* sender / child                          */
+    uint32_t uid;
+    int32_t  status;            /* SIGCHLD: exit status or signal          */
+    uint64_t addr;              /* faults: si_addr (and sigcontext cr2)    */
+    uint64_t err;               /* faults: CPU error code                  */
+    uint32_t trapno;            /* faults: exception vector                */
+};
+
 /* Kernel layout of struct sigaction (Linux x86_64 rt_sigaction). */
 struct k_sigaction {
     uint64_t handler;           /* SIG_DFL 0, SIG_IGN 1, or a function     */
@@ -44,7 +56,7 @@ struct tcb {
 
     /* CPU context: everything else lives on the kernel stack */
     uint64_t  rsp;              /* saved by context_switch()            */
-    uint8_t  *kstack;           /* base of the kernel stack allocation   */
+    uint8_t  *kstack;           /* base of the kernel stack (a guard page lies below) */
     size_t    kstack_size;
     uint64_t  cr3;              /* address space root (PML4 phys)        */
 
@@ -93,6 +105,9 @@ struct tcb {
     uint64_t  saved_mask;       /* rt_sigsuspend: mask to restore           */
     bool      saved_mask_valid;
     struct k_sigaction sigact[NSIG];
+    struct ksig_info siginfo[NSIG];
+
+    int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
 };
 
 void        sched_init(void);
@@ -118,6 +133,7 @@ struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
 struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
 void        task_reap(struct tcb *t);   /* free a zombie now (wait4)        */
 void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
+bool        task_stack_guard_hit(const struct tcb *t, uint64_t addr);  /* in t's guard page */
 const char *task_state_name(enum task_state s);
 uint64_t    sched_context_switches(void);
 void        sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle);

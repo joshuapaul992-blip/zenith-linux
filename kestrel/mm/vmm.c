@@ -94,6 +94,50 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size)
     return pages > 0;
 }
 
+/* The 4 KiB PTE of identity-mapped `phys`, splitting its 2 MiB page into a
+ * page table first if needed (same physical pages, same attributes). The
+ * boot identity map lives in the shared kernel PDPTs, so the change is seen
+ * by every address space. NULL if unmapped or out of memory. */
+#define PTE_NX      (1ull << 63)
+#define PDE_PAT     (1ull << 12)                        /* PAT bit of a 2 MiB PDE */
+static uint64_t *identity_pte(uint64_t phys)
+{
+    uint64_t *pml4 = kpml4();
+    if (!(pml4[(phys >> 39) & 511] & PTE_PRESENT)) return NULL;
+    uint64_t *pdpt = (uint64_t *)(pml4[(phys >> 39) & 511] & ADDR_MASK);
+    if (!(pdpt[(phys >> 30) & 511] & PTE_PRESENT) || (pdpt[(phys >> 30) & 511] & PTE_HUGE)) return NULL;
+    uint64_t *pd = (uint64_t *)(pdpt[(phys >> 30) & 511] & ADDR_MASK);
+    uint64_t *pde = &pd[(phys >> 21) & 511];
+    if (!(*pde & PTE_PRESENT)) return NULL;
+    if (*pde & PTE_HUGE) {
+        uint64_t pt_phys = pmm_alloc();                 /* zeroed, identity mapped */
+        if (!pt_phys) return NULL;
+        uint64_t *pt = (uint64_t *)pt_phys;
+        uint64_t base = *pde & 0x000FFFFFFFE00000ull;
+        uint64_t attr = *pde & (PTE_PRESENT | PTE_WRITE | VMM_PWT | VMM_PCD | PTE_NX);
+        if (*pde & PDE_PAT) attr |= 0x80;               /* PAT bit moves to bit 7 in a PTE */
+        for (int i = 0; i < 512; i++) pt[i] = (base + (uint64_t)i * 4096) | attr;
+        *pde = pt_phys | PTE_PRESENT | PTE_WRITE;
+        /* invlpg on any address of a large page drops its TLB entry */
+        invlpg(base);
+        write_cr3(read_cr3());
+    }
+    uint64_t *pt = (uint64_t *)(*pde & ADDR_MASK);
+    return &pt[(phys >> 12) & 511];
+}
+
+bool vmm_set_guard(uint64_t phys, bool guard)
+{
+    uint64_t f = irq_save();
+    uint64_t *pte = identity_pte(phys & ~0xFFFull);
+    if (pte) {
+        if (guard) *pte &= ~(uint64_t)PTE_PRESENT; else *pte |= PTE_PRESENT;
+        invlpg(phys & ~0xFFFull);
+    }
+    irq_restore(f);
+    return pte != NULL;
+}
+
 bool vmm_identity_map(uint64_t phys, uint64_t size, uint64_t flags)
 {
     uint64_t *pml4 = kpml4();

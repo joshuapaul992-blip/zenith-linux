@@ -34,6 +34,7 @@ void uvm_init(void)
      * CR0.EM off, CR0.MP on, CR4.OSFXSR + OSXMMEXCPT on, x87 reset. */
     uint64_t cr0 = read_cr0(), cr4 = read_cr4();
     cr0 = (cr0 & ~0x4ull) | 0x2ull;
+    cr0 |= 1ull << 18;                      /* AM: user code that sets EFLAGS.AC gets #AC (SIGBUS) */
     cr4 |= (1ull << 9) | (1ull << 10);
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
     __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));

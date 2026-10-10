@@ -327,6 +327,36 @@ static int init_main(void *arg)
     kush_main();                                  /* interactive shell on tty1; never returns */
 }
 
+/* --- kestrel.crashtest=stack|null|ud: deliberately crash the kernel in a
+ * thread, to check that faults are caught and reported (register dump,
+ * backtrace, stack-overflow detection) on a given machine. Diagnostics only. */
+static volatile int crash_depth;
+static __attribute__((noinline)) int crash_recurse(int n)
+{
+    volatile char pad[256];
+    pad[0] = (char)n;
+    crash_depth = n;
+    return crash_recurse(n + 1) + pad[0];
+}
+
+static int crash_main(void *arg)
+{
+    const char *what = arg;
+    task_sleep_ms(500);
+    kprintf("crashtest: %s\n", what);
+    if (!strncmp(what, "stack", 5)) crash_recurse(0);
+    else if (!strncmp(what, "null", 4)) { volatile int *p = (int *)0x8; *p = 1; }
+    else if (!strncmp(what, "ud", 2)) __asm__ volatile("ud2");
+    kprintf("crashtest: unknown test\n");
+    return 0;
+}
+
+static void crashtest_maybe(void)
+{
+    const char *c = strstr(g_boot.cmdline, "kestrel.crashtest=");
+    if (c) task_create("crashtest", crash_main, (void *)(c + 18));
+}
+
 /* --- kworker/0: CPU-bound work, proves time-slice preemption ------------- */
 static volatile uint64_t primes_found;
 
@@ -455,6 +485,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
         task_create("exec-launch", exec_launcher, line);
     }
 
+    crashtest_maybe();
     if (!task_create("init", init_main, NULL)) panic("cannot start init");
     if (!(ch.flags & BOOTOPT_SAFE_MODE)) {
         struct tcb *kw = task_create("kworker/0", kworker_compute, NULL);   /* demo load: idle class */

@@ -129,7 +129,43 @@ struct int_frame;
 #define SYS_pipe2         293
 #define SYS_prlimit64     302
 #define SYS_getrandom     318
-#define SYS_MAX           320
+#define SYS_pread64        17
+#define SYS_pwrite64       18
+#define SYS_mremap         25
+#define SYS_msync          26
+#define SYS_mincore        27
+#define SYS_fsync          74
+#define SYS_fdatasync      75
+#define SYS_truncate       76
+#define SYS_ftruncate      77
+#define SYS_futex         202
+#define SYS_sched_setaffinity 203
+#define SYS_sched_getaffinity 204
+#define SYS_epoll_create  213
+#define SYS_clock_nanosleep 230
+#define SYS_epoll_wait    232
+#define SYS_epoll_ctl     233
+#define SYS_openat        257
+#define SYS_mkdirat       258
+#define SYS_newfstatat    262
+#define SYS_unlinkat      263
+#define SYS_faccessat     269
+#define SYS_ppoll         271
+#define SYS_set_robust_list 273
+#define SYS_get_robust_list 274
+#define SYS_epoll_pwait   281
+#define SYS_signalfd      282
+#define SYS_timerfd_create 283
+#define SYS_eventfd       284
+#define SYS_timerfd_settime 286
+#define SYS_timerfd_gettime 287
+#define SYS_signalfd4     289
+#define SYS_eventfd2      290
+#define SYS_epoll_create1 291
+#define SYS_memfd_create  319
+#define SYS_membarrier    324
+#define SYS_rseq          334
+#define SYS_MAX           336
 
 typedef int64_t (*syscall_fn)(uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6);

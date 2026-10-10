@@ -26,6 +26,7 @@ void   heap_init(size_t bytes);
 void  *kmalloc(size_t n);
 void  *kzalloc(size_t n);
 void  *krealloc(void *p, size_t n);
+void  *krealloc_shrink(void *p, size_t n);          /* in place, frees the tail */
 void   kfree(void *p);
 char  *kstrdup(const char *s);
 size_t heap_used(void);
@@ -46,5 +47,8 @@ bool vmm_set_uncached(uint64_t phys, uint64_t size);
  * if needed; 2 MiB pages already made uncached are left alone. False if the
  * CPU has no PAT. */
 bool vmm_set_write_combining(uint64_t phys, uint64_t size);
+/* Make the identity-mapped 4 KiB page at `phys` a guard page (not present:
+ * any access faults) or a normal page again. Splits its 2 MiB page. */
+bool vmm_set_guard(uint64_t phys, bool guard);
 
 #endif

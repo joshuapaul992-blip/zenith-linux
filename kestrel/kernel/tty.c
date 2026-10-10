@@ -25,6 +25,7 @@
 #include <kernel/mm.h>
 #include <kernel/klog.h>
 #include <kernel/string.h>
+#include <kernel/uaccess.h>
 
 struct kestrel_tty system_ttys[MAX_MONITORS];
 int tty_count;
@@ -1063,6 +1064,36 @@ int tty_set_graphics(int index, bool on)
     }
     tty_unlock(t);
     return 0;
+}
+
+/* Like tty_blit(), from a user buffer. Its pages are faulted in first (with
+ * no lock held); the copy under the TTY lock then uses no-fault user
+ * copies, and a page that went away in between makes the blit fail with
+ * -EFAULT instead of touching a bad address. */
+int tty_blit_user(int index, int x, int y, int w, int h, uint64_t usrc, uint32_t pitch)
+{
+    struct kestrel_tty *t = tty_get(index);
+    if (!t || !t->active || t->bytes_pp != 4) return -ENODEV;
+    if (w <= 0 || h <= 0) return 0;
+    uint64_t span = (uint64_t)(h - 1) * pitch + (uint64_t)w * 4;
+    if (!user_range_ok(usrc, span)) return -EFAULT;
+    for (uint64_t a = usrc & ~0xFFFull; a < usrc + span; a += 4096) {
+        uint32_t probe;
+        if (get_user_u32(&probe, (const void *)(a < usrc ? usrc : a))) return -EFAULT;
+    }
+    if (x < 0) { usrc -= (uint64_t)x * 4; w += x; x = 0; }
+    if (y < 0) { usrc -= (uint64_t)(int64_t)y * pitch; h += y; y = 0; }
+    if (x + w > t->native_width)  w = t->native_width - x;
+    if (y + h > t->native_height) h = t->native_height - y;
+    if (w <= 0 || h <= 0) return 0;
+    if (!tty_lock(t)) return -EBUSY;
+    int rc = 0;
+    for (int py = 0; py < h && !rc; py++)
+        rc = copy_from_user_nofault(row_ptr(t, y + py) + (size_t)x * 4, (const void *)(usrc + (uint64_t)py * pitch),
+                                    (size_t)w * 4);
+    publish(t, x, y, w, h);
+    tty_unlock(t);
+    return rc;
 }
 
 int tty_blit(int index, int x, int y, int w, int h, const void *src, uint32_t pitch)

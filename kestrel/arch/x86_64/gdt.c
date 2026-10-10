@@ -7,7 +7,13 @@
  *
  * User data precedes user code because SYSRET loads SS = STAR[63:48]+8 and
  * CS = STAR[63:48]+16. The TSS supplies RSP0 (kernel stack on a ring 3 ->
- * ring 0 transition) and IST1, a dedicated stack for double faults. */
+ * ring 0 transition) and the Interrupt Stack Table: exceptions that can
+ * arrive when the current stack cannot be trusted switch to a known-good
+ * stack of their own,
+ *   IST1  #DF  double fault (e.g. a kernel stack overflow hit its guard page)
+ *   IST2  NMI  can interrupt anything, including the first instructions of
+ *              another handler
+ *   IST3  #MC  machine check: hardware error, state unknown */
 #include <kernel/arch.h>
 #include <kernel/string.h>
 
@@ -23,7 +29,8 @@ struct tss {
 
 static uint64_t gdt[7];
 static struct tss tss;
-static uint8_t df_stack[8192] __attribute__((aligned(16)));
+#define IST_STACK_SIZE 16384
+static uint8_t ist_stacks[3][IST_STACK_SIZE] __attribute__((aligned(16)));
 
 struct gdt_ptr { uint16_t limit; uint64_t base; } __attribute__((packed));
 
@@ -36,7 +43,7 @@ void gdt_init(void)
     gdt[4] = 0x00AFFA000000FFFFull;     /* user code   */
 
     memset(&tss, 0, sizeof tss);
-    tss.ist[0] = (uint64_t)(df_stack + sizeof df_stack);
+    for (int i = 0; i < 3; i++) tss.ist[i] = (uint64_t)(ist_stacks[i] + IST_STACK_SIZE);
     tss.iopb_offset = sizeof tss;
 
     uint64_t base = (uint64_t)&tss, limit = sizeof tss - 1;
@@ -66,3 +73,12 @@ void gdt_init(void)
 }
 
 void tss_set_kernel_stack(uint64_t rsp0) { tss.rsp[0] = rsp0; }
+
+bool ist_stack_range(uint64_t addr, uint64_t *lo, uint64_t *hi)
+{
+    for (int i = 0; i < 3; i++) {
+        uint64_t b = (uint64_t)ist_stacks[i];
+        if (addr >= b && addr < b + IST_STACK_SIZE) { *lo = b; *hi = b + IST_STACK_SIZE; return true; }
+    }
+    return false;
+}

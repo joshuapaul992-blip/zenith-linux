@@ -156,12 +156,8 @@ static void set_grab(struct file *f, bool on)
     if (dropped) { kprintf("kinput: %u event(s) dropped (queue full)\n", dropped); dropped = 0; }
 }
 
-static bool bad_user_ptr(void *p, size_t len)
-{
-    struct tcb *t = current_task();
-    if ((uint64_t)p < 4096) return true;
-    return t->user && !uvm_mapped(t->pml4, (uint64_t)p, len);
-}
+/* The argument is a kernel copy (sys_ioctl). */
+static bool bad_user_ptr(void *p, size_t len) { (void)len; return p == NULL; }
 
 static int kinput_ioctl(struct file *f, unsigned long req, void *arg)
 {

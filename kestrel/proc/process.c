@@ -14,6 +14,7 @@
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/posix.h>
+#include <kernel/uaccess.h>
 
 extern void user_return(struct int_frame *f) __attribute__((noreturn));
 
@@ -38,31 +39,23 @@ extern void user_return(struct int_frame *f) __attribute__((noreturn));
 static uint64_t sigbit(int sig) { return 1ull << (sig - 1); }
 #define UNBLOCKABLE (sigbit(SIGKILL) | sigbit(SIGSTOP))
 
-/* ---- user memory --------------------------------------------------------- */
-static bool uok(uint64_t p, uint64_t len)
-{
-    struct tcb *t = current_task();
-    return t->user && p >= 4096 && len && uvm_mapped(t->pml4, p, len);
-}
-
-/* Length of the NUL-terminated user string at p (at most max-1 chars). */
-static int64_t ustrlen(uint64_t p, size_t max)
-{
-    for (size_t i = 0; i < max; i++) {
-        if ((i == 0 || ((p + i) & (UVM_PAGE - 1)) == 0) && !uok(p + i, 1)) return -EFAULT;
-        if (((const char *)p)[i] == 0) return (int64_t)i;
-    }
-    return -E2BIG;
-}
-
+/* ---- user memory (always through uaccess.h) -------------------------------- */
+/* A kernel copy of the user string at p, at most max bytes with the NUL.
+ * Most strings are short: try a small buffer before a big one. */
 static char *ustrdup(uint64_t p, size_t max, int64_t *err)
 {
-    int64_t n = ustrlen(p, max);
-    if (n < 0) { *err = n; return NULL; }
-    char *s = kmalloc((size_t)n + 1);
-    if (!s) { *err = -ENOMEM; return NULL; }
-    memcpy(s, (const void *)p, (size_t)n + 1);
-    return s;
+    if (!max) { *err = -E2BIG; return NULL; }
+    for (size_t cap = max < 256 ? max : 256;; cap = max) {
+        char *buf = kmalloc(cap);
+        if (!buf) { *err = -ENOMEM; return NULL; }
+        long n = strncpy_from_user(buf, (const char *)p, cap);
+        if (n >= 0) {
+            char *s = krealloc_shrink(buf, (size_t)n + 1);
+            return s;
+        }
+        kfree(buf);
+        if (n != -ENAMETOOLONG || cap == max) { *err = n == -ENAMETOOLONG ? -E2BIG : n; return NULL; }
+    }
 }
 
 /* ---- process tree ---------------------------------------------------------- */
@@ -95,7 +88,11 @@ void process_exit(struct tcb *t)
     if (!t->user) return;
     struct tcb *p = task_find(t->ppid);
     if (alive(p) && p->user) {
-        if (t->exit_signal) signal_send(p, t->exit_signal);
+        if (t->exit_signal) {
+            struct ksig_info ci = { .code = t->term_signal ? CLD_KILLED : CLD_EXITED, .pid = t->pid, .uid = t->uid,
+                                    .status = t->term_signal ? t->term_signal : (t->exit_code & 0xff) };
+            signal_send_info(p, t->exit_signal, &ci);
+        }
         wakeup(p);                                      /* wait4() sleeps on itself */
     }
 }
@@ -105,6 +102,10 @@ static int fork_child_entry(void *arg)
 {
     struct int_frame f = *(struct int_frame *)arg;
     kfree(arg);
+    /* CLONE_CHILD_SETTID: the tid goes into the child's own memory (a fork
+     * child's copy, or the shared memory of CLONE_VM). */
+    if (f.vector) put_user_u32((void *)f.vector, (uint32_t)current_task()->pid);
+    f.vector = 0x80;
     cli();
     user_return(&f);                    /* FPU, FS base and CR3 set by the scheduler */
 }
@@ -116,10 +117,10 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_FILES | CLONE_FS)) return -ENOSYS;   /* threads */
     if (flags & ~(uint64_t)CLONE_SUPPORTED) return -EINVAL;
     if ((flags & CLONE_VM) && !(flags & CLONE_VFORK)) return -ENOSYS;                 /* threads */
-    if ((flags & CLONE_CHILD_SETTID) && !(flags & CLONE_VM)) return -EINVAL;
-    if ((flags & CLONE_PARENT_SETTID) && !uok(ptid, 4)) return -EFAULT;
-    if ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) && !uok(ctid, 4)) return -EFAULT;
+    if ((flags & CLONE_PARENT_SETTID) && !user_range_ok(ptid, 4)) return -EFAULT;
+    if ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) && !user_range_ok(ctid, 4)) return -EFAULT;
     if ((flags & CLONE_SETTLS) && tls && !uvm_range_ok(tls, 1)) return -EINVAL;
+    if (newsp && !user_range_ok(newsp, 0)) return -EINVAL;
 
     bool share = flags & CLONE_VM;
     uint64_t pml4 = share ? p->pml4 : uvm_clone(p->pml4);      /* eager copy, interrupts on */
@@ -129,6 +130,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     *cf = *p->uframe;
     cf->rax = 0;                                        /* the child's return value */
     if (newsp) cf->rsp = newsp;
+    cf->vector = (flags & CLONE_CHILD_SETTID) ? ctid : 0;   /* fork_child_entry writes the tid there */
 
     uint64_t fl = irq_save();                           /* the child must not run half-built */
     struct tcb *c = task_create(p->name, fork_child_entry, cf);
@@ -171,8 +173,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->sig_pending = 0;
     if (flags & CLONE_VFORK) c->vfork_parent = p->pid;
     int pid = c->pid;
-    if (flags & CLONE_PARENT_SETTID) *(int32_t *)ptid = pid;
-    if (flags & CLONE_CHILD_SETTID) *(int32_t *)ctid = pid;   /* shared memory (CLONE_VM) */
+    if (flags & CLONE_PARENT_SETTID) put_user_u32((void *)ptid, (uint32_t)pid);
 
     /* vfork: the parent waits until the child has its own address space */
     while ((flags & CLONE_VFORK) && c->pid == pid && c->vfork_parent == p->pid && c->state != TASK_UNUSED)
@@ -197,15 +198,18 @@ static int64_t copy_vector(uint64_t uv, char ***out, int *count, size_t *bytes)
     if (!uv) return 0;                                  /* Linux accepts NULL argv/envp */
     int n = 0;
     for (;; n++) {
+        uint64_t p;
         if (n >= EXEC_MAX_STRINGS) return -E2BIG;
-        if (!uok(uv + (uint64_t)n * 8, 8)) return -EFAULT;
-        if (!((const uint64_t *)uv)[n]) break;
+        if (get_user_u64(&p, (const void *)(uv + (uint64_t)n * 8))) return -EFAULT;
+        if (!p) break;
     }
     char **v = kzalloc(sizeof(char *) * (size_t)(n + 1));
     if (!v) return -ENOMEM;
     for (int i = 0; i < n; i++) {
         int64_t err = 0;
-        v[i] = ustrdup(((const uint64_t *)uv)[i], EXEC_MAX_BYTES, &err);
+        uint64_t p;
+        if (get_user_u64(&p, (const void *)(uv + (uint64_t)i * 8)) || !p) { free_strings(v, i); return -EFAULT; }
+        v[i] = ustrdup(p, EXEC_MAX_BYTES - *bytes, &err);
         if (!v[i]) { free_strings(v, i); return err; }
         *bytes += strlen(v[i]) + 1;
         if (*bytes > EXEC_MAX_BYTES) { free_strings(v, i + 1); return -E2BIG; }
@@ -235,7 +239,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     if (!t->user || !f) return -EINVAL;
 
     int64_t rc = 0;
-    char *path = ustrdup(upath, 256, &rc);
+    char *path = ustrdup(upath, VFS_PATH_MAX, &rc);
     if (!path) return rc == -E2BIG ? -ENAMETOOLONG : rc;
     struct exec_args ea = { 0, 0, NULL, NULL };
     size_t bytes = 0;
@@ -322,8 +326,8 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
 {
     struct tcb *self = current_task();
     if (!self->user) return -ECHILD;
-    if (ustatus && !uok(ustatus, 4)) return -EFAULT;
-    if (rusage && !uok(rusage, 144)) return -EFAULT;
+    if (ustatus && !user_range_ok(ustatus, 4)) return -EFAULT;
+    if (rusage && !user_range_ok(rusage, 144)) return -EFAULT;
     uint64_t fl = irq_save();
     for (;;) {
         bool any = false;
@@ -340,8 +344,8 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
             int zpid = z->pid;
             task_reap(z);
             irq_restore(fl);
-            if (ustatus) *(int32_t *)ustatus = status;
-            if (rusage) memset((void *)rusage, 0, 144);
+            if (ustatus && put_user_u32((void *)ustatus, (uint32_t)status)) return -EFAULT;
+            if (rusage && clear_user((void *)rusage, 144)) return -EFAULT;
             return zpid;
         }
         if (options & WNOHANG) { irq_restore(fl); return 0; }
@@ -405,17 +409,41 @@ static bool ignored(const struct tcb *t, int sig)
     return k->handler == SIG_IGN || (k->handler == SIG_DFL && default_ignored(sig));
 }
 
-int signal_send(struct tcb *t, int sig)
+int signal_send_info(struct tcb *t, int sig, const struct ksig_info *info)
 {
     if (!alive(t) || !t->user) return -ESRCH;
     if (sig == 0) return 0;
     if (sig < 1 || sig > NSIG) return -EINVAL;
     if (ignored(t, sig)) return 0;                      /* discarded at generation */
     uint64_t fl = irq_save();
+    if (!(t->sig_pending & sigbit(sig))) {              /* standard signals do not queue */
+        if (info) t->siginfo[sig - 1] = *info;
+        else t->siginfo[sig - 1] = (struct ksig_info){ .code = SI_KERNEL };
+    }
     t->sig_pending |= sigbit(sig);
     if (sig == SIGKILL || !(t->sig_mask & sigbit(sig))) task_interrupt(t);
     irq_restore(fl);
     return 0;
+}
+
+int signal_send(struct tcb *t, int sig) { return signal_send_info(t, sig, NULL); }
+
+/* A synchronous fault of the current process (idt.c). Like Linux's
+ * force_sig_fault(): a fault cannot be ignored or blocked -- if it is, the
+ * action reverts to the default (the process dies) instead of returning to
+ * the faulting instruction forever. */
+void signal_force_fault(int sig, int code, uint64_t addr, uint32_t trapno, uint64_t err)
+{
+    struct tcb *t = current_task();
+    struct k_sigaction *k = &t->sigact[sig - 1];
+    uint64_t fl = irq_save();
+    if (k->handler == SIG_IGN || (t->sig_mask & sigbit(sig))) {
+        k->handler = SIG_DFL;
+        t->sig_mask &= ~sigbit(sig);
+    }
+    t->siginfo[sig - 1] = (struct ksig_info){ .code = code, .addr = addr, .trapno = trapno, .err = err };
+    t->sig_pending |= sigbit(sig);
+    irq_restore(fl);
 }
 
 bool signal_pending(void)
@@ -424,9 +452,16 @@ bool signal_pending(void)
     return t->user && (t->sig_pending & ~(t->sig_mask & ~UNBLOCKABLE));
 }
 
-__attribute__((noreturn)) static void die(struct tcb *t, int sig)
+static bool fault_signal(int sig) { return sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE || sig == SIGTRAP; }
+
+__attribute__((noreturn)) static void die(struct tcb *t, int sig, uint64_t rip)
 {
-    kprintf("process %d (%s): killed by signal %d\n", t->pid, t->name, sig);
+    const struct ksig_info *i = &t->siginfo[sig - 1];
+    if (fault_signal(sig) && i->trapno)
+        kprintf("process %d (%s): killed by signal %d (code %d, address %lx) at RIP=%lx\n",
+                t->pid, t->name, sig, i->code, i->addr, rip);
+    else
+        kprintf("process %d (%s): killed by signal %d\n", t->pid, t->name, sig);
     t->term_signal = sig;
     sti();
     task_exit(128 + sig);
@@ -453,8 +488,11 @@ struct kucontext {
 
 struct ksiginfo {
     int32_t si_signo, si_errno, si_code, si_pad;
-    int32_t si_pid, si_uid;
-    uint8_t rest[128 - 24];
+    union {
+        struct { int32_t pid; uint32_t uid; int32_t status, pad; int64_t utime, stime; } kill;   /* + SIGCHLD */
+        struct { uint64_t addr; } fault;
+        uint8_t raw[128 - 16];
+    } u;
 };
 
 struct rt_sigframe {
@@ -469,37 +507,58 @@ _Static_assert(sizeof(struct ksiginfo) == 128, "siginfo layout");
 
 static bool user_code(uint64_t a) { return uvm_range_ok(a, 1); }
 
+/* Build the frame in kernel memory, then copy it to the user stack in one
+ * checked copy: a bad or unmapped stack (or one another thread unmaps right
+ * now) makes delivery fail cleanly, and the process dies of SIGSEGV. */
 static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_sigaction *k)
 {
     if (!(k->flags & SA_RESTORER) || !user_code(k->handler) || !user_code(k->restorer)) return false;
     uint64_t sp = f->rsp - 128;                         /* skip the red zone */
     uint64_t fpu = (sp - 512) & ~63ull;
     uint64_t frame = ((fpu - sizeof(struct rt_sigframe)) & ~15ull) - 8;   /* rsp+8 16-aligned */
-    if (frame < UVM_USER_START || !uok(frame, f->rsp - frame)) return false;
+    if (frame < UVM_USER_START || f->rsp > UVM_USER_END || !user_range_ok(frame, f->rsp - frame)) return false;
 
-    __asm__ volatile("fxsave (%0)" :: "r"(fpu) : "memory");
-    struct rt_sigframe *fr = (struct rt_sigframe *)frame;
-    memset(fr, 0, sizeof *fr);
-    fr->pretcode = k->restorer;
-    struct sigctx *m = &fr->uc.mc;
+    static uint8_t fxbuf[512] __attribute__((aligned(16)));
+    struct rt_sigframe fr;
+    memset(&fr, 0, sizeof fr);
+    uint64_t fl = irq_save();                           /* fxbuf is shared */
+    __asm__ volatile("fxsave %0" : "=m"(fxbuf));
+    int bad = copy_to_user((void *)fpu, fxbuf, sizeof fxbuf);
+    irq_restore(fl);
+    if (bad) return false;
+
+    const struct ksig_info *si = &t->siginfo[sig - 1];
+    fr.pretcode = k->restorer;
+    struct sigctx *m = &fr.uc.mc;
     m->r8 = f->r8; m->r9 = f->r9; m->r10 = f->r10; m->r11 = f->r11;
     m->r12 = f->r12; m->r13 = f->r13; m->r14 = f->r14; m->r15 = f->r15;
     m->rdi = f->rdi; m->rsi = f->rsi; m->rbp = f->rbp; m->rbx = f->rbx;
     m->rdx = f->rdx; m->rax = f->rax; m->rcx = f->rcx; m->rsp = f->rsp;
     m->rip = f->rip; m->eflags = f->rflags;
     m->cs = (uint16_t)f->cs; m->ss = (uint16_t)f->ss;
-    m->err = f->error; m->trapno = f->vector;
+    m->err = si->trapno ? si->err : 0;
+    m->trapno = si->trapno;
+    m->cr2 = si->trapno == 14 ? si->addr : 0;
     uint64_t oldmask = t->saved_mask_valid ? t->saved_mask : t->sig_mask;
     m->oldmask = oldmask;
     m->fpstate = fpu;
-    fr->uc.sigmask = oldmask;
-    fr->info.si_signo = sig;
+    fr.uc.sigmask = oldmask;
+    fr.info.si_signo = sig;
+    fr.info.si_code = si->code;
+    if (fault_signal(sig) && si->trapno) {
+        fr.info.u.fault.addr = si->addr;
+    } else {
+        fr.info.u.kill.pid = si->pid;
+        fr.info.u.kill.uid = si->uid;
+        fr.info.u.kill.status = si->status;
+    }
+    if (copy_to_user((void *)frame, &fr, sizeof fr)) return false;
 
     f->rip = k->handler;
     f->rsp = frame;
     f->rdi = (uint64_t)sig;
-    f->rsi = (uint64_t)&fr->info;
-    f->rdx = (uint64_t)&fr->uc;
+    f->rsi = frame + __builtin_offsetof(struct rt_sigframe, info);
+    f->rdx = frame + __builtin_offsetof(struct rt_sigframe, uc);
     f->rax = 0;
     f->rflags &= ~(uint64_t)(0x400 | 0x100);            /* DF, TF */
 
@@ -530,14 +589,17 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall)
         struct k_sigaction *k = &t->sigact[sig - 1];
         if (sig == SIGKILL || k->handler == SIG_DFL) {
             if (sig != SIGKILL && default_ignored(sig)) continue;
-            die(t, sig);
+            die(t, sig, f->rip);
         }
         if (k->handler == SIG_IGN) continue;
         if (syscall) {
             if (ret == -ERESTARTSYS && (k->flags & SA_RESTART)) restart(f, nr);
             else if (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND) f->rax = (uint64_t)-EINTR;
         }
-        if (!setup_frame(t, f, sig, k)) die(t, SIGSEGV);
+        if (!setup_frame(t, f, sig, k)) {
+            t->siginfo[SIGSEGV - 1] = (struct ksig_info){ .code = SI_KERNEL };
+            die(t, SIGSEGV, f->rip);
+        }
         return;                                         /* one handler per return */
     }
     if (syscall && (ret == -ERESTARTSYS || ret == -ERESTARTNOHAND)) restart(f, nr);
@@ -548,17 +610,17 @@ int64_t sig_return(void)
     struct tcb *t = current_task();
     struct int_frame *f = t->uframe;
     uint64_t ucp = f->rsp;                              /* the handler's `ret` popped pretcode */
-    if (!uok(ucp, sizeof(struct kucontext))) die(t, SIGSEGV);
-    struct kucontext uc = *(const struct kucontext *)ucp;
+    struct kucontext uc;
+    if (copy_from_user(&uc, (const void *)ucp, sizeof uc)) goto bad;
     const struct sigctx *m = &uc.mc;
-    if (!user_code(m->rip) || !uvm_range_ok(m->rsp, 1)) die(t, SIGSEGV);
+    if (!user_code(m->rip) || !uvm_range_ok(m->rsp, 1)) goto bad;
 
     if (m->fpstate) {
         static uint8_t buf[512] __attribute__((aligned(16)));
-        if ((m->fpstate & 15) || !uok(m->fpstate, 512)) die(t, SIGSEGV);
+        if (m->fpstate & 15) goto bad;
         uint64_t fl = irq_save();
-        memcpy(buf, (const void *)m->fpstate, sizeof buf);
-        *(uint32_t *)(buf + 24) &= 0xffbf;              /* reserved MXCSR bits fault */
+        if (copy_from_user(buf, (const void *)m->fpstate, sizeof buf)) { irq_restore(fl); goto bad; }
+        *(uint32_t *)(buf + 24) &= 0xffbf;              /* reserved MXCSR bits would #GP */
         __asm__ volatile("fxrstor %0" :: "m"(buf));
         irq_restore(fl);
     }
@@ -571,6 +633,9 @@ int64_t sig_return(void)
     t->sig_mask = uc.sigmask & ~UNBLOCKABLE;
     t->iret_return = true;                              /* rcx and r11 matter now */
     return (int64_t)m->rax;
+bad:
+    t->siginfo[SIGSEGV - 1] = (struct ksig_info){ .code = SI_KERNEL };
+    die(t, SIGSEGV, f->rip);
 }
 
 int64_t sig_action(uint64_t sig, uint64_t act, uint64_t oact, uint64_t size)
@@ -578,18 +643,16 @@ int64_t sig_action(uint64_t sig, uint64_t act, uint64_t oact, uint64_t size)
     struct tcb *t = current_task();
     if (size != 8 || sig < 1 || sig > NSIG) return -EINVAL;
     if (act && (sig == SIGKILL || sig == SIGSTOP)) return -EINVAL;
-    if (act && !uok(act, sizeof(struct k_sigaction))) return -EFAULT;
-    if (oact && !uok(oact, sizeof(struct k_sigaction))) return -EFAULT;
-    struct k_sigaction old = t->sigact[sig - 1];
+    struct k_sigaction k, old = t->sigact[sig - 1];
+    if (act && copy_from_user(&k, (const void *)act, sizeof k)) return -EFAULT;
+    if (oact && copy_to_user((void *)oact, &old, sizeof old)) return -EFAULT;
     if (act) {
-        struct k_sigaction k = *(const struct k_sigaction *)act;
         k.mask &= ~UNBLOCKABLE;
         uint64_t fl = irq_save();
         t->sigact[sig - 1] = k;
         if (ignored(t, (int)sig)) t->sig_pending &= ~sigbit((int)sig);
         irq_restore(fl);
     }
-    if (oact) *(struct k_sigaction *)oact = old;
     return 0;
 }
 
@@ -597,20 +660,18 @@ int64_t sig_procmask(uint64_t how, uint64_t set, uint64_t oset, uint64_t size)
 {
     struct tcb *t = current_task();
     if (size != 8) return -EINVAL;
-    if (set && !uok(set, 8)) return -EFAULT;
-    if (oset && !uok(oset, 8)) return -EFAULT;
-    uint64_t old = t->sig_mask;
+    uint64_t s = 0, old = t->sig_mask;
+    if (set && copy_from_user(&s, (const void *)set, 8)) return -EFAULT;
+    if (set && how > 2) return -EINVAL;
+    if (oset && copy_to_user((void *)oset, &old, 8)) return -EFAULT;
     if (set) {
-        uint64_t s = *(const uint64_t *)set;
         switch (how) {
         case 0: t->sig_mask |= s; break;                /* SIG_BLOCK   */
         case 1: t->sig_mask &= ~s; break;               /* SIG_UNBLOCK */
         case 2: t->sig_mask = s; break;                 /* SIG_SETMASK */
-        default: return -EINVAL;
         }
         t->sig_mask &= ~UNBLOCKABLE;
     }
-    if (oset) *(uint64_t *)oset = old;
     return 0;
 }
 
@@ -618,9 +679,8 @@ int64_t sig_pending_set(uint64_t set, uint64_t size)
 {
     struct tcb *t = current_task();
     if (size != 8) return -EINVAL;
-    if (!uok(set, 8)) return -EFAULT;
-    *(uint64_t *)set = t->sig_pending & t->sig_mask;
-    return 0;
+    uint64_t v = t->sig_pending & t->sig_mask;
+    return copy_to_user((void *)set, &v, 8) ? -EFAULT : 0;
 }
 
 /* Sleep until a signal is delivered to a handler (or ends the process). */
@@ -636,10 +696,11 @@ int64_t sig_suspend(uint64_t mask, uint64_t size)
 {
     struct tcb *t = current_task();
     if (size != 8) return -EINVAL;
-    if (!uok(mask, 8)) return -EFAULT;
+    uint64_t m;
+    if (copy_from_user(&m, (const void *)mask, 8)) return -EFAULT;
     t->saved_mask = t->sig_mask;
     t->saved_mask_valid = true;
-    t->sig_mask = *(const uint64_t *)mask & ~UNBLOCKABLE;
+    t->sig_mask = m & ~UNBLOCKABLE;
     int64_t r = wait_for_signal();
     /* restored by rt_sigreturn through the frame's mask if a handler runs */
     return r;
@@ -651,12 +712,13 @@ int64_t sig_kill(int64_t pid, int64_t sig)
 {
     struct tcb *self = current_task();
     if (sig < 0 || sig > NSIG) return -EINVAL;
+    struct ksig_info info = { .code = SI_USER, .pid = self->pid, .uid = self->uid };
     if (pid > 0) {
         struct tcb *t = task_find((int)pid);
         if (!t || t->state == TASK_UNUSED) return -ESRCH;
         if (!t->user) return -EPERM;                    /* kernel threads */
         if (t->state == TASK_ZOMBIE) return 0;
-        return signal_send(t, (int)sig);
+        return signal_send_info(t, (int)sig, &info);
     }
     int pgid = pid == 0 ? self->pgid : (int)-pid;
     bool found = false;
@@ -665,7 +727,7 @@ int64_t sig_kill(int64_t pid, int64_t sig)
         if (!alive(t) || !t->user) continue;
         if (pid == -1 ? t == self : t->pgid != pgid) continue;
         found = true;
-        signal_send(t, (int)sig);
+        signal_send_info(t, (int)sig, &info);
     }
     return found ? 0 : -ESRCH;
 }
