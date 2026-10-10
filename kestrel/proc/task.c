@@ -153,12 +153,27 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     return t;
 }
 
+void task_set_idle_class(struct tcb *t) { t->idle_class = true; }
+
+static bool normal_ready(void)
+{
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (tasks[i].state == TASK_READY && !tasks[i].idle_class) return true;
+    return false;
+}
+
+/* Round robin among ready tasks; idle-class tasks only when no normal task
+ * is ready (they are what the CPU does instead of halting). */
 static struct tcb *pick_next(void)
 {
     int start = (int)(cur - tasks);
-    for (int i = 1; i <= MAX_TASKS; i++) {
-        struct tcb *t = &tasks[(start + i) % MAX_TASKS];
-        if (t->pid != 0 && t->state == TASK_READY) return t;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 1; i <= MAX_TASKS; i++) {
+            struct tcb *t = &tasks[(start + i) % MAX_TASKS];
+            if (t->pid != 0 && t->state == TASK_READY && t->idle_class == (pass == 1)) return t;
+        }
+        /* no other normal task: a normal current task keeps the CPU */
+        if (pass == 0 && cur->state == TASK_RUNNING && !cur->idle_class && cur->pid != 0) return cur;
     }
     /* nothing else runnable: keep the current thread if it can run, else idle */
     if (cur->state == TASK_RUNNING) return cur;
@@ -224,6 +239,7 @@ void sched_tick(void)
         }
     }
     if (cur->pid == 0) { if (need_resched) schedule(); return; }
+    if (cur->idle_class && preempt && normal_ready()) { schedule(); return; }   /* yield at once */
     if (preempt && (--cur->quantum <= 0 || need_resched)) schedule();
 }
 

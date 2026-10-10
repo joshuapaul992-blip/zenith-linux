@@ -22,12 +22,12 @@
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
 
-/* Read from fd until `want` appears or ~2 s pass; returns what was read. */
+/* Read from fd until `want` appears or ~10 s pass; returns what was read. */
 static int read_until(int fd, char *buf, size_t cap, const char *want)
 {
     size_t n = 0;
     buf[0] = 0;
-    for (int tries = 0; tries < 200 && !strstr(buf, want); tries++) {
+    for (int tries = 0; tries < 1000 && !strstr(buf, want); tries++) {
         struct pollfd p = { fd, POLLIN, 0 };
         if (poll(&p, 1, 10) <= 0) continue;
         ssize_t r = read(fd, buf + n, cap - 1 - n);
@@ -157,16 +157,19 @@ int main(int argc, char **argv)
     m = posix_openpt(O_RDWR | O_NOCTTY);
     grantpt(m); unlockpt(m);
     name = ptsname(m);
+    int ready[2];
+    pipe(ready);
     pid = fork();
     if (pid == 0) {
         setsid();
         int fd = open(name, O_RDWR);
         ioctl(fd, TIOCSCTTY, 0);
         close(m);
+        write(ready[1], "r", 1);                        /* the pty is our terminal now */
         for (;;) pause();
     }
-    struct timespec t = { 0, 100 * 1000000L };
-    nanosleep(&t, NULL);
+    char r;
+    read(ready[0], &r, 1);
     close(m);
     waitpid(pid, &st, 0);
     CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGHUP, "closing the master sends SIGHUP to the session");

@@ -181,7 +181,64 @@ static uint64_t build_stack(struct tcb *t, const struct exec_args *a, uint64_t e
     return sp;
 }
 
+static int exec_load_image_elf(struct tcb *t, const char *path, const struct exec_args *a,
+                               uint64_t *entry, uint64_t *sp);
+
+/* "#!interpreter [arg]" on the first line: returns 1 and fills interp/arg,
+ * 0 for anything else (ELF files), or -errno. */
+static int read_shebang(const char *path, char *interp, size_t icap, char *arg, size_t acap)
+{
+    struct file *f;
+    int rc = vfs_open(path, O_RDONLY, 0, &f);
+    if (rc < 0) return rc;
+    char line[128];
+    ssize_t n = vfs_read(f, line, sizeof line - 1);
+    vfs_close(f);
+    if (n < 2 || line[0] != '#' || line[1] != '!') return 0;
+    line[n] = 0;
+    char *p = line + 2, *end = strchr(p, '\n');
+    if (!end) return -ENOEXEC;                          /* line too long */
+    *end = 0;
+    while (*p == ' ' || *p == '\t') p++;
+    char *q = p;
+    while (*q && *q != ' ' && *q != '\t') q++;
+    if (q == p) return -ENOEXEC;
+    char *rest = q;
+    if (*rest) { *rest++ = 0; while (*rest == ' ' || *rest == '\t') rest++; }
+    for (char *e = rest + strlen(rest); e > rest && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r'); ) *--e = 0;
+    strlcpy(interp, p, icap);
+    strlcpy(arg, rest, acap);                           /* Linux: the rest is one argument */
+    return 1;
+}
+
 int exec_load_image(struct tcb *t, const char *path, const struct exec_args *a, uint64_t *entry, uint64_t *sp)
+{
+    /* scripts: run the interpreter with [interp, arg?, path, argv[1..]] */
+    char interp[128], iarg[128];
+    int sb = read_shebang(path, interp, sizeof interp, iarg, sizeof iarg);
+    if (sb < 0) return sb;
+    if (sb == 1) {
+        int extra = iarg[0] ? 2 : 1;
+        char **v = kmalloc(sizeof(char *) * (size_t)(a->argc + extra + 1));
+        if (!v) return -ENOMEM;
+        int k = 0;
+        v[k++] = interp;
+        if (iarg[0]) v[k++] = iarg;
+        v[k++] = (char *)path;
+        for (int i = 1; i < a->argc; i++) v[k++] = a->argv[i];
+        struct exec_args sa = { k, a->envc, v, a->envp };
+        char i2[8], a2[8];
+        int r = read_shebang(interp, i2, sizeof i2, a2, sizeof a2);
+        if (r == 1) r = -ENOEXEC;                       /* the interpreter must be a program */
+        else if (r == 0) r = exec_load_image_elf(t, interp, &sa, entry, sp);
+        kfree(v);
+        return r;
+    }
+    return exec_load_image_elf(t, path, a, entry, sp);
+}
+
+static int exec_load_image_elf(struct tcb *t, const char *path, const struct exec_args *a,
+                               uint64_t *entry, uint64_t *sp)
 {
     size_t n = 0;                                       /* /proc/PID/cmdline */
     for (int i = 0; i < a->argc && n < sizeof t->cmdline; i++) {

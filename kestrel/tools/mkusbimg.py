@@ -193,6 +193,9 @@ def main():
     ap.add_argument("--corrupt-payload", action="store_true")
     ap.add_argument("--no-report", action="store_true", help="no FAT report volume")
     ap.add_argument("--esp-img", help="FAT image placed in an EFI System Partition (UEFI boot)")
+    ap.add_argument("--ramdisk", action="store_true",
+                    help="write only a small disk image holding the boot volume (sector-0 marker, header,"
+                         " payload), for loading as a Multiboot2 module (the ISO)")
     a = ap.parse_args()
 
     total = a.size * 1024 * 1024 // SECTOR
@@ -200,6 +203,15 @@ def main():
     vol_uuid = uuid.UUID(a.uuid) if a.uuid else uuid.uuid4()
     payload = ustar_from_dir(a.rootfs)
     header = volume_header(vol_uuid, a.label, payload)
+
+    if a.ramdisk:               # sector 0: option-B marker -> header at block 1
+        sec0 = bytearray(SECTOR)
+        sec0[3:15] = MAGIC
+        sec0[15:23] = struct.pack("<Q", 1)
+        with open(a.out, "wb") as f:
+            f.write(bytes(sec0) + header + b"\0" * (PAYLOAD_OFFSET - len(header)) + payload)
+        print(f"{a.out}: boot volume ramdisk, payload {len(payload)} bytes crc {crc32(payload):08x}, uuid {vol_uuid}")
+        return
 
     core = b""
     if not a.no_grub:

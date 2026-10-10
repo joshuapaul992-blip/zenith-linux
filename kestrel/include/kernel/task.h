@@ -50,6 +50,7 @@ struct tcb {
 
     /* scheduling */
     int       quantum;
+    bool      idle_class;       /* runs only when no other task is ready    */
     uint64_t  wake_tick;
     void     *wait_chan;
     uint64_t  cpu_ticks, switches, start_tick;
@@ -103,6 +104,7 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg);
 __attribute__((noreturn)) void task_exit(int code);
 void        schedule(void);             /* call with interrupts disabled */
 void        sched_yield(void);
+void        task_set_idle_class(struct tcb *t);  /* background work (kworker/0) */
 void        sched_tick(void);           /* from the timer IRQ            */
 void        sched_idle_loop(void) __attribute__((noreturn));
 

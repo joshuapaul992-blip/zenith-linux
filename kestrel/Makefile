@@ -69,7 +69,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
-           drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c drivers/usb/xhci.c kernel/usbhost.c \
+           drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kestrel_font.c drivers/video/edid.c drivers/video/bochs_dispi.c \
@@ -122,11 +122,12 @@ $(BUILD)/cmdline.stamp: FORCE
 	@mkdir -p $(BUILD)
 	@echo '$(KERNEL_CMDLINE)' | cmp -s - $@ || echo '$(KERNEL_CMDLINE)' > $@
 
-$(ISO): $(KERNEL) boot/grub/grub.cfg $(BUILD)/cmdline.stamp
+$(ISO): $(KERNEL) boot/grub/grub.cfg $(BUILD)/cmdline.stamp $(BUILD)/kestrel.vol
 	@test -n "$(GRUB_MKRESCUE)" || { echo "error: grub-mkrescue not found"; exit 1; }
 	@rm -rf $(BUILD)/isodir
 	@mkdir -p $(BUILD)/isodir/boot/grub
 	@cp $(KERNEL) $(BUILD)/isodir/boot/kernel.elf
+	@cp $(BUILD)/kestrel.vol $(BUILD)/isodir/boot/kestrel.vol
 	@sed 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' boot/grub/grub.cfg > $(BUILD)/isodir/boot/grub/grub.cfg
 	@echo "  ISO     $@"
 	@$(GRUB_MKRESCUE) -o $@ $(BUILD)/isodir 2> $(BUILD)/grub-mkrescue.log || \
@@ -236,6 +237,11 @@ $(ROOTFS_STAGE).stamp: $(shell find rootfs -type f) $(USER_PROGS) user/shtest.sh
 	@if [ -f $(BUSYBOX_ROOT)/.stamp ]; then cp -a $(BUSYBOX_ROOT)/bin $(ROOTFS_STAGE)/; fi   # -a: keep the hard links
 	@if [ -f $(XTERM_ROOT)/.stamp ]; then cp -r $(XTERM_ROOT)/bin $(XTERM_ROOT)/share $(ROOTFS_STAGE)/; fi
 	@touch $@
+
+# The boot volume alone, as a Multiboot2 module for the ISO (kernel/ramdisk.c)
+$(BUILD)/kestrel.vol: $(ROOTFS_STAGE).stamp tools/mkusbimg.py
+	@echo "  VOLUME  $@"
+	@$(PYTHON) tools/mkusbimg.py $@ --rootfs $(ROOTFS_STAGE) --ramdisk >/dev/null
 
 USBIMG := $(BUILD)/kestrel-usb.img
 USBIMG_FLAGS ?=

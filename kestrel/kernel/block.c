@@ -426,7 +426,8 @@ size_t blk_proc(char *buf, size_t cap)
         char type[40];
         if (b->kind == BLK_PART && b->gpt) { char g[37]; blk_guid_str(b->type_guid, g); snprintf(type, sizeof type, "gpt %.8s", g); }
         else if (b->kind == BLK_PART) snprintf(type, sizeof type, "mbr 0x%02x", b->mbr_type);
-        else snprintf(type, sizeof type, "%s disk", b->kind == BLK_DISK_USB ? "usb" : b->kind == BLK_DISK_NVME ? "nvme" : "sata");
+        else snprintf(type, sizeof type, "%s disk", b->kind == BLK_DISK_USB ? "usb" : b->kind == BLK_DISK_NVME ? "nvme" :
+                                                              b->kind == BLK_DISK_RAM ? "ram" : "sata");
         char label[48] = "";
         if (b->kind != BLK_PART) strlcpy(label, b->model, sizeof label);
         else if (b->part_name[0]) snprintf(label, sizeof label, "\"%s\"", b->part_name);

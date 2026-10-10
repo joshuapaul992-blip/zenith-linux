@@ -49,6 +49,11 @@ void pmm_init(uintptr_t mbi)
     reserve_range(0, 0x100000);
     reserve_range((uint64_t)_kernel_start, (uint64_t)_kernel_end);
     reserve_range(mbi, mbi + ((struct mb2_info *)mbi)->total_size);
+    for (struct mb2_tag *t = mb2_first_tag(mbi); t->type != MB2_TAG_END; t = mb2_next_tag(t))
+        if (t->type == MB2_TAG_MODULE) {                /* e.g. the ISO's boot volume */
+            struct mb2_tag_module *m = (struct mb2_tag_module *)t;
+            reserve_range(m->mod_start, m->mod_end);
+        }
     search_hint = 0x100000 / PAGE_SIZE;
 
     kprintf("pmm: %lu MiB usable, %lu MiB free, kernel %p-%p\n",

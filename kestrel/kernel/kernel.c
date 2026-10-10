@@ -41,6 +41,7 @@
 #include <kernel/kush.h>
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
+#include <kernel/block.h>
 
 #define KERNEL_HEAP_SIZE (8u << 20)
 #define WANT_WIDTH  1024
@@ -412,6 +413,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     vfs_init();
     kinput_init();                  /* /dev/kinput, for the X server */
     storage_register_devices();     /* sataN + partitions in the block layer */
+    ramdisk_init(mbi);              /* Multiboot2 modules (the ISO's boot volume) */
     current_task()->cwd = vfs_root();
 
     /* Find the Kestrel boot volume by its markers (never by device name),
@@ -441,7 +443,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
 
     if (!task_create("init", init_main, NULL)) panic("cannot start init");
     if (!(ch.flags & BOOTOPT_SAFE_MODE)) {
-        task_create("kworker/0", kworker_compute, NULL);
+        struct tcb *kw = task_create("kworker/0", kworker_compute, NULL);   /* demo load: idle class */
+        if (kw) task_set_idle_class(kw);
         task_create("kworker/1", kworker_heartbeat, NULL);
     }
     usb_start_thread();

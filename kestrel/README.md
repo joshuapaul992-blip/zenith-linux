@@ -16,7 +16,8 @@ sudo apt install build-essential nasm grub-pc-bin grub-efi-amd64-bin grub-common
                  xorriso mtools qemu-system-x86 ovmf
 
 make            # build/kernel.elf
-make iso        # build/kestrel.iso          hybrid BIOS + UEFI (grub-mkrescue)
+make iso        # build/kestrel.iso          hybrid BIOS + UEFI (grub-mkrescue); carries the boot
+                #                            volume as a Multiboot2 module (build/kestrel.vol)
 make floppy     # build/kestrel-floppy.img   1.44 MB, BIOS (grub-mkimage + memdisk)
 make usbimg     # build/kestrel-usb.img      64 MiB USB stick, BIOS + UEFI: GRUB, Kestrel boot volume
                 #                            (rootfs/) and a FAT report volume (REPORT.TXT, VBIOS.ROM)
@@ -41,6 +42,12 @@ A host x86_64 `gcc` works because everything is compiled `-ffreestanding -nostdl
 On Fedora and Arch the GRUB tools are called `grub2-*`. The Makefile finds both names; override `GRUB_LIB` if `boot.img` lives somewhere unusual.
 
 The kernel log goes to COM1, so `make run` prints it in your terminal (`-serial stdio`).
+
+**Full desktop images.** With the ports built first (`make xlibre`, `make icewm`, `make busybox`, `make xterm`; see "X11", "IceWM" and "Terminals"), `make usbimg` and `make iso` include them. Both GRUB menus then offer two entries for 5 seconds:
+- **Desktop** (the default): `kestrel.exec=/bin/startx` starts the X server, IceWM and an xterm. Logout in IceWM's menu ends the session, and the screen returns to the text terminals, which stay running underneath.
+- **Text console:** the kernel's terminals and kush only.
+
+On the ISO, GRUB loads the boot volume into memory as a Multiboot2 module (`module2 /boot/kestrel.vol`). `kernel/ramdisk.c` turns each module into a read-only `/dev/ramN`, and the usual boot-volume discovery mounts it on `/boot`, found through the volume's sector-0 signature. `tools/mkusbimg.py --ramdisk` writes that volume file. This has been checked under BIOS and UEFI (OVMF) in QEMU.
 
 ## Boot manager
 
@@ -497,7 +504,8 @@ mm/           pmm.c          bitmap frame allocator from the MB2 memory map
               heap.c         kmalloc/kfree (first fit, split, coalesce, IRQ-safe)
               vmm.c          extra identity mappings (e.g. GOP frame buffer above 4 GiB)
 
-proc/task.c                  TCBs, round-robin scheduler (10 ms quantum), sleep_on/wakeup,
+proc/task.c                  TCBs, round-robin scheduler (10 ms quantum; an idle class for background
+                             work such as kworker/0, which runs only when nothing else is ready), sleep_on/wakeup,
                              timed sleep, zombie reaping, idle thread
 proc/exec.c                  ELF64 loader, System V initial stack, kernel-started processes
 proc/process.c               fork/vfork/clone, execve, wait4, sessions, signals
@@ -525,6 +533,7 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
                              redirection, $?, built-ins
               coreutils/     pwd cd ls mkdir rmdir touch rm cp mv cat head tail grep echo
                              chmod chown date uname neofetch (+ cu_lib.c helpers, table.c)
+              ramdisk.c      Multiboot2 modules as read-only /dev/ramN (the ISO's boot volume)
               storage.c      PCI -> AHCI and NVMe glue, boot-time MBR verify, /dev/sdX, nvmeN,
                              NVMe self-test and shutdown
               usbhost.c      PCI -> xHCI glue, key injection, mouse pointer, usbd thread, /proc/usb,
@@ -566,6 +575,7 @@ Calls can enter through two paths:
 Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm/uvm.c`):
 - **Address spaces:** each process has its own PML4. The kernel half (`PML4[0..127]`, 0–64 TiB, which holds the identity map and all MMIO) shares its page tables with every process and is supervisor-only. The user half is `0x4000_0000_0000`–`0x7fff_ffff_ffff`: static-PIE images load at its start, anonymous `mmap` grows from `0x6000_0000_0000`, and a 1 MiB stack ends at `0x7fff_ff00_0000`.
 - **Programs:** ET_EXEC linked inside the user half, or ET_DYN (static-PIE) loaded at the image base. Programs that need a dynamic linker are refused.
+- **Scripts:** a file starting with `#!interpreter [arg]` runs that interpreter with the script's path, as on Linux (`/boot/bin/startx` is one).
 - **Start-up:** the initial stack follows the System V / Linux layout (argc, argv, envp, and auxv with `AT_PHDR`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM` and more), so a musl `crt1` starts unchanged.
 - **Per-process state:** SSE state (`fxsave`) and the TLS base (`FS_BASE`) are switched with the process. Faults in ring 3 kill the process with status 128 + signal; the kernel keeps running.
 - **Pointers:** user pointers passed to `read`/`write`/`readv`/`writev` and the memory calls must lie in mapped user memory, otherwise the call returns `-EFAULT`.
@@ -729,7 +739,7 @@ make busybox BUSYBOX_SRC=<unpacked busybox release>
 make usbimg
 ```
 
-**Trying it:** boot with `kestrel.exec=/bin/Xkestrel,:0+2s+/bin/icewm`, then choose XTerm in IceWM's start menu (or add `+3s+/bin/xterm`).
+**Trying it:** choose the desktop entry in the boot menu (`kestrel.exec=/bin/startx`). Or start the pieces yourself with `kestrel.exec=/bin/Xkestrel,:0+2s+/bin/icewm` and pick XTerm in IceWM's start menu. In a text terminal, `run startx` does the same.
 
 **Checked in QEMU** with an xHCI keyboard and mouse: commands typed into the shell run, including pipes, `ps`, `top` and `stty size`; Ctrl+C interrupts a running `sleep`; `exit` closes the window, and IceWM reaps xterm.
 

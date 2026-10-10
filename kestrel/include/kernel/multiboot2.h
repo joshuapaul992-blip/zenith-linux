@@ -36,6 +36,12 @@ struct mb2_tag_string {
     char     string[];
 } __attribute__((packed));
 
+struct mb2_tag_module {             /* a file GRUB loaded with module2 */
+    uint32_t type, size;
+    uint32_t mod_start, mod_end;    /* physical, end exclusive */
+    char     string[];              /* the module's command line */
+} __attribute__((packed));
+
 struct mb2_mmap_entry {
     uint64_t addr;
     uint64_t len;

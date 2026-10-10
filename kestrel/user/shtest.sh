@@ -36,6 +36,8 @@ EOF
 check "here-document"         [ "$(tail -n 1 /tmp/heredoc)" = beta ]
 check "subshell isolation"    [ "$(x=1; (x=2); echo $x)" = 1 ]
 check "uname"                 [ "$(uname -s)" = Kestrel ]
+printf '#!/bin/sh -e\necho "script $0 $1"\n' > /tmp/script.sh; chmod +x /tmp/script.sh
+check "#! scripts run directly" [ "$(/tmp/script.sh arg)" = "script /tmp/script.sh arg" ]
 check "/proc/self/stat"       [ "$(cut -d' ' -f1 /proc/self/stat)" -gt 0 ]
 check "/proc/PID/cmdline"     grep -q shtest.sh /proc/$$/cmdline
 check "readlink /proc/self/fd"  [ "$(readlink /proc/self/fd/0)" = "$(readlink /proc/self/fd/0)" ] && [ -n "$(readlink /proc/self/fd/1)" ]

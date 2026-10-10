@@ -19,7 +19,7 @@
 #define BLK_NAME_MAX    16
 #define BLK_MAX         48
 
-enum blk_kind { BLK_DISK_SATA, BLK_DISK_USB, BLK_DISK_NVME, BLK_PART };
+enum blk_kind { BLK_DISK_SATA, BLK_DISK_USB, BLK_DISK_NVME, BLK_DISK_RAM, BLK_PART };
 
 struct blkdev;
 struct blkdev_ops {
@@ -63,6 +63,7 @@ struct blkdev *blk_register_disk(const char *prefix, enum blk_kind kind, const c
 int  blk_scan_partitions(struct blkdev *disk);      /* number found, or -errno */
 void blk_mark_removed(struct blkdev *disk);         /* disk and its partitions */
 void blk_publish(void);                             /* create missing /dev nodes */
+void ramdisk_init(uintptr_t mbi);                   /* Multiboot2 modules -> ramN (kernel/ramdisk.c) */
 
 int            blk_count(void);
 struct blkdev *blk_get(int index);

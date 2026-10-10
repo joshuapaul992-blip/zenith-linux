@@ -1,0 +1,12 @@
+#!/bin/sh
+# /boot/bin/startx -- the Kestrel desktop: X server on :0, IceWM, one xterm.
+# Choose Logout in IceWM's menu to end the session; the X server stops too
+# and the monitors return to their text terminals.
+Xkestrel :0 "$@" &
+xpid=$!
+i=0
+while [ ! -S /tmp/.X11-unix/X0 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+xterm &
+icewm
+kill $xpid 2>/dev/null
+wait $xpid
