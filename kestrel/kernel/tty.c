@@ -15,6 +15,7 @@
  * Monitors with a RAM shadow (display_head.shadow) are drawn and scrolled in
  * the shadow and the changed rectangle is then copied to VRAM, because
  * reading VRAM over PCIe is slow; without one, the same code works on VRAM. */
+#include <kernel/process.h>
 #include <kernel/tty.h>
 #include <kernel/posix.h>
 #include <kernel/kestrel_font.h>
@@ -472,6 +473,7 @@ bool tty_read_key(struct kestrel_tty *t, struct key_event *ev, bool block)
             return true;
         }
         if (!block) { irq_restore(f); return false; }
+        if (signal_pending()) { irq_restore(f); return false; }    /* user reader: EINTR */
         sleep_on(t->keyq);                      /* returns with interrupts disabled */
         irq_restore(f);
     }
@@ -495,7 +497,7 @@ long tty_read_line(struct kestrel_tty *t, char *buf, size_t n)
         t->buffer_index = 0;
         for (;;) {
             struct key_event ev;
-            tty_read_key(t, &ev, true);
+            if (!tty_read_key(t, &ev, true)) return -ERESTARTSYS;  /* signal */
             char c = ev.ascii;
             if (c == '\n') { t->input_buffer[t->buffer_index++] = '\n'; tty_putc(t, '\n'); break; }
             if (c == '\b') { if (t->buffer_index) { t->buffer_index--; tty_backspace(t); } continue; }

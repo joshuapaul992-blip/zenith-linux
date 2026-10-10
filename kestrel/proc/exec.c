@@ -143,19 +143,19 @@ out:
 
 /* System V initial stack: strings at the top, then (16-byte aligned at
  * argc) argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL. */
-static uint64_t build_stack(struct tcb *t, const struct spawn_args *a, uint64_t entry, uint64_t phdr_va, int phnum)
+static uint64_t build_stack(struct tcb *t, const struct exec_args *a, uint64_t entry, uint64_t phdr_va, int phnum)
 {
-    static const char *const envp[] = { "PATH=/boot/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0" };
-    const int nenv = (int)(sizeof envp / sizeof *envp);
     uint64_t sp = UVM_STACK_TOP;
-    uint64_t argv_va[EXEC_MAX_ARGS], env_va[sizeof envp / sizeof *envp];
+    uint64_t *va = kmalloc(sizeof(uint64_t) * (size_t)(a->argc + a->envc + 1));
+    if (!va) return 0;
+    uint64_t *argv_va = va, *env_va = va + a->argc;
 
 #define PUSH_BYTES(src, n) do { sp -= (n); memcpy((void *)sp, (src), (n)); } while (0)
     for (int i = a->argc - 1; i >= 0; i--) { PUSH_BYTES(a->argv[i], strlen(a->argv[i]) + 1); argv_va[i] = sp; }
-    for (int i = nenv - 1; i >= 0; i--) { PUSH_BYTES(envp[i], strlen(envp[i]) + 1); env_va[i] = sp; }
+    for (int i = a->envc - 1; i >= 0; i--) { PUSH_BYTES(a->envp[i], strlen(a->envp[i]) + 1); env_va[i] = sp; }
     PUSH_BYTES("x86_64", 7);
     uint64_t platform = sp;
-    uint64_t execfn = argv_va[0];
+    uint64_t execfn = a->argc ? argv_va[0] : platform;
     uint8_t rnd[16];
     uint64_t seed = time_ms() ^ (uint64_t)t->pid << 32 ^ rdtsc();
     for (int i = 0; i < 16; i++) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; rnd[i] = (uint8_t)(seed >> 56); }
@@ -169,16 +169,28 @@ static uint64_t build_stack(struct tcb *t, const struct spawn_args *a, uint64_t 
         { AT_GID, t->gid }, { AT_EGID, t->gid }, { AT_PLATFORM, platform }, { AT_HWCAP, 0 },
         { AT_CLKTCK, 100 }, { AT_SECURE, 0 }, { AT_RANDOM, random }, { AT_EXECFN, execfn }, { AT_NULL, 0 },
     };
-    const uint64_t words = 1 + (uint64_t)a->argc + 1 + (uint64_t)nenv + 1 + 2 * (sizeof auxv / sizeof *auxv);
+    const uint64_t words = 1 + (uint64_t)a->argc + 1 + (uint64_t)a->envc + 1 + 2 * (sizeof auxv / sizeof *auxv);
     sp = (sp - words * 8) & ~0xFull;                        /* rsp % 16 == 0 at argc */
     uint64_t *w = (uint64_t *)sp;
     *w++ = (uint64_t)a->argc;
     for (int i = 0; i < a->argc; i++) *w++ = argv_va[i];
     *w++ = 0;
-    for (int i = 0; i < nenv; i++) *w++ = env_va[i];
+    for (int i = 0; i < a->envc; i++) *w++ = env_va[i];
     *w++ = 0;
     for (size_t i = 0; i < sizeof auxv / sizeof *auxv; i++) { *w++ = auxv[i][0]; *w++ = auxv[i][1]; }
+    kfree(va);
     return sp;
+}
+
+int exec_load_image(struct tcb *t, const char *path, const struct exec_args *a, uint64_t *entry, uint64_t *sp)
+{
+    uint64_t phdr_va = 0;
+    int phnum = 0;
+    int rc = load_elf(t, path, entry, &phdr_va, &phnum);
+    if (rc < 0) return rc;
+    if (!uvm_map(t->pml4, UVM_STACK_TOP - UVM_STACK_SIZE, UVM_STACK_SIZE, UVM_W)) return -ENOMEM;
+    *sp = build_stack(t, a, *entry, phdr_va, phnum);
+    return *sp ? 0 : -ENOMEM;
 }
 
 static void open_stdio(struct tcb *t, const char *dev)
@@ -203,14 +215,13 @@ static int process_main(void *arg)
     write_cr3(pml4);
     irq_restore(f);
 
-    uint64_t entry = 0, phdr_va = 0, sp;
-    int phnum = 0;
-    if (load_elf(t, a->path, &entry, &phdr_va, &phnum) < 0 ||
-        !uvm_map(pml4, UVM_STACK_TOP - UVM_STACK_SIZE, UVM_STACK_SIZE, UVM_W)) {
+    static char *const envp[] = { "PATH=/boot/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0" };
+    struct exec_args ea = { a->argc, (int)(sizeof envp / sizeof *envp), a->argv, (char **)envp };
+    uint64_t entry = 0, sp = 0;
+    if (exec_load_image(t, a->path, &ea, &entry, &sp) < 0) {
         kfree(a);
         return 127;
     }
-    sp = build_stack(t, a, entry, phdr_va, phnum);
     open_stdio(t, a->stdio);
     kprintf("exec: pid %d: %s entry %lx, stack %lx, brk %lx, %lu user pages\n", t->pid, a->path, entry, sp, t->brk,
             uvm_pages(pml4));

@@ -53,8 +53,10 @@ syscall_entry:
 
     mov     rdi, rsp
     sti
-    call    syscall_dispatch
+    call    syscall_dispatch            ; nonzero: return through iretq
     cli
+    test    eax, eax
+    jnz     .iret
 
     pop     r15
     pop     r14
@@ -77,6 +79,28 @@ syscall_entry:
     pop     r11                         ; user RFLAGS -> R11 for SYSRET
     pop     rsp                         ; user RSP
     o64 sysret
+
+    ; rt_sigreturn restores a full context, rcx and r11 included, which
+    ; SYSRET would overwrite: leave through IRETQ (the frame above is laid
+    ; out like an interrupt frame).
+.iret:
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rbp
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
+    pop     rbx
+    pop     rax
+    add     rsp, 16                     ; vector + error code
+    iretq
 
 section .data
 align 8

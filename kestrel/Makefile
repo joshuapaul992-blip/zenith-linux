@@ -79,7 +79,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c \
            kernel/coreutils/text.c kernel/coreutils/perms.c kernel/coreutils/sysinfo.c \
            kernel/coreutils/neofetch.c \
            mm/pmm.c mm/heap.c mm/vmm.c mm/uvm.c \
-           proc/task.c proc/exec.c \
+           proc/task.c proc/exec.c proc/process.c \
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
            lib/string.c lib/printf.c
@@ -173,7 +173,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest
+MUSL_PROGS  := libctest socktest proctest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

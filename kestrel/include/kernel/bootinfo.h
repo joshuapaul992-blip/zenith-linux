@@ -20,7 +20,7 @@
 
 struct bootinfo {
     char     loader[64];
-    char     cmdline[128];
+    char     cmdline[1024];
     bool     uefi;                  /* EFI system table tag present */
     char     cpu_vendor[13];
     char     cpu_brand[49];

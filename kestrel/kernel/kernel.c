@@ -432,7 +432,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
      * needed. */
     const char *ex = strstr(g_boot.cmdline, "kestrel.exec=");
     if (ex) {
-        static char line[256];
+        static char line[1024];
         size_t i = 0;
         for (ex += 13; *ex && *ex != ' ' && i + 1 < sizeof line; ex++) line[i++] = *ex;
         line[i] = 0;

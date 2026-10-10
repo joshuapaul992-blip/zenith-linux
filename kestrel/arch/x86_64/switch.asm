@@ -63,6 +63,35 @@ thread_trampoline:
 ; per-task MSR value restored by the scheduler, so FS itself is not loaded.
 ; -----------------------------------------------------------------------------
 global enter_user
+global user_return
+
+; -----------------------------------------------------------------------------
+; void user_return(struct int_frame *f)   -- noreturn
+;
+; Return to ring 3 with every register taken from `f` (a fork child starts
+; this way, with the parent's registers and rax = 0). `f` must live on the
+; current kernel stack; interrupts off.
+; -----------------------------------------------------------------------------
+user_return:
+    mov     rsp, rdi
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rbp
+    pop     rdi
+    pop     rsi
+    pop     rdx
+    pop     rcx
+    pop     rbx
+    pop     rax
+    add     rsp, 16                     ; vector + error code
+    iretq
+
 enter_user:
     cli
     mov     ax, 0x1B                    ; user data | RPL3

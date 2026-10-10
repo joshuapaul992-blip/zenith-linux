@@ -5,6 +5,7 @@
  *  for PS/2, the timer-driven xHCI poll for USB); the queue is a ring of
  *  fixed-size records protected by disabling interrupts on the reader side.
  * ============================================================================= */
+#include <kernel/process.h>
 #include <kernel/kinput.h>
 #include <kernel/vfs.h>
 #include <kernel/posix.h>
@@ -120,6 +121,7 @@ static ssize_t kinput_fread(struct file *f, void *buf, size_t len)
     uint64_t fl = irq_save();
     while (q_head == q_tail) {
         if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
+        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(&q);
     }
     while (n < max && q_tail != q_head) {

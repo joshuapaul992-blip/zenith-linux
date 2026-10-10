@@ -1,5 +1,6 @@
 /* arch/x86_64/idt.c -- IDT setup and the central interrupt dispatcher */
 #include <kernel/task.h>
+#include <kernel/process.h>
 #include <kernel/arch.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
@@ -113,5 +114,6 @@ void isr_dispatch(struct int_frame *f)
          * not come back through here for a while. */
         pic_eoi(irq);
         if (irq_handlers[irq]) irq_handlers[irq](f);
+        if ((f->cs & 3) == 3) signal_deliver(f, 0, false);  /* back to ring 3 */
     }
 }

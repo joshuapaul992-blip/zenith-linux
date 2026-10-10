@@ -117,6 +117,17 @@ int main(int argc, char **argv)
     xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8,
                         (uint32_t)strlen(title), title);
 
+    /* Let the window manager close us politely (WM_DELETE_WINDOW). */
+    xcb_intern_atom_cookie_t pc = xcb_intern_atom(c, 0, 12, "WM_PROTOCOLS");
+    xcb_intern_atom_cookie_t dc = xcb_intern_atom(c, 0, 16, "WM_DELETE_WINDOW");
+    xcb_intern_atom_reply_t *pr = xcb_intern_atom_reply(c, pc, NULL);
+    xcb_intern_atom_reply_t *dr = xcb_intern_atom_reply(c, dc, NULL);
+    xcb_atom_t wm_protocols = pr ? pr->atom : XCB_NONE, wm_delete = dr ? dr->atom : XCB_NONE;
+    free(pr);
+    free(dr);
+    if (wm_protocols && wm_delete)
+        xcb_change_property(c, XCB_PROP_MODE_REPLACE, win, wm_protocols, XCB_ATOM_ATOM, 32, 1, &wm_delete);
+
     xcb_font_t font = xcb_generate_id(c);
     xcb_void_cookie_t fck = xcb_open_font_checked(c, font, 5, "fixed");
     xcb_generic_error_t *err = xcb_request_check(c, fck);
@@ -173,6 +184,15 @@ int main(int argc, char **argv)
             case XCB_DESTROY_NOTIFY:
                 free(ev);
                 goto out;
+            case XCB_CLIENT_MESSAGE: {
+                xcb_client_message_event_t *cm = (xcb_client_message_event_t *)ev;
+                if (cm->type == wm_protocols && cm->data.data32[0] == wm_delete) {
+                    printf("xdemo: closed by the window manager\n");
+                    free(ev);
+                    goto out;
+                }
+                break;
+            }
             case 0: {
                 xcb_generic_error_t *e = (xcb_generic_error_t *)ev;
                 printf("xdemo: X error %u (major %u)\n", e->error_code, e->major_code);

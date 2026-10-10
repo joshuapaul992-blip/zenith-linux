@@ -1,5 +1,5 @@
 # /boot/etc/icewm/programs -- the start menu's Programs folder on Kestrel
 #
-# Starting a program from IceWM needs fork/exec, which Kestrel does not have
-# yet: until then choosing an entry only logs "Function not implemented".
+# Entries run through IceWM's fork() + execvp(); programs not found in
+# PATH (/boot/bin) are hidden.
 prog "X demo" - xdemo

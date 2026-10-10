@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <time.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -152,7 +153,11 @@ static int selftest(void)
     CHECK(poll(q, 1, 0) == 1 && (q[0].revents & POLLHUP), "peer closed: POLLHUP");
     CHECK(read(s1, b, sizeof b) == 0, "peer closed: read returns 0 (EOF)");
     errno = 0;
-    CHECK(write(s1, "x", 1) < 0 && errno == EPIPE, "peer closed: write fails with EPIPE");
+    CHECK(send(s1, "x", 1, MSG_NOSIGNAL) < 0 && errno == EPIPE, "peer closed: send(MSG_NOSIGNAL) fails with EPIPE");
+    signal(SIGPIPE, SIG_IGN);                   /* as X servers and clients do */
+    errno = 0;
+    CHECK(write(s1, "x", 1) < 0 && errno == EPIPE, "peer closed: write fails with EPIPE (SIGPIPE ignored)");
+    signal(SIGPIPE, SIG_DFL);
 
     int sv[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && write(sv[0], "pq", 2) == 2 && read(sv[1], b, 2) == 2 && b[1] == 'q',

@@ -6,6 +6,7 @@
  * room while a reader exists (none: -EPIPE; there are no signals yet, so no
  * SIGPIPE). O_NONBLOCK on either end turns waiting into -EAGAIN. Waiting
  * uses the scheduler's sleep_on()/wakeup() on the pipe itself. */
+#include <kernel/process.h>
 #include <kernel/vfs.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
@@ -31,6 +32,7 @@ static ssize_t pipe_read(struct file *f, void *dst, size_t len)
     while (!p->count) {
         if (!p->writers) { irq_restore(fl); return 0; }
         if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
+        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(p);
     }
     size_t n = len < p->count ? len : p->count;
@@ -51,6 +53,7 @@ static ssize_t pipe_write(struct file *f, const void *src, size_t len)
         if (!p->readers) { irq_restore(fl); return done ? (ssize_t)done : -EPIPE; }
         if (p->count == PIPE_BUF_SIZE) {
             if (f->flags & O_NONBLOCK) break;
+            if (signal_pending()) { irq_restore(fl); return done ? (ssize_t)done : -ERESTARTSYS; }
             sleep_on(p);
             continue;
         }

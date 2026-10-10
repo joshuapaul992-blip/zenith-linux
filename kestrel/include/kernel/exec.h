@@ -10,6 +10,8 @@
 #ifndef KESTREL_EXEC_H
 #define KESTREL_EXEC_H
 
+#include <stdint.h>
+
 #define EXEC_MAX_ARGS   32
 
 /* Start `path` with argv[0..argc) as a new process sharing the caller's TTY.
@@ -22,5 +24,17 @@ int exec_spawn_io(const char *path, int argc, char *const argv[], const char *st
 
 /* Wait for process `pid` to exit; returns its exit status, or -ECHILD. */
 int exec_wait(int pid);
+
+/* Strings for a new image: argv[0..argc) and envp[0..envc), kernel memory. */
+struct exec_args {
+    int    argc, envc;
+    char **argv, **envp;
+};
+
+struct tcb;
+/* Load `path` into t's address space (t->pml4, which must be the loaded
+ * CR3): segments, a fresh stack with argv/envp/auxv, the program break.
+ * Returns 0 with the entry point and initial stack pointer, or -errno. */
+int exec_load_image(struct tcb *t, const char *path, const struct exec_args *a, uint64_t *entry, uint64_t *sp);
 
 #endif

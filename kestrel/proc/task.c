@@ -13,6 +13,7 @@
 #include <kernel/string.h>
 #include <kernel/vfs.h>
 #include <kernel/uvm.h>
+#include <kernel/process.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp);
 extern void thread_trampoline(void);
@@ -66,15 +67,47 @@ void sched_init(void)
     kprintf("sched: pid 0 (swapper) adopted boot stack, quantum=%dms\n", SCHED_QUANTUM);
 }
 
+static void reap_one(struct tcb *t)
+{
+    for (int fd = 0; fd < MAX_FDS; fd++) if (t->fds[fd]) vfs_close(t->fds[fd]);
+    if (t->pml4 && !t->vm_borrowed) uvm_destroy(t->pml4);
+    t->pml4 = 0;
+    kfree(t->kstack);
+    t->state = TASK_UNUSED;
+}
+
+/* Zombies go away here unless someone still wants their exit status: a
+ * task_wait() caller, or a parent process that has not called wait4(). */
 static void reap_zombies(void)
 {
     for (int i = 1; i < MAX_TASKS; i++) {
         struct tcb *t = &tasks[i];
-        if (t->state != TASK_ZOMBIE || t == cur || t->waiters) continue;
-        for (int fd = 0; fd < MAX_FDS; fd++) if (t->fds[fd]) vfs_close(t->fds[fd]);
-        if (t->pml4) { uvm_destroy(t->pml4); t->pml4 = 0; }
-        kfree(t->kstack);
-        t->state = TASK_UNUSED;
+        if (t->state != TASK_ZOMBIE || t == cur || t->waiters || process_zombie_kept(t)) continue;
+        reap_one(t);
+    }
+}
+
+void task_reap(struct tcb *t)
+{
+    uint64_t f = irq_save();
+    if (t->state == TASK_ZOMBIE && t != cur && !t->waiters) reap_one(t);
+    irq_restore(f);
+}
+
+struct tcb *task_find(int pid)
+{
+    for (int i = 0; i < MAX_TASKS; i++)
+        if (tasks[i].state != TASK_UNUSED && tasks[i].pid == pid) return &tasks[i];
+    return NULL;
+}
+
+struct tcb *task_slot(int i) { return (i >= 0 && i < MAX_TASKS) ? &tasks[i] : NULL; }
+
+void task_interrupt(struct tcb *t)
+{
+    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
+        t->state = TASK_READY;
+        need_resched = true;
     }
 }
 
@@ -106,6 +139,7 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
 
     t->pid = next_pid++;
     t->ppid = cur ? cur->pid : 0;
+    t->pgid = t->sid = t->pid;
     strlcpy(t->name, name, sizeof t->name);
     t->cr3 = read_cr3();
     t->quantum = SCHED_QUANTUM;
@@ -227,6 +261,7 @@ void task_exit(int code)
     /* close now, not at reap time: pipe and socket peers must see EOF */
     for (int fd = 0; fd < MAX_FDS; fd++) if (cur->fds[fd]) { vfs_close(cur->fds[fd]); cur->fds[fd] = NULL; }
     cur->exit_code = code;
+    process_exit(cur);                          /* parent, children, vfork */
     cur->state = TASK_ZOMBIE;
     wakeup(cur);                                /* anyone waiting on us */
     schedule();

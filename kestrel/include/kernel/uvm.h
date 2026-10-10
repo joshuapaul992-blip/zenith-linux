@@ -45,5 +45,8 @@ void     uvm_unmap(uint64_t pml4, uint64_t va, uint64_t len);
 bool     uvm_range_ok(uint64_t va, uint64_t len);       /* inside the user half */
 bool     uvm_mapped(uint64_t pml4, uint64_t va, uint64_t len);
 uint64_t uvm_pages(uint64_t pml4);          /* user pages mapped (statistics)  */
+/* A new address space with a private copy of every user page of `src`
+ * (fork). Eager copy; 0 on OOM. */
+uint64_t uvm_clone(uint64_t src);
 
 #endif

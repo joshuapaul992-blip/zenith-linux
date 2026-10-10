@@ -11,6 +11,7 @@
  * kept in a small table: abstract names directly, path names by the inode
  * of their VSOCK node, so a socket file that was unlinked or replaced can
  * no longer be reached even if its vnode memory is reused. */
+#include <kernel/process.h>
 #include <kernel/socket.h>
 #include <kernel/vfs.h>
 #include <kernel/task.h>
@@ -245,6 +246,7 @@ int usock_accept(struct file *f, int flags, struct file **out, struct sockaddr_u
     uint64_t fl = irq_save();
     while (!l->qlen) {
         if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
+        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(l);
         if (l->state != US_LISTEN) { irq_restore(fl); return -EINVAL; }
     }
@@ -280,6 +282,7 @@ long usock_send(struct file *f, const void *buf, size_t len, int flags)
         if (!p || p->shut_rd) { irq_restore(fl); return done ? (long)done : -EPIPE; }
         if (p->rx_count == SOCK_BUF) {
             if (nb) break;
+            if (signal_pending()) { irq_restore(fl); return done ? (long)done : -ERESTARTSYS; }
             sleep_on(p);
             continue;
         }
@@ -306,6 +309,7 @@ long usock_recv(struct file *f, void *buf, size_t len, int flags)
     while (!s->rx_count) {
         if (!s->peer || s->shut_rd || (s->peer && s->peer->shut_wr)) { irq_restore(fl); return 0; }    /* EOF */
         if (nb) { irq_restore(fl); return -EAGAIN; }
+        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(s);
     }
     size_t n = len < s->rx_count ? len : s->rx_count;

@@ -499,6 +499,8 @@ mm/           pmm.c          bitmap frame allocator from the MB2 memory map
 
 proc/task.c                  TCBs, round-robin scheduler (10 ms quantum), sleep_on/wakeup,
                              timed sleep, zombie reaping, idle thread
+proc/exec.c                  ELF64 loader, System V initial stack, kernel-started processes
+proc/process.c               fork/vfork/clone, execve, wait4, sessions, signals
 fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), file objects,
                              getdents64, ramfs files, generated "pseudo" files
               devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor
@@ -548,11 +550,9 @@ Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), select, pselect6 (no signal mask), access, umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, getpgid, wait4 (always `-ECHILD`: processes cannot have children yet), getuid, getgid, geteuid, getegid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
+**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), select, pselect6 (no signal mask), access, umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, fork, vfork, clone (`fork`/`vfork`-style only: no threads), execve, wait4, setsid, setpgid, getpgid, getpgrp, getsid, kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, getuid, getgid, geteuid, getegid, exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
 
-**Accepted but inert (no signals yet):** rt_sigaction, rt_sigprocmask.
-
-**Stubs returning `-ENOSYS`:** fork, execve, kill, gettimeofday.
+**Stubs returning `-ENOSYS`:** gettimeofday (musl uses clock_gettime).
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -587,7 +587,26 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 - `socktest`: 20 checks in one process.
 - `socktest server` with `socktest client`: a real server and client, started together with `kestrel.exec=/boot/bin/socktest,server+/boot/bin/socktest,client` (`+` separates programs).
 
-Not done yet: W^X page permissions, file-backed `mmap`, fork/execve, signals, threads, and `SCM_RIGHTS`. These come as the XLibre port needs them.
+**Processes** (`proc/process.c`, `include/kernel/process.h`):
+- **fork:** gives the child a private copy of every user page. The copy is eager; copy-on-write comes later. Descriptors, the working directory, signal handlers and the signal mask are inherited.
+- **vfork and `clone(CLONE_VM | CLONE_VFORK)`** (musl's `posix_spawn`): the child borrows the parent's address space, and the parent sleeps until the child calls `execve` or exits.
+- **execve:** builds the new image in a fresh address space. If loading fails, the old image is untouched and the call returns an error. On success, `O_CLOEXEC` descriptors close, caught signals revert to their defaults, and the FPU state and TLS base are reset.
+- **wait4:** a parent waits for a child, a process group or any child, with `WNOHANG`. A process's exited children stay zombies until it collects them, unless SIGCHLD is ignored or has `SA_NOCLDWAIT`. Orphans are reaped by the kernel.
+- **setsid, setpgid, getpgid, getsid:** sessions and process groups.
+
+**Signals** follow Linux x86_64:
+- **Handlers and masks:** `rt_sigaction` with `SA_RESTART`, `SA_NODEFER`, `SA_RESETHAND` and `SA_NOCLDWAIT`; `rt_sigprocmask`, `rt_sigpending`, `rt_sigsuspend` and `pause`.
+- **Sending:** `kill` to a process, a process group or everyone; `tkill`/`tgkill`, which `raise()` and `abort()` use.
+- **Kernel-raised signals:** SIGCHLD to the parent when a child exits, and SIGPIPE on writes to a pipe or socket nobody reads, unless `MSG_NOSIGNAL`.
+- **Handlers run on Linux's frame:** a handler gets the standard `rt_sigframe` (siginfo, a ucontext with the saved registers, and the `fxsave` FPU state) and returns through musl's `SA_RESTORER` trampoline into `rt_sigreturn`.
+- **When delivery happens:** on every return to ring 3 (after a system call or an interrupt), so a process spinning in user mode can also be killed.
+- **Blocking calls:** pipe and socket I/O, `accept`, tty reads, `/dev/kinput`, `wait4`, `poll`, `select`, `nanosleep` and `sigsuspend` stop waiting when a signal arrives. They return EINTR to a handler, or restart under `SA_RESTART`, as on Linux.
+- **Default actions:** terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH. There is no job control: stop signals are ignored.
+- **CPU faults** in ring 3 still end the process immediately, without calling a SIGSEGV handler.
+
+`user/proctest.c` (`/boot/bin/proctest`) checks all of this in 30 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE and abort.
+
+Not done yet: W^X page permissions, copy-on-write, file-backed `mmap`, threads, timers (`alarm`, `setitimer`), job control, and `SCM_RIGHTS`.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -669,8 +688,10 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 **Trying it:**
 - `kestrel.exec=/boot/bin/Xkestrel,:0+2s+/boot/bin/icewm+3s+/boot/bin/xdemo`.
 - Checked in QEMU: IceWM frames the xdemo window, Ctrl+Esc opens the start menu, and dragging the title bar moves the window.
+- Starting programs: choosing "X demo" in the menu runs IceWM's own `fork()` + `execvp()`, and the new xdemo window appears.
+- Closing: the title-bar close button sends `WM_DELETE_WINDOW`; xdemo exits, and IceWM collects it through its SIGCHLD handler and `waitpid`.
 
-**Not yet:** starting programs from the menu. That needs fork/exec; until then choosing an entry fails with "Function not implemented". Also missing: icewmbg (backgrounds), icewm-session and other fonts than `fixed`.
+**Not yet:** icewmbg (backgrounds), icewm-session, more programs for the menus, and fonts other than `fixed`.
 
 ## Memory map at boot
 
@@ -686,8 +707,8 @@ The limits: C++ exceptions cannot be caught, and the compiled parts of libstdc++
 The structure is laid out for these, in order:
 
 1. **User mode:** done (see "User programs"). Still missing: W^X and a fault-safe `copy_from_user`.
-2. **fork/execve/wait4** on top of that.
-3. **Signals.**
+2. **fork/execve/wait4:** done (see "Processes"); copy-on-write next.
+3. **Signals:** done, apart from timers, job control and handlers for CPU faults.
 4. **libc:** done for musl (static-PIE, unmodified). The XLibre X server runs on it (see "X11").
 5. **A writable file system** (FAT or ext2) on the block layer, next to the read-only tarfs.
 6. **ACPI parsing** for power-off on real hardware. The emulator ports are used today.

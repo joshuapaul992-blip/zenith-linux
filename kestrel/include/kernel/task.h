@@ -23,6 +23,17 @@ enum task_state {
 
 struct file;
 struct vnode;
+struct int_frame;
+
+#define NSIG            64
+
+/* Kernel layout of struct sigaction (Linux x86_64 rt_sigaction). */
+struct k_sigaction {
+    uint64_t handler;           /* SIG_DFL 0, SIG_IGN 1, or a function     */
+    uint64_t flags;             /* SA_*                                    */
+    uint64_t restorer;          /* SA_RESTORER: calls rt_sigreturn          */
+    uint64_t mask;              /* blocked while the handler runs          */
+};
 
 /* Thread Control Block. Every kernel thread (and, later, every user
  * process' main thread) is described by one of these. */
@@ -61,6 +72,21 @@ struct tcb {
     uint64_t  fs_base;          /* TLS pointer (arch_prctl ARCH_SET_FS)    */
     uint64_t  tid_address;      /* set_tid_address()                       */
     uint8_t   fpu[512] __attribute__((aligned(16)));    /* fxsave area     */
+
+    /* processes (proc/process.c) */
+    int       pgid, sid;        /* process group, session                  */
+    int       exit_signal;      /* sent to the parent at exit (SIGCHLD)    */
+    int       term_signal;      /* killed by this signal; 0 = exit()       */
+    bool      vm_borrowed;      /* vfork child: pml4 belongs to the parent  */
+    int       vfork_parent;     /* pid blocked in vfork() until exec/exit   */
+    struct int_frame *uframe;   /* user registers of the syscall in progress */
+    bool      iret_return;      /* leave this syscall through iretq          */
+
+    /* signals */
+    uint64_t  sig_pending, sig_mask;
+    uint64_t  saved_mask;       /* rt_sigsuspend: mask to restore           */
+    bool      saved_mask_valid;
+    struct k_sigaction sigact[NSIG];
 };
 
 void        sched_init(void);
@@ -81,6 +107,10 @@ void        task_sleep_ms(uint64_t ms);
 int         task_wait(int pid);         /* exit status, or -ECHILD        */
 
 int         task_snapshot(struct tcb *out, int max);
+struct tcb *task_find(int pid);         /* live or zombie, NULL if none     */
+struct tcb *task_slot(int i);           /* 0 <= i < MAX_TASKS               */
+void        task_reap(struct tcb *t);   /* free a zombie now (wait4)        */
+void        task_interrupt(struct tcb *t);  /* end a sleep early (signals)  */
 const char *task_state_name(enum task_state s);
 uint64_t    sched_context_switches(void);
 void        sched_cpu_times(uint64_t *user, uint64_t *system, uint64_t *idle);

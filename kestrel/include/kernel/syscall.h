@@ -29,6 +29,7 @@ struct int_frame;
 #define SYS_brk            12
 #define SYS_rt_sigaction   13
 #define SYS_rt_sigprocmask 14
+#define SYS_rt_sigreturn   15
 #define SYS_ioctl          16
 #define SYS_readv          19
 #define SYS_writev         20
@@ -54,9 +55,12 @@ struct int_frame;
 #define SYS_socketpair     53
 #define SYS_setsockopt     54
 #define SYS_getsockopt     55
+#define SYS_clone          56
 #define SYS_nanosleep      35
+#define SYS_pause          34
 #define SYS_getpid         39
 #define SYS_fork           57
+#define SYS_vfork          58
 #define SYS_execve         59
 #define SYS_exit           60
 #define SYS_wait4          61
@@ -78,16 +82,24 @@ struct int_frame;
 #define SYS_getgid        104
 #define SYS_geteuid       107
 #define SYS_getegid       108
+#define SYS_setpgid       109
 #define SYS_getppid       110
+#define SYS_getpgrp       111
+#define SYS_setsid        112
 #define SYS_getpgid       121
+#define SYS_getsid        124
+#define SYS_rt_sigpending 127
+#define SYS_rt_sigsuspend 130
 #define SYS_arch_prctl    158
 #define SYS_reboot        169
 #define SYS_gettid        186
+#define SYS_tkill         200
 #define SYS_getdents64    217
 #define SYS_set_tid_address 218
 #define SYS_clock_gettime 228
 #define SYS_clock_getres  229
 #define SYS_exit_group    231
+#define SYS_tgkill        234
 #define SYS_pselect6      270
 #define SYS_utimensat     280
 #define SYS_accept4       288
@@ -100,7 +112,8 @@ typedef int64_t (*syscall_fn)(uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6);
 
 void syscall_init(void);
-void syscall_dispatch(struct int_frame *f);
+/* Returns nonzero when the caller must leave through iretq (rt_sigreturn). */
+int  syscall_dispatch(struct int_frame *f);
 const char *syscall_name(int nr);
 int  syscall_implemented(int nr);
 uint64_t syscall_count(int nr);

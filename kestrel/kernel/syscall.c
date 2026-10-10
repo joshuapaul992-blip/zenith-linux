@@ -5,6 +5,7 @@
  * placeholder handlers returning -ENOSYS so the vector table is complete and
  * each can be filled in independently. */
 #include <kernel/syscall.h>
+#include <kernel/process.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
 #include <kernel/task.h>
@@ -235,8 +236,6 @@ static int64_t sys_getgid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, ui
 
 /* Single-user system: effective ids are the real ids, a process is its own
  * process group. */
-static int64_t sys_getpgid(uint64_t pid, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return pid ? (int64_t)pid : current_task()->pid; }
 
 static int64_t sys_sched_yield(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; sched_yield(); return 0; }
@@ -246,11 +245,22 @@ static int64_t sys_exit(uint64_t code, uint64_t a2, uint64_t a3, uint64_t a4, ui
 
 static int64_t sys_nanosleep(uint64_t req, uint64_t rem, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)rem; (void)a3; (void)a4; (void)a5; (void)a6;
+    (void)a3; (void)a4; (void)a5; (void)a6;
     if (bad_ptr(req)) return -EFAULT;
     const struct timespec *ts = (const struct timespec *)req;
     if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000) return -EINVAL;
-    task_sleep_ms((uint64_t)ts->tv_sec * 1000 + (uint64_t)ts->tv_nsec / 1000000);
+    uint64_t deadline = time_ms() + (uint64_t)ts->tv_sec * 1000 + (uint64_t)ts->tv_nsec / 1000000;
+    for (uint64_t now; (now = time_ms()) < deadline; ) {
+        if (signal_pending()) {                         /* EINTR with the time left */
+            if (rem && !bad_buf(rem, sizeof(struct timespec))) {
+                struct timespec *r = (struct timespec *)rem;
+                r->tv_sec = (int64_t)((deadline - now) / 1000);
+                r->tv_nsec = (int64_t)((deadline - now) % 1000) * 1000000;
+            }
+            return -EINTR;
+        }
+        task_sleep_ms(deadline - now);                  /* a signal ends it early */
+    }
     return 0;
 }
 
@@ -437,22 +447,6 @@ static int64_t sys_set_tid_address(uint64_t ptr, uint64_t a2, uint64_t a3, uint6
 static int64_t sys_gettid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return current_task()->pid; }
 
-/* No signals yet: handlers are accepted and never invoked, masks are empty. */
-static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t old, uint64_t size, uint64_t a5, uint64_t a6)
-{
-    (void)act; (void)a5; (void)a6;
-    if (sig < 1 || sig > 64) return -EINVAL;
-    if (old) { if (bad_buf(old, size + 24)) return -EFAULT; memset((void *)old, 0, size + 24); }
-    return 0;
-}
-
-static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t old, uint64_t size, uint64_t a5, uint64_t a6)
-{
-    (void)how; (void)set; (void)a5; (void)a6;
-    if (old) { if (bad_buf(old, size)) return -EFAULT; memset((void *)old, 0, size); }
-    return 0;
-}
-
 struct iovec { uint64_t base, len; };
 
 static int64_t rw_vec(uint64_t fd, uint64_t iov, uint64_t cnt, bool wr)
@@ -600,6 +594,7 @@ static int64_t sys_poll(uint64_t fds, uint64_t nfds, uint64_t timeout, uint64_t 
         }
         if (ready || tmo == 0) return ready;
         if (tmo > 0 && time_ms() >= deadline) return 0;
+        if (signal_pending()) return -ERESTARTNOHAND;
         task_sleep_ms(1);
     }
 }
@@ -645,6 +640,7 @@ static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int6
             }
             return ready;
         }
+        if (signal_pending()) return -ERESTARTNOHAND;
         task_sleep_ms(1);
     }
 }
@@ -917,13 +913,48 @@ static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_
     return rc;
 }
 
-/* Ring-3 processes cannot create processes yet (no fork/clone), so a
- * process never has children to wait for. */
+/* ---- processes and signals (proc/process.c) ---------------------------- */
+#define SIGCHLD_ 17
+#define CLONE_VM_ 0x100
+#define CLONE_VFORK_ 0x4000
+static int64_t sys_fork(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_clone(SIGCHLD_, 0, 0, 0, 0); }
+static int64_t sys_vfork(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_clone(CLONE_VM_ | CLONE_VFORK_ | SIGCHLD_, 0, 0, 0, 0); }
+static int64_t sys_clone(uint64_t flags, uint64_t sp, uint64_t ptid, uint64_t ctid, uint64_t tls, uint64_t a6)
+{ (void)a6; return proc_clone(flags, sp, ptid, ctid, tls); }
+static int64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return proc_execve(path, argv, envp); }
 static int64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_t ru, uint64_t a5, uint64_t a6)
-{
-    (void)pid; (void)status; (void)options; (void)ru; (void)a5; (void)a6;
-    return -ECHILD;
-}
+{ (void)a5; (void)a6; return proc_wait4((int64_t)(int32_t)pid, status, options, ru); }
+static int64_t sys_setsid(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_setsid(); }
+static int64_t sys_setpgid(uint64_t pid, uint64_t pgid, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return proc_setpgid((int64_t)(int32_t)pid, (int64_t)(int32_t)pgid); }
+static int64_t sys_getpgid(uint64_t pid, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_getpgid((int64_t)(int32_t)pid); }
+static int64_t sys_getpgrp(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_getpgid(0); }
+static int64_t sys_getsid(uint64_t pid, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_getsid((int64_t)(int32_t)pid); }
+static int64_t sys_rt_sigaction(uint64_t sig, uint64_t act, uint64_t old, uint64_t size, uint64_t a5, uint64_t a6)
+{ (void)a5; (void)a6; return sig_action(sig, act, old, size); }
+static int64_t sys_rt_sigprocmask(uint64_t how, uint64_t set, uint64_t old, uint64_t size, uint64_t a5, uint64_t a6)
+{ (void)a5; (void)a6; return sig_procmask(how, set, old, size); }
+static int64_t sys_rt_sigpending(uint64_t set, uint64_t size, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sig_pending_set(set, size); }
+static int64_t sys_rt_sigreturn(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return sig_return(); }
+static int64_t sys_rt_sigsuspend(uint64_t mask, uint64_t size, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sig_suspend(mask, size); }
+static int64_t sys_pause(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return sig_pause(); }
+static int64_t sys_kill(uint64_t pid, uint64_t sig, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sig_kill((int64_t)(int32_t)pid, (int64_t)(int32_t)sig); }
+static int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sig_tgkill(0, (int64_t)(int32_t)tid, (int64_t)(int32_t)sig); }
+static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sig_tgkill((int64_t)(int32_t)tgid, (int64_t)(int32_t)tid, (int64_t)(int32_t)sig); }
 
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
@@ -976,8 +1007,14 @@ void syscall_init(void)
     REG(SYS_recvmsg, sys_recvmsg);     REG(SYS_shutdown, sys_shutdown);
     REG(SYS_getsockname, sys_getsockname); REG(SYS_getpeername, sys_getpeername);
     REG(SYS_setsockopt, sys_setsockopt);   REG(SYS_getsockopt, sys_getsockopt);
-    REG(SYS_fork, sys_enosys);         REG(SYS_execve, sys_enosys);
-    REG(SYS_wait4, sys_wait4);        REG(SYS_kill, sys_enosys);
+    REG(SYS_fork, sys_fork);           REG(SYS_execve, sys_execve);
+    REG(SYS_vfork, sys_vfork);         REG(SYS_clone, sys_clone);
+    REG(SYS_setsid, sys_setsid);       REG(SYS_setpgid, sys_setpgid);
+    REG(SYS_getpgrp, sys_getpgrp);     REG(SYS_getsid, sys_getsid);
+    REG(SYS_rt_sigreturn, sys_rt_sigreturn); REG(SYS_rt_sigpending, sys_rt_sigpending);
+    REG(SYS_rt_sigsuspend, sys_rt_sigsuspend); REG(SYS_pause, sys_pause);
+    REG(SYS_tkill, sys_tkill);         REG(SYS_tgkill, sys_tgkill);
+    REG(SYS_wait4, sys_wait4);        REG(SYS_kill, sys_kill);
     REG(SYS_gettimeofday, sys_enosys);
 
     /* SYSCALL/SYSRET fast path (used once ring-3 processes exist) */
@@ -991,12 +1028,12 @@ void syscall_init(void)
     kprintf("syscall: int 0x80 gate + SYSCALL/LSTAR ready, %d calls implemented\n", n);
 }
 
-void syscall_dispatch(struct int_frame *f)
+int syscall_dispatch(struct int_frame *f)
 {
     uint64_t nr = f->rax;
+    struct tcb *t = current_task();
     if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
         static uint8_t warned[SYS_MAX + 1];
-        struct tcb *t = current_task();
         uint64_t k = nr < SYS_MAX ? nr : SYS_MAX;
         if (t->user && warned[k] < 3) {         /* the gaps a ported program hits */
             warned[k]++;
@@ -1004,12 +1041,24 @@ void syscall_dispatch(struct int_frame *f)
                     nr < SYS_MAX && names[nr] ? names[nr] : "?", f->rip);
         }
         f->rax = (uint64_t)-ENOSYS;
-        return;
+    } else {
+        counts[nr]++;
+        t->uframe = f;
+        t->iret_return = false;
+        if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
+        int64_t r = table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
+        f->rax = (uint64_t)r;
+        /* a write to a pipe or socket nobody reads raises SIGPIPE */
+        if (r == -EPIPE && t->user &&
+            (nr == SYS_write || nr == SYS_writev ||
+             (nr == SYS_sendto && !(f->r10 & MSG_NOSIGNAL)) || (nr == SYS_sendmsg && !(f->rdx & MSG_NOSIGNAL))))
+            signal_send(t, SIGPIPE);
+        cli();
     }
-    counts[nr]++;
-    if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
-    f->rax = (uint64_t)table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
-    cli();
+    if (t->user && (f->cs & 3) == 3) signal_deliver(f, nr, true);
+    int iret = t->iret_return;
+    t->iret_return = false;
+    return iret;
 }
 
 const char *syscall_name(int nr) { return (nr >= 0 && nr < SYS_MAX && names[nr]) ? names[nr] : NULL; }

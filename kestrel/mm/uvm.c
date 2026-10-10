@@ -131,6 +131,30 @@ static uint64_t walk(uint64_t *t, int level, bool free_it)
 
 uint64_t uvm_pages(uint64_t pml4) { return pml4 ? walk((uint64_t *)pml4, 4, false) : 0; }
 
+/* Copy one level of the user half from `src` into `dst` (both tables of
+ * the same level), duplicating every page. False on OOM; `dst` then holds
+ * a partial copy that uvm_destroy() frees. */
+static bool copy_level(const uint64_t *src, uint64_t *dst, int level)
+{
+    for (int i = (level == 4 ? KERNEL_SLOTS : 0); i < (level == 4 ? 256 : 512); i++) {
+        if (!(src[i] & PTE_P)) continue;
+        uint64_t n = pmm_alloc();
+        if (!n) return false;
+        dst[i] = n | (src[i] & ~ADDR_MASK);             /* same rights */
+        if (level == 1) memcpy((void *)n, (const void *)(src[i] & ADDR_MASK), UVM_PAGE);
+        else if (!copy_level((const uint64_t *)(src[i] & ADDR_MASK), (uint64_t *)n, level - 1)) return false;
+    }
+    return true;
+}
+
+uint64_t uvm_clone(uint64_t src)
+{
+    uint64_t dst = uvm_create();
+    if (!dst) return 0;
+    if (!copy_level((const uint64_t *)src, (uint64_t *)dst, 4)) { uvm_destroy(dst); return 0; }
+    return dst;
+}
+
 void uvm_destroy(uint64_t pml4)
 {
     if (!pml4 || pml4 == kernel_pml4) return;
