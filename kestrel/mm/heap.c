@@ -1,11 +1,15 @@
-/* mm/heap.c -- first-fit kernel heap with block splitting and coalescing.
+/* mm/heap.c -- kernel heap with block splitting and coalescing.
  * The heap starts as one physically contiguous, identity-mapped arena
  * reserved at boot and grows by further arenas taken from the frame
  * allocator when it runs out (at least 1 MiB each). Blocks of all arenas
  * sit on one address-ordered list; two neighbours on the list are merged
- * only when they also touch in memory, so arenas never merge. All
- * operations are IRQ-safe. A failed allocation returns NULL: callers turn
- * that into -ENOMEM, never into a crash. */
+ * only when they also touch in memory, so arenas never merge. Free blocks
+ * are also kept in bins by size (one per power of two), so an allocation
+ * looks only at free blocks big enough for it, not at every block: with
+ * tens of thousands of blocks (a large program's page cache and mappings)
+ * a list walk per kmalloc made the whole kernel crawl. All operations are
+ * IRQ-safe. A failed allocation returns NULL: callers turn that into
+ * -ENOMEM, never into a crash. */
 #include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
@@ -17,13 +21,53 @@
 struct block {
     uint64_t magic;
     size_t   size;            /* payload bytes */
-    struct block *next, *prev;
+    struct block *next, *prev;      /* every block, in address order */
+    struct block *fnext, *fprev;    /* free blocks of the same bin */
     uint64_t free;
     uint64_t pad;             /* keep header a multiple of 16 */
 };
 
+#define NBINS 48
 static struct block *head;
+static struct block *bins[NBINS];   /* bin k: free blocks of 2^k to 2^(k+1)-1 bytes */
+static uint64_t bin_map;            /* bit k: bins[k] is not empty */
 static size_t arena_size, used_bytes;
+
+static int bin_of(size_t size)
+{
+    int k = 63 - __builtin_clzll(size | 1);
+    return k < NBINS ? k : NBINS - 1;
+}
+
+static void bin_add(struct block *b)
+{
+    int k = bin_of(b->size);
+    b->fprev = NULL;
+    b->fnext = bins[k];
+    if (bins[k]) bins[k]->fprev = b;
+    bins[k] = b;
+    bin_map |= 1ull << k;
+}
+
+static void bin_del(struct block *b)
+{
+    int k = bin_of(b->size);
+    if (b->fprev) b->fprev->fnext = b->fnext; else bins[k] = b->fnext;
+    if (b->fnext) b->fnext->fprev = b->fprev;
+    if (!bins[k]) bin_map &= ~(1ull << k);
+    b->fnext = b->fprev = NULL;
+}
+
+/* A free block of at least n bytes: first fit in n's own bin, else the
+ * first block of the next non-empty bin (every one of those is big enough). */
+static struct block *find_free(size_t n)
+{
+    int k = bin_of(n);
+    for (struct block *b = bins[k]; b; b = b->fnext)
+        if (b->size >= n) return b;
+    uint64_t above = k + 1 < 64 ? bin_map & ~((2ull << k) - 1) : 0;
+    return above ? bins[__builtin_ctzll(above)] : NULL;
+}
 
 #define GROW_MIN    (1u << 20)
 
@@ -51,6 +95,7 @@ static bool heap_grow(size_t need)
     nb->next = b;
     if (b) b->prev = nb;
     if (prev) prev->next = nb; else head = nb;
+    bin_add(nb);
     arena_size += frames * PAGE_SIZE;
     return true;
 }
@@ -66,6 +111,7 @@ void heap_init(size_t bytes)
     head->size = arena_size - sizeof(struct block);
     head->next = head->prev = NULL;
     head->free = 1;
+    bin_add(head);
     kprintf("heap: %zu KiB arena at %p\n", arena_size >> 10, (void *)base);
 }
 
@@ -76,8 +122,12 @@ void *kmalloc(size_t n)
     n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
     uint64_t f = irq_save();
     for (int attempt = 0; attempt < 2; attempt++) {
-    for (struct block *b = head; b; b = b->next) {
-        if (!b->free || b->size < n) continue;
+        struct block *b = find_free(n);
+        if (!b) {
+            if (attempt == 0 && !heap_grow(n)) break;
+            continue;
+        }
+        bin_del(b);
         if (b->size >= n + sizeof(struct block) + 64) {      /* split */
             struct block *nb = (struct block *)((uint8_t *)(b + 1) + n);
             nb->magic = HEAP_MAGIC;
@@ -87,13 +137,12 @@ void *kmalloc(size_t n)
             if (b->next) b->next->prev = nb;
             b->next = nb;
             b->size = n;
+            bin_add(nb);
         }
         b->free = 0;
         used_bytes += b->size + sizeof(struct block);
         irq_restore(f);
         return b + 1;
-    }
-    if (attempt == 0 && !heap_grow(n)) break;
     }
     irq_restore(f);
     kprintf("heap: out of memory (request %zu bytes)\n", n);
@@ -116,15 +165,21 @@ void kfree(void *p)
     b->free = 1;
     used_bytes -= b->size + sizeof(struct block);
     if (b->next && b->next->free && adjacent(b, b->next)) { /* merge right */
+        bin_del(b->next);
         b->size += sizeof(struct block) + b->next->size;
         b->next = b->next->next;
         if (b->next) b->next->prev = b;
     }
     if (b->prev && b->prev->free && adjacent(b->prev, b)) { /* merge left  */
-        b->prev->size += sizeof(struct block) + b->size;
-        b->prev->next = b->next;
-        if (b->next) b->next->prev = b->prev;
+        struct block *l = b->prev;
+        bin_del(l);
+        l->size += sizeof(struct block) + b->size;
+        l->next = b->next;
+        if (b->next) b->next->prev = l;
+        b->magic = 0;
+        b = l;
     }
+    bin_add(b);
     irq_restore(f);
 }
 
