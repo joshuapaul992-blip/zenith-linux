@@ -72,6 +72,7 @@ static int pipe_poll(struct file *f, int events)
 {
     struct pipe *p = pipe_of(f);
     int r = 0;
+    poll_wait(p);
     if (f->vn == &p->rd) {
         if (p->count) r |= POLLIN;
         if (!p->writers) r |= POLLHUP;

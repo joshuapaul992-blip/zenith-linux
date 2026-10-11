@@ -345,6 +345,8 @@ static int master_poll(struct file *f, int events)
 {
     struct pty *p = pty_of(f);
     int r = 0;
+    poll_wait(&p->in);
+    poll_wait(&p->out);
     if (p->out_count) r |= POLLIN;
     if (p->slave_seen && !p->slaves) r |= POLLHUP | POLLIN;
     if (p->in_count < IN_BUF) r |= POLLOUT;
@@ -436,6 +438,8 @@ static int slave_poll(struct file *f, int events)
 {
     struct pty *p = pty_of(f);
     int r = 0;
+    poll_wait(&p->in);
+    poll_wait(&p->out);
     if (slave_readable(p)) r |= POLLIN;
     if (!p->masters) r |= POLLHUP | POLLIN;
     if (p->out_count + 2 <= OUT_BUF) r |= POLLOUT;

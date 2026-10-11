@@ -859,7 +859,13 @@ uint64_t vfs_poll_deadline(struct file *f)
 /* Files without a poll op (regular files, most devices) never block. */
 int vfs_poll(struct file *f, int events)
 {
-    if (f->vn && f->vn->ops && f->vn->ops->poll) return f->vn->ops->poll(f, events);
+    if (f->vn && f->vn->ops && f->vn->ops->poll) {
+        struct poll_table *pt = current_task() ? current_task()->poll_tab : NULL;
+        uint32_t calls = pt ? pt->calls : 0;
+        int r = f->vn->ops->poll(f, events);
+        if (pt && pt->calls == calls) pt->all = true;   /* named no channel: any wakeup counts */
+        return r;
+    }
     int r = 0;
     if ((f->flags & O_ACCMODE) != O_WRONLY) r |= POLLIN;
     if ((f->flags & O_ACCMODE) != O_RDONLY) r |= POLLOUT;

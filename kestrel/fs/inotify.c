@@ -162,6 +162,7 @@ static ssize_t in_read(struct file *f, void *buf, size_t len)
 static int in_poll(struct file *f, int events)
 {
     struct inotify *in = f->vn->data;
+    poll_wait(in);
     return in->head ? (events & (POLLIN | POLLRDNORM)) : 0;
 }
 

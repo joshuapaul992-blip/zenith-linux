@@ -102,6 +102,7 @@ struct tcb {
     bool      idle_class;       /* runs only when no other task is ready    */
     uint64_t  wake_ms;          /* uptime_ms() to wake a TASK_SLEEPING task */
     void     *wait_chan;
+    struct poll_table *poll_tab;    /* poll/select/epoll: collecting, then sleeping on it */
     uint64_t  cpu_ticks, switches, start_tick;   /* start_tick: uptime in PIT_HZ ticks */
     int       exit_code;
     int       waiters;          /* task_wait() callers: not reaped yet   */
@@ -203,12 +204,29 @@ void        io_pause(void *chan, uint32_t us);
 void        io_wake(void *chan);
 
 /* Waiting for any of many objects (poll, select, epoll). Every wakeup()
- * advances a global sequence number and wakes the pollers: a poller reads
- * the number, checks its objects, and sleeps only if the number has not
- * moved since -- no state change can slip in between unnoticed.
- * poll_sleep returns at a wakeup, a signal, or deadline_ms (0: none). */
+ * advances a global sequence number: a poller reads the number, checks its
+ * objects, and sleeps only if the number has not moved since -- no state
+ * change can slip in between unnoticed.
+ *
+ * Which wakeups end the sleep: while the objects are checked (between
+ * poll_begin and poll_end), each one's poll op names the channels its state
+ * changes are announced on with poll_wait(chan), and the poller then wakes
+ * only for wakeup() on one of those. An object whose poll op names none (or
+ * more than POLL_CHANS in all) makes the poller wake at every wakeup(), as
+ * every poller once did -- slower, never wrong.
+ * poll_sleep returns at such a wakeup, a signal, or deadline_ms (0: none). */
+#define POLL_CHANS 48
+struct poll_table {
+    bool      all;              /* wake at any wakeup()                       */
+    uint16_t  n;
+    uint32_t  calls;            /* poll_wait() calls, to spot silent poll ops */
+    void     *chan[POLL_CHANS];
+};
 uint64_t    poll_seq_read(void);
-void        poll_sleep(uint64_t seq, uint64_t deadline_ms);
+void        poll_begin(struct poll_table *pt);
+void        poll_wait(void *chan);  /* from a poll op: changes are announced on chan */
+void        poll_end(void);
+void        poll_sleep(uint64_t seq, uint64_t deadline_ms, struct poll_table *pt);
 void        task_sleep_ms(uint64_t ms);
 int         task_wait(int pid);         /* exit status, or -ECHILD        */
 

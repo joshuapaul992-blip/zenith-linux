@@ -641,6 +641,8 @@ static int inet_poll(struct file *f, int events)
     struct isock *s = isk(f);
     int r;
     uint64_t fl = irq_save();
+    poll_wait(s);
+    if (s->type == SOCK_STREAM && s->tcb) poll_wait(s->tcb);    /* tcp.c wakes the connection */
     if (s->type == SOCK_STREAM) r = tcp_poll(s);
     else {
         r = POLLOUT | POLLWRNORM;

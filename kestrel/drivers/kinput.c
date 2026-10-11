@@ -135,6 +135,7 @@ static ssize_t kinput_fread(struct file *f, void *buf, size_t len)
 static int kinput_poll(struct file *f, int events)
 {
     (void)f;
+    poll_wait(&q);
     return (q_head != q_tail) ? (events & POLLIN) : 0;
 }
 

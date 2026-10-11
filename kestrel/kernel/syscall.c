@@ -1503,9 +1503,11 @@ static int64_t do_poll(uint64_t ufds, uint64_t nfds, int64_t tmo)
     if (copy_from_user(p, (const void *)ufds, nfds * sizeof *p)) { kfree(p); return -EFAULT; }
     uint64_t deadline = tmo > 0 ? time_ms() + (uint64_t)tmo : 0;
     int64_t ready;
+    struct poll_table pt;
     for (;;) {
         uint64_t seq = poll_seq_read(), wake = deadline;
         ready = 0;
+        poll_begin(&pt);
         for (uint64_t i = 0; i < nfds; i++) {
             p[i].revents = 0;
             if (p[i].fd < 0) continue;
@@ -1523,9 +1525,10 @@ static int64_t do_poll(uint64_t ufds, uint64_t nfds, int64_t tmo)
             }
             if (p[i].revents) ready++;
         }
+        poll_end();
         if (ready || tmo == 0 || (tmo > 0 && time_ms() >= deadline)) break;
         if (signal_pending()) { ready = -ERESTARTNOHAND; break; }
-        poll_sleep(seq, wake);                          /* until something changes */
+        poll_sleep(seq, wake, &pt);                     /* until one of them changes */
     }
     if (ready >= 0 && copy_to_user((void *)ufds, p, nfds * sizeof *p)) ready = -EFAULT;
     kfree(p);
@@ -1570,16 +1573,18 @@ static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int6
     uint64_t lim = n < MAX_FDS ? n : MAX_FDS;
     static const int want[3] = { POLLIN | POLLHUP | POLLERR, POLLOUT | POLLERR, POLLPRI };
     uint64_t deadline = tmo_ms > 0 ? time_ms() + (uint64_t)tmo_ms : 0;
+    struct poll_table pt;
     for (;;) {
         uint64_t seq = poll_seq_read(), wake = deadline;
         int ready = 0;
         uint8_t out[3][128];
         memset(out, 0, sizeof out);
+        poll_begin(&pt);
         for (uint64_t fd = 0; fd < lim; fd++) {
             for (int k = 0; k < 3; k++) {
                 if (!usets[k] || !(in[k][fd / 8] & (1u << (fd % 8)))) continue;
                 struct file *f = fget((int)fd);
-                if (!f) return -EBADF;
+                if (!f) { poll_end(); return -EBADF; }
                 int ev = vfs_poll(f, want[k]);
                 uint64_t d = vfs_poll_deadline(f);
                 if (d && (!wake || d < wake)) wake = d;
@@ -1590,13 +1595,14 @@ static int64_t do_select(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, int6
                 }
             }
         }
+        poll_end();
         if (ready || tmo_ms == 0 || (tmo_ms > 0 && time_ms() >= deadline)) {
             for (int k = 0; k < 3; k++)
                 if (usets[k] && bytes && copy_to_user((void *)usets[k], out[k], bytes)) return -EFAULT;
             return ready;
         }
         if (signal_pending()) return -ERESTARTNOHAND;
-        poll_sleep(seq, wake);
+        poll_sleep(seq, wake, &pt);
     }
 }
 

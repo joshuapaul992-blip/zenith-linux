@@ -534,6 +534,8 @@ static int sock_poll(struct file *f, int events)
 {
     struct usock *s = us(f);
     int r = 0;
+    poll_wait(s);                               /* data, accepts, the peer leaving */
+    if (s->peer) poll_wait(s->peer);            /* room to write: the peer reads */
     if (s->state == US_LISTEN) {
         if (s->qlen) r |= POLLIN;
     } else if (s->state == US_CONNECTED || s->peer_gone) {

@@ -98,6 +98,7 @@ static int efd_poll(struct file *f, int events)
 {
     struct eventfd *e = f->vn->data;
     int r = 0;
+    poll_wait(e);
     if (e->count) r |= POLLIN;
     if (e->count < EFD_MAX) r |= POLLOUT;
     return r & events;
@@ -168,6 +169,7 @@ static ssize_t tfd_read(struct file *f, void *buf, size_t len)
 static int tfd_poll(struct file *f, int events)
 {
     struct timerfd *t = f->vn->data;
+    poll_wait(t);                                       /* settime; expiry: the poll deadline */
     uint64_t fl = irq_save();
     tfd_update(t);
     int r = t->expired ? POLLIN : 0;
@@ -305,6 +307,7 @@ static ssize_t sfd_read(struct file *f, void *buf, size_t len)
 static int sfd_poll(struct file *f, int events)
 {
     struct sigfd *s = f->vn->data;
+    poll_wait(&signal_wait_chan);
     return (signal_pending_mask() & s->mask) ? (POLLIN & events) : 0;
 }
 

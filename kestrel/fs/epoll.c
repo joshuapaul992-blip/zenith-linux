@@ -8,7 +8,7 @@
  *
  * epoll_wait() asks each watched file for its readiness (vfs_poll) and
  * sleeps on the poller sequence (task.h: poll_sleep) when nothing is ready,
- * so any state change anywhere wakes it to look again, and a file whose
+ * so a state change of a watched file wakes it to look again, and a file whose
  * readiness changes on its own (timerfd) bounds the sleep. Level-triggered
  * watches report while the condition holds. Edge-triggered ones (EPOLLET)
  * report readiness that is new since the last report; any I/O on the file
@@ -256,17 +256,20 @@ int epoll_wait_file(struct file *epf, void *kevents, int maxevents, int64_t time
     if (!epoll_is(epf)) return -EINVAL;
     struct eventpoll *ep = ep_of(epf);
     uint64_t deadline = timeout_ms > 0 ? time_ms() + (uint64_t)timeout_ms : 0;
+    struct poll_table pt;
     for (;;) {
         uint64_t seq = poll_seq_read(), tdl = 0;
         uint64_t fl = irq_save();
+        poll_begin(&pt);                                /* the watched files name their channels */
         int n = scan(ep, kevents, maxevents, false, &tdl, 0);
+        poll_end();
         irq_restore(fl);
         if (n || timeout_ms == 0) return n;
         if (signal_pending()) return -EINTR;
         if (timeout_ms > 0 && time_ms() >= deadline) return 0;
         uint64_t d = timeout_ms > 0 ? deadline : 0;
         if (tdl && (!d || tdl < d)) d = tdl;
-        poll_sleep(seq, d);
+        poll_sleep(seq, d, &pt);
     }
 }
 

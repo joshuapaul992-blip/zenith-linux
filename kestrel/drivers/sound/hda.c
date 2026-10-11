@@ -819,6 +819,7 @@ static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
 static int dsp_poll(struct file *f, int events)
 {
     (void)f;
+    poll_wait(&hda);                                    /* and the 4 ms poll deadline */
     uint64_t fl = irq_save();
     update();
     int r = (hda.ready && space() >= FRAG_BYTES) ? (events & (POLLOUT | POLLWRNORM)) : 0;

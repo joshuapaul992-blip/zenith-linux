@@ -476,15 +476,23 @@ bool kmutex_held(const struct kmutex *m) { return m->owner == cur; }
 static uint64_t poll_seq;                       /* advanced by every wakeup() */
 static int      pollers;                        /* tasks in poll_sleep        */
 
+/* A sleeping poller cares about chan (task.h: struct poll_table). */
+static bool polls_for(const struct tcb *t, void *chan)
+{
+    const struct poll_table *pt = t->poll_tab;
+    if (!pt || pt->all) return true;
+    for (int i = 0; i < pt->n; i++) if (pt->chan[i] == chan) return true;
+    return false;
+}
+
 void wakeup(void *chan)
 {
     __atomic_add_fetch(&poll_seq, 1, __ATOMIC_SEQ_CST);
     bool polls = __atomic_load_n(&pollers, __ATOMIC_RELAXED) > 0;
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = &tasks[i];
-        if (((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && t->wait_chan == chan) ||
-            (polls && t->wait_chan == &poll_seq && (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING)))
-            make_ready(t);
+        if (t->state != TASK_BLOCKED && t->state != TASK_SLEEPING) continue;
+        if (t->wait_chan == chan || (polls && t->wait_chan == &poll_seq && polls_for(t, chan))) make_ready(t);
     }
 }
 
@@ -510,17 +518,41 @@ void io_wake(void *chan) { wakeup_waiters(chan); }
 
 uint64_t poll_seq_read(void) { return __atomic_load_n(&poll_seq, __ATOMIC_SEQ_CST); }
 
-void poll_sleep(uint64_t seq, uint64_t deadline_ms)
+void poll_begin(struct poll_table *pt)
+{
+    pt->all = false;
+    pt->n = 0;
+    pt->calls = 0;
+    cur->poll_tab = pt;
+}
+
+void poll_wait(void *chan)
+{
+    struct poll_table *pt = cur->poll_tab;
+    if (!pt) return;                            /* a poll op called outside a scan */
+    pt->calls++;
+    if (pt->all) return;
+    for (int i = 0; i < pt->n; i++) if (pt->chan[i] == chan) return;
+    if (pt->n == POLL_CHANS) { pt->all = true; return; }
+    pt->chan[pt->n++] = chan;
+}
+
+void poll_end(void) { cur->poll_tab = NULL; }
+
+void poll_sleep(uint64_t seq, uint64_t deadline_ms, struct poll_table *pt)
 {
     uint64_t f = irq_save();
     if (__atomic_load_n(&poll_seq, __ATOMIC_SEQ_CST) == seq && !signal_pending()) {
         /* Objects that change state without a wakeup() (a device polled by
-         * a driver) are still seen within 100 ms. */
-        uint64_t cap = time_ms() + 100;
+         * a driver) are still seen within 100 ms; with every object's
+         * channels known, a second is plenty. */
+        uint64_t cap = time_ms() + (pt && !pt->all ? 1000 : 100);
         __atomic_add_fetch(&pollers, 1, __ATOMIC_SEQ_CST);
+        cur->poll_tab = pt;
         task_block_self(&poll_seq, deadline_ms && deadline_ms < cap ? deadline_ms : cap);
         schedule();
         cur->wait_chan = NULL;
+        cur->poll_tab = NULL;
         __atomic_sub_fetch(&pollers, 1, __ATOMIC_SEQ_CST);
     }
     irq_restore(f);
