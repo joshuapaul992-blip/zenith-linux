@@ -7,7 +7,9 @@
 # `apt-get source --download-only xorgproto xtrans libxau libxdmcp xcb-proto
 # libxcb libx11 libxkbfile libfontenc libxfont pixman zlib libxext libxrender
 # libxfixes libxdamage libxcomposite libxpm libpng1.6 libice libsm libxt
-# libxmu libxaw ncurses`).
+# libxmu libxaw ncurses`). The current XLibre server needs xorgproto 2024.1
+# or newer (presentproto 1.4); Ubuntu 24.04 has 2023.2, so take
+# xorgproto_2024.1.orig.tar.gz from a later release's pool.
 set -eu
 SRC=$(cd "$1" && pwd)
 SYSROOT=$(mkdir -p "$2" && cd "$2" && pwd)

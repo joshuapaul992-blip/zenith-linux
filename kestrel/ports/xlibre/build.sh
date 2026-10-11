@@ -15,7 +15,8 @@
 # BUILD       Kestrel's build directory (sysroot goes to BUILD/xsysroot,
 #             the server's meson tree to BUILD/xserver)
 #
-# Host needs: musl-gcc, meson, ninja, pkg-config, python3, xkbcomp, xkb-data.
+# Host needs: musl-gcc, meson, ninja, pkg-config, python3, xkbcomp, xkb-data,
+# and gettext (xgettext, for libXpm's message catalogue).
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$1" && pwd)
