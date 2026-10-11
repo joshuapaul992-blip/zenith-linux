@@ -12,6 +12,7 @@
 #include <kernel/arch.h>
 #include <kernel/time.h>
 #include <kernel/bootinfo.h>
+#include <kernel/process.h>
 
 static struct vnode *root;
 static struct mount *mounts;
@@ -746,10 +747,60 @@ struct file *vfs_file_get(struct file *f)
     return f;
 }
 
+/* ---- flock(2): advisory whole-file locks --------------------------------
+ * A lock belongs to an open file description, as on Linux: dup'd and
+ * inherited descriptors share it, and it goes away with the description's
+ * last close. Shared locks coexist; an exclusive one excludes all others. */
+#define MAX_FLOCKS 256
+static struct flock_ent { struct vnode *vn; struct file *owner; bool excl; } flocks[MAX_FLOCKS];
+static int flock_chan;
+
+static void flock_drop(struct file *f)
+{
+    bool any = false;
+    for (int i = 0; i < MAX_FLOCKS; i++)
+        if (flocks[i].owner == f) { flocks[i].owner = NULL; flocks[i].vn = NULL; any = true; }
+    if (any) wakeup(&flock_chan);
+}
+
+int vfs_flock(struct file *f, int op)
+{
+    enum { LOCK_SH = 1, LOCK_EX = 2, LOCK_NB = 4, LOCK_UN = 8 };
+    int kind = op & ~LOCK_NB;
+    if (kind != LOCK_SH && kind != LOCK_EX && kind != LOCK_UN) return -EINVAL;
+    uint64_t fl = irq_save();
+    if (kind == LOCK_UN) { flock_drop(f); irq_restore(fl); return 0; }
+    for (;;) {
+        bool blocked = false;
+        int mine = -1, slot = -1;
+        for (int i = 0; i < MAX_FLOCKS; i++) {
+            if (!flocks[i].owner) { if (slot < 0) slot = i; continue; }
+            if (flocks[i].vn != f->vn) continue;
+            if (flocks[i].owner == f) { mine = i; continue; }
+            if (kind == LOCK_EX || flocks[i].excl) blocked = true;
+        }
+        if (!blocked) {
+            if (mine >= 0) flocks[mine].excl = kind == LOCK_EX;     /* conversion */
+            else if (slot < 0) { irq_restore(fl); return -ENOLCK; }
+            else flocks[slot] = (struct flock_ent){ f->vn, f, kind == LOCK_EX };
+            if (mine >= 0 && kind == LOCK_SH) wakeup(&flock_chan);
+            irq_restore(fl);
+            return 0;
+        }
+        /* Linux drops a held lock before waiting to convert it, so two
+         * holders upgrading at once cannot deadlock. */
+        if (mine >= 0) { flocks[mine].owner = NULL; flocks[mine].vn = NULL; wakeup(&flock_chan); }
+        if (op & LOCK_NB) { irq_restore(fl); return -EAGAIN; }
+        if (signal_pending()) { irq_restore(fl); return -EINTR; }
+        sleep_on(&flock_chan);
+    }
+}
+
 void vfs_close(struct file *f)
 {
     if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (f->ep_links) epoll_file_closing(f);            /* leaves every epoll set */
+    flock_drop(f);
     struct vnode *vn = f->vn;
     bool last = vn && __atomic_sub_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL) == 0 && vn->unlinked;
     if (vn && vn->ops && vn->ops->release) vn->ops->release(f);    /* may free a socket's vnode */

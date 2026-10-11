@@ -22,6 +22,9 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/file.h>
+#include <sys/wait.h>
+#include <sys/xattr.h>
 #include <sys/reboot.h>
 
 static int failures;
@@ -248,6 +251,28 @@ static void checks(const char *dir)
     CHECK(chown(a, 1000, 1000) == 0 && stat(a, &st) == 0 && st.st_uid == 1000 && st.st_gid == 1000, "chown");
     CHECK(open(in(dir, "nope/x"), O_RDONLY) < 0 && errno == ENOENT, "ENOENT");
     CHECK(mkdir(in(dir, "victim"), 0755) < 0 && errno == EEXIST, "EEXIST");
+
+    printf("locks and extended attributes:\n");
+    int l1 = open(a, O_RDWR), l2 = open(a, O_RDONLY);
+    CHECK(flock(l1, LOCK_EX | LOCK_NB) == 0, "flock: exclusive lock");
+    CHECK(flock(l2, LOCK_SH | LOCK_NB) < 0 && errno == EWOULDBLOCK, "flock: a second open file description is refused");
+    int l3 = dup(l1);
+    CHECK(flock(l3, LOCK_EX | LOCK_NB) == 0, "flock: a dup'd descriptor shares the lock");
+    pid_t kid = fork();
+    if (kid == 0) {                                     /* the child blocks until the parent's last close */
+        close(l1); close(l3);                           /* its copies would keep the lock alive */
+        _exit(flock(l2, LOCK_EX) == 0 ? 0 : 1);
+    }
+    usleep(100000);
+    close(l1); close(l3);
+    int ws = -1;
+    CHECK(waitpid(kid, &ws, 0) == kid && WIFEXITED(ws) && WEXITSTATUS(ws) == 0, "flock: a waiter gets the lock when the holder closes");
+    CHECK(flock(l2, LOCK_UN) == 0 && flock(l2, LOCK_SH | LOCK_NB) == 0, "flock: unlock, then a shared lock");
+    close(l2);
+    char xb[64];
+    CHECK(listxattr(a, xb, sizeof xb) == 0, "listxattr: an empty list");
+    CHECK(getxattr(a, "user.x", xb, sizeof xb) < 0 && errno == ENODATA, "getxattr: ENODATA");
+    CHECK(setxattr(a, "user.x", "1", 1, 0) < 0 && errno == ENOTSUP, "setxattr: ENOTSUP");
 
     printf("space accounting:\n");
     rm_rf(dir);

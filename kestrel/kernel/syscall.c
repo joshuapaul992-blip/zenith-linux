@@ -957,6 +957,51 @@ static int64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uin
     return r;
 }
 
+/* flock(fd, op): advisory whole-file locks (fs/vfs.c). apk locks its
+ * database with it. */
+static int64_t sys_flock(uint64_t fd, uint64_t op, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int r = vfs_flock(f, (int)op);
+    fput(f);
+    return r;
+}
+
+/* Extended attributes: no file system here stores them. Every file has an
+ * empty list, reads find nothing (ENODATA), and setting one is refused
+ * (ENOTSUP), as on a Linux file system mounted without xattr support. */
+static int xattr_target(uint64_t path, bool follow)
+{
+    AT_PATH((uint64_t)(int64_t)AT_FDCWD, path);
+    struct vnode *vn;
+    int r = vfs_lookup_at(base, p, follow, &vn);
+    fput(hold);
+    return r;
+}
+
+static int64_t xattr_result(int nr)
+{
+    switch (nr) {
+    case 188: case 189: case 190: return -ENOTSUP;     /* setxattr lsetxattr fsetxattr */
+    case 194: case 195: case 196: return 0;            /* listxattr llistxattr flistxattr: empty */
+    default:                      return -ENODATA;     /* get and remove */
+    }
+}
+
+#define XATTR_PATH(name, nr, follow)                                                                \
+    static int64_t name(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) \
+    { UNUSED6(a2, a3, a4, a5, a6, a6); int r = xattr_target(path, follow); return r ? r : xattr_result(nr); }
+#define XATTR_FD(name, nr)                                                                          \
+    static int64_t name(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)   \
+    { UNUSED6(a2, a3, a4, a5, a6, a6); struct file *f = fget((int)fd); if (!f) return -EBADF;      \
+      fput(f); return xattr_result(nr); }
+XATTR_PATH(sys_setxattr, 188, true)     XATTR_PATH(sys_lsetxattr, 189, false)    XATTR_FD(sys_fsetxattr, 190)
+XATTR_PATH(sys_getxattr, 191, true)     XATTR_PATH(sys_lgetxattr, 192, false)    XATTR_FD(sys_fgetxattr, 193)
+XATTR_PATH(sys_listxattr, 194, true)    XATTR_PATH(sys_llistxattr, 195, false)   XATTR_FD(sys_flistxattr, 196)
+XATTR_PATH(sys_removexattr, 197, true)  XATTR_PATH(sys_lremovexattr, 198, false) XATTR_FD(sys_fremovexattr, 199)
+
 /* memfd_create(name, flags): an anonymous ramfs file (page-backed, so it can
  * be shared with MAP_SHARED and passed to other processes). */
 #define MFD_CLOEXEC       1
@@ -2466,6 +2511,12 @@ void syscall_init(void)
     REG(SYS_mremap, sys_mremap);       REG(SYS_msync, sys_msync);
     REG(SYS_mincore, sys_mincore);     REG(SYS_ftruncate, sys_ftruncate);
     REG(SYS_truncate, sys_truncate);   REG(SYS_fsync, sys_fsync);
+    REG(SYS_flock, sys_flock);
+    REG(SYS_setxattr, sys_setxattr);   REG(SYS_lsetxattr, sys_lsetxattr);   REG(SYS_fsetxattr, sys_fsetxattr);
+    REG(SYS_getxattr, sys_getxattr);   REG(SYS_lgetxattr, sys_lgetxattr);   REG(SYS_fgetxattr, sys_fgetxattr);
+    REG(SYS_listxattr, sys_listxattr); REG(SYS_llistxattr, sys_llistxattr); REG(SYS_flistxattr, sys_flistxattr);
+    REG(SYS_removexattr, sys_removexattr); REG(SYS_lremovexattr, sys_lremovexattr);
+    REG(SYS_fremovexattr, sys_fremovexattr);
     REG(SYS_fdatasync, sys_fsync);     REG(SYS_memfd_create, sys_memfd_create);
 
     syscall_cpu_init();

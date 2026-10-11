@@ -621,7 +621,7 @@ Calls can enter through two paths:
 Every pointer a call receives is checked to lie in the user half and copied through `copy_from_user`/`copy_to_user` (`kernel/uaccess.c`): a bad or unmapped pointer gives `-EFAULT`, never a kernel fault. Structures with pointers inside (`msghdr`, iovecs, `epoll_event`, control messages) are copied into the kernel once and only that copy is used, so another thread cannot change them between the check and the use.
 
 **Implemented** (by area):
-- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, close, lseek, stat, lstat (as stat: no symbolic links), fstat, newfstatat, access, faccessat, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`), dup, dup2, dup3, ftruncate, truncate, fsync, fdatasync, sendfile, readlink/readlinkat (`/proc/self/exe`, `/proc/self/fd/N`), mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), chown, utimensat, chdir, getcwd, umask.
+- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, close, lseek, stat, lstat (as stat: no symbolic links), fstat, newfstatat, access, faccessat, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`), dup, dup2, dup3, ftruncate, truncate, fsync, fdatasync, flock (advisory, per open file description), the twelve `*xattr` calls (no file system stores extended attributes: lists are empty, reads give `ENODATA`, writes `ENOTSUP`), sendfile, readlink/readlinkat (`/proc/self/exe`, `/proc/self/fd/N`), mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), chown, utimensat, chdir, getcwd, umask.
 - **Waiting for events:** poll, ppoll, select, pselect6 (with signal masks), epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait, eventfd, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd, signalfd4, pipe, pipe2.
 - **Sockets (`AF_UNIX`):** socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg and recvmsg (with `SCM_RIGHTS`), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes).
 - **Sockets (`AF_INET`):** the same calls for TCP, UDP, raw ICMP and ping sockets, with `MSG_PEEK`/`MSG_DONTWAIT`/`MSG_TRUNC`/`MSG_NOSIGNAL`, and the `SOL_SOCKET`, `IPPROTO_IP` and `IPPROTO_TCP` options programs use (see Networking). `ioctl` handles `FIONREAD` and the `SIOCGIF*`/`SIOCSIF*`/`SIOCADDRT`/`SIOCDELRT` interface calls.
@@ -892,14 +892,21 @@ How it works:
 - **Directory offsets:** `getdents` offsets are stable per entry, so a program that deletes entries while reading a directory (`rm -r`) sees each of them once.
 
 **Tests:**
-- `fstest` (in `/bin` on the root volume) runs 45 checks:
+- `fstest` (in `/bin` on the root volume) runs 53 checks:
   - files in every block-map class, sparse files, truncation, `O_APPEND`;
   - fast and slow symbolic links, link loops, `O_NOFOLLOW`;
   - hard links, renames of files and directories (and `..`), 400-entry directories;
-  - unlinked open files, `chmod`/`chown`;
+  - unlinked open files, `chmod`/`chown`, `flock` and the extended-attribute calls;
   - free space returning exactly to where it started.
 - `fstest -r` writes files, restarts the machine, and checks them after the reboot.
 - After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
+
+**Alpine Linux as the root.** Alpine's own minirootfs (3.24.2, from the official `alpinelinux/docker-alpine` repository) runs unmodified on Kestrel. Put it on an ext2 partition, label it, and boot with `kestrel.rootfs=LABEL=<label>`:
+- Alpine's `/bin/sh`, BusyBox and musl dynamic loader start, and its tools (`ps`, `df`, `free`, `ping`, `wget`, `sha256sum`, ...) work.
+- `apk` 3.0.8 works on the installed system: `info`, `list`, `policy`, `stats`, `audit`, and `del`, which locks the database with `flock`, rewrites it and removes files; `e2fsck -fn` finds the volume clean afterwards.
+- `apk add` and `apk update` need Alpine's package servers, which the test environment cannot reach, so installing packages from the network has not been tried.
+- Programs start with `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, as on a Linux distribution.
+- A whole disk without a partition table is mounted read-only; a partition is mounted read-write.
 
 **Not yet:**
 - Shared writable `mmap` of disk files (read-only shared mappings work).

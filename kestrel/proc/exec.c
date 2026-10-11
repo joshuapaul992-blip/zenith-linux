@@ -400,8 +400,11 @@ static int process_main(void *arg)
     cpu_load_cr3(mm->pml4);
     irq_restore(f);
 
-    static char *const envp[] = { "PATH=/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0", "SHELL=/bin/sh" };
-    static char *const console_envp[] = { "PATH=/bin", "HOME=/root", "TERM=linux", "SHELL=/bin/sh", "USER=root",
+    /* PATH as a Linux distribution sets it (Alpine keeps apk in /sbin and
+     * most tools in /usr/bin); directories Kestrel lacks are skipped. */
+#define KPATH "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    static char *const envp[] = { KPATH, "HOME=/", "TERM=kestrel", "DISPLAY=:0", "SHELL=/bin/sh" };
+    static char *const console_envp[] = { KPATH, "HOME=/root", "TERM=linux", "SHELL=/bin/sh", "USER=root",
                                            "LOGNAME=root" };
     struct exec_args ea = { a->argc, (int)(sizeof envp / sizeof *envp), a->argv, (char **)envp };
     if (a->ctty) { ea.envc = (int)(sizeof console_envp / sizeof *console_envp); ea.envp = (char **)console_envp; }

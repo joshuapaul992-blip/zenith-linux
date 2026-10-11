@@ -211,6 +211,7 @@ uint64_t vfs_poll_deadline(struct file *f);     /* see vnode_ops.poll_deadline *
 struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
 void    vfs_close(struct file *f);                  /* drops one reference */
+int     vfs_flock(struct file *f, int op);          /* flock(2) LOCK_SH/EX/UN, LOCK_NB */
 struct file *vfs_file_get(struct file *f);         /* takes one (atomic), returns f */
 int     vfs_truncate(struct vnode *vn, uint64_t size);
 struct vm_object *vfs_vmobject(struct vnode *vn);  /* see vnode_ops.vmobject */
