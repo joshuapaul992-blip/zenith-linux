@@ -189,6 +189,13 @@ enum { PT_IDLE, PT_DEBOUNCE, PT_DONE, PT_FAILED };
 static void delay_us(uint32_t us) { X.plat.delay_us(us); X.fake_ms += us / 1000; }
 static void delay_ms(uint32_t ms) { while (ms--) { X.plat.delay_us(1000); X.fake_ms++; } }
 static uint64_t now_ms(void) { return X.plat.now_ms ? X.plat.now_ms() : X.fake_ms; }
+/* Wait for something xhci_poll() completes (it calls wake(chan)). */
+static void pause_us(const volatile void *chan, uint32_t us)    /* chan: an address, only compared */
+{
+    if (X.plat.pause) { X.plat.pause((void *)(uintptr_t)chan, us); X.fake_ms += us / 1000; }
+    else delay_us(us);
+}
+static void wake(const volatile void *chan) { if (X.plat.wake) X.plat.wake((void *)(uintptr_t)chan); }
 
 /* Serialise command/transfer users (single CPU: a flag set with IRQs off).
  * Waiting threads poll with short delays; on a preemptive kernel the holder
@@ -206,11 +213,11 @@ static bool acquire(uint32_t timeout_ms)
     uint64_t end = now_ms() + timeout_ms;
     while (!try_acquire()) {
         if (now_ms() >= end) return false;
-        delay_us(200);
+        pause_us(&X.busy, 200);
     }
     return true;
 }
-static void release(void) { X.busy = false; }
+static void release(void) { X.busy = false; wake(&X.busy); }
 
 static void *dma(size_t size, size_t align, uint64_t *phys)
 {
@@ -374,6 +381,7 @@ static void handle_transfer_event(const struct xhci_trb *ev)
         if (ev->param == d->xfer_wait_trb || (cc != CC_SUCCESS && cc != CC_SHORT_PACKET)) {
             d->xfer_code = cc;
             d->xfer_done = true;
+            wake(&d->xfer_done);
         }
         return;
     }
@@ -384,6 +392,7 @@ static void handle_transfer_event(const struct xhci_trb *ev)
             d->msc.code = cc;
             d->msc.residual = TRB_GET_LEN(ev->status);
             d->msc.done = true;
+            wake(&d->msc.done);
         }
         return;
     }
@@ -414,6 +423,7 @@ static void handle_event(const struct xhci_trb *ev)
             X.cmd_code = (uint8_t)TRB_GET_CODE(ev->status);
             X.cmd_slot = (uint8_t)TRB_GET_SLOT(ev->control);
             X.cmd_done = true;
+            wake(&X.cmd_done);
         }
         break;
     case TRB_EV_TRANSFER:
@@ -433,6 +443,15 @@ static void handle_event(const struct xhci_trb *ev)
 }
 
 static void key_repeat(void);
+
+void xhci_enable_interrupts(uint16_t moderation_250ns)
+{
+    if (!X.up) return;
+    struct xhci_intr_regs *ir = &X.rt->ir[0];
+    REG(ir->imod) = moderation_250ns;
+    REG(ir->iman) = XHCI_IMAN_IP | XHCI_IMAN_IE;
+    REG(X.op->usbcmd) = REG(X.op->usbcmd) | XHCI_CMD_INTE;
+}
 
 void xhci_poll(void)
 {
@@ -463,9 +482,9 @@ static int command(uint32_t control, uint64_t param, uint8_t *slot_out)
     X.cmd_wait_trb = trb;
     ring_doorbell(0, 0);                        /* doorbell 0 target 0: command ring */
 
-    for (uint32_t t = 0; t < 20000 && !X.cmd_done; t++) {   /* 2 s */
+    for (uint64_t end = now_ms() + 2000; !X.cmd_done && now_ms() < end; ) {
         xhci_poll();
-        if (!X.cmd_done) delay_us(100);
+        if (!X.cmd_done) pause_us(&X.cmd_done, 100);
     }
     if (!X.cmd_done) {
         X.last_cmd_type = (uint8_t)TRB_GET_TYPE(control);
@@ -517,9 +536,9 @@ static int control(struct usb_dev *d, uint8_t reqtype, uint8_t request, uint16_t
     d->xfer_wait_trb = xhci_ring_enqueue(&d->ep0, 0, 0, TRB_TYPE(TRB_STATUS) | sdir | TRB_IOC);
     ring_doorbell(d->slot, 1);
 
-    for (uint32_t t = 0; t < 10000 && !d->xfer_done; t++) {   /* 1 s */
+    for (uint64_t end = now_ms() + 1000; !d->xfer_done && now_ms() < end; ) {
         xhci_poll();
-        if (!d->xfer_done) delay_us(100);
+        if (!d->xfer_done) pause_us(&d->xfer_done, 100);
     }
     if (!d->xfer_done) {
         X.timeouts++;
@@ -1264,7 +1283,7 @@ int xhci_bulk_transfer(uint8_t slot, bool in, void *buf, uint32_t len, uint32_t 
         xhci_poll();
         if (m->done) break;
         if (now_ms() >= end) break;
-        if (spin > 200) delay_us(50);
+        if (spin > 20) pause_us(&m->done, 50);         /* sleep until the completion event */
     }
     int rc = XHCI_OK;
     if (!m->done) {

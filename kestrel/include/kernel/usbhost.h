@@ -6,6 +6,7 @@
 
 void   usb_init(void);              /* after pci_init() + video, before sti     */
 void   usb_start_thread(void);      /* after the scheduler: hot-plug thread     */
+void   usb_enable_irqs(void);       /* after apic_init(): MSI instead of polling alone */
 void   usb_redraw_pointer(void);    /* after a full-screen redraw               */
 size_t usb_summary(char *buf, size_t cap);
 size_t usb_proc(char *buf, size_t cap);   /* /proc/usb contents */

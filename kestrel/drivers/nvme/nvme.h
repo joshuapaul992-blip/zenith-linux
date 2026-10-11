@@ -319,6 +319,15 @@ struct nvme_platform {
     void     (*yield)(void);
     /* Debug output, one character at a time. NULL: polled COM1 (0x3F8). */
     void     (*log_putc)(char c);
+    /* Optional: wait for a completion or the controller lock without
+     * spinning, once nvme_enable_interrupts() has run. pause(chan, us)
+     * returns after wake(chan) (called from nvme_irq() and on unlock) or
+     * whenever the platform likes; NULL or interrupts off: delay_us/yield.
+     * now_us: a microsecond clock for timeouts while pausing; NULL: the
+     * delays are counted instead. */
+    void     (*pause)(void *chan, uint32_t us);
+    void     (*wake)(void *chan);
+    uint64_t (*now_us)(void);
 };
 
 struct nvme_namespace {
@@ -356,6 +365,17 @@ int nvme_flush(struct nvme_namespace *ns);
 /* Normal shutdown (CC.SHN = 01b) of every controller, for power-off and
  * reboot: the controller flushes its caches and records a clean shutdown. */
 void nvme_shutdown_all(void);
+
+/* Interrupts: the I/O completion queue always raises interrupt vector 0.
+ * Once the platform routes it (MSI-X entry 0 or the MSI message) to a
+ * handler that calls nvme_irq(ctrl), nvme_enable_interrupts() lets command
+ * waits sleep. `msix`: MSI-X is in use (INTMS/INTMC must not be touched);
+ * otherwise vector 0 is unmasked through INTMC. Controllers are numbered
+ * in nvme_init() order; nvme_ctrl_count() counts every one that took a
+ * slot, failed or not. */
+int  nvme_ctrl_count(void);
+void nvme_enable_interrupts(int ctrl, bool msix);
+void nvme_irq(int ctrl);
 
 const char *nvme_strerror(int err);
 

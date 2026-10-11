@@ -6,6 +6,7 @@
 
 void   storage_init(void);              /* after pci_init() and the heap  */
 void   storage_register_devices(void);  /* after vfs_init(): /dev/sdX, block devices */
+void   storage_enable_irqs(void);       /* after apic_init(): MSI wakes waiting requests */
 size_t storage_summary(char *buf, size_t cap);
 void   storage_shutdown(void);          /* before reboot/power-off: NVMe normal shutdown */
 

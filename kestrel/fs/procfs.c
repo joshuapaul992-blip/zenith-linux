@@ -8,6 +8,7 @@
 #include <kernel/cpu.h>
 #include <kernel/mm.h>
 #include <kernel/pagecache.h>
+#include <kernel/msi.h>
 #include <kernel/arch.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
@@ -118,6 +119,7 @@ static size_t gen_interrupts(char *buf, size_t cap, void *ctx)
                                      "rtc", "", "", "", "mouse", "fpu", "ata0", "ata1" };
     for (int i = 0; i < 16; i++)
         if (irq_count(i)) P("%3d: %10lu  XT-PIC  %s\n", i, irq_count(i), names[i]);
+    n += msi_proc(buf + n, cap - n);
     P("context switches: %lu\n", sched_context_switches());
     return n;
 }

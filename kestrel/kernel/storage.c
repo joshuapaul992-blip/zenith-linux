@@ -32,6 +32,7 @@
 #include <kernel/time.h>
 #include <kernel/task.h>
 #include <kernel/crc32.h>
+#include <kernel/msi.h>
 #include "pci.h"
 #include "ahci.h"
 #include "nvme.h"
@@ -58,7 +59,11 @@ static const struct ahci_platform kestrel_platform = {
     .dma_alloc = dma_alloc,
     .map_mmio  = map_mmio,
     .log_putc  = klog_putc,
-    /* virt_to_phys: identity (default); delay_us: port 0x80 (default) */
+    .delay_us  = udelay,
+    .pause     = io_pause,          /* sleeps once storage_enable_irqs() ran */
+    .wake      = io_wake,
+    .now_us    = time_us,
+    /* virt_to_phys: identity (default) */
 };
 
 /* Waiting for an NVMe controller that another namespace's request holds:
@@ -74,8 +79,14 @@ static const struct nvme_platform kestrel_nvme = {
     .delay_us  = udelay,
     .yield     = nvme_yield,
     .log_putc  = klog_putc,
+    .pause     = io_pause,
+    .wake      = io_wake,
+    .now_us    = time_us,
     /* virt_to_phys: identity (default) */
 };
+
+/* The PCI function behind each HBA and controller, for storage_enable_irqs(). */
+static struct pci_device *ahci_pci[AHCI_MAX_HBAS], *nvme_pci[NVME_MAX_CTRLS];
 
 /* ---- command line helpers ---------------------------------------------- */
 static const char *cmdline_value(const char *key)
@@ -105,11 +116,13 @@ static void ahci_bringup(void)
                 dev->vendor_id, dev->device_id, dev->bus, dev->device, dev->function,
                 abar->base, abar->size >> 10);
         /* MMIO decoding for the registers, bus mastering for the DMA engine;
-         * legacy INTx off since the driver polls. */
+         * legacy INTx off: the driver polls until MSI is set up. */
         pci_enable(dev, false, true, true);
         pci_write32(dev->bus, dev->device, dev->function, PCI_REG_COMMAND,
                     pci_read16(dev->bus, dev->device, dev->function, PCI_REG_COMMAND) | PCI_CMD_INTX_DISABLE);
+        int hba = ahci_hba_count();
         ahci_init(abar->base, &kestrel_platform);
+        if (ahci_hba_count() > hba) ahci_pci[hba] = dev;
     }
 
     /* Debug verify loop: read the MBR of every attached disk. */
@@ -219,7 +232,9 @@ static void nvme_bringup(void)
         pci_enable(dev, false, true, true);
         pci_write32(dev->bus, dev->device, dev->function, PCI_REG_COMMAND,
                     pci_read16(dev->bus, dev->device, dev->function, PCI_REG_COMMAND) | PCI_CMD_INTX_DISABLE);
+        int ci = nvme_ctrl_count();
         int rc = nvme_init(bar->base, &kestrel_nvme);
+        if (nvme_ctrl_count() > ci) nvme_pci[ci] = dev;
         if (rc < 0) kprintf("storage: NVMe at %02x:%02x.%x: %s\n", dev->bus, dev->device, dev->function, nvme_strerror(rc));
     }
 
@@ -233,6 +248,23 @@ void storage_init(void)
 {
     ahci_bringup();
     nvme_bringup();
+}
+
+/* Message-signalled interrupts, once the local APIC is up: a finished
+ * command wakes its waiter, which sleeps (dropping the kernel lock)
+ * instead of spinning. Without MSI the drivers keep polling. */
+static void ahci_msi(void *arg) { ahci_irq((int)(uintptr_t)arg); }
+static void nvme_msi(void *arg) { nvme_irq((int)(uintptr_t)arg); }
+
+void storage_enable_irqs(void)
+{
+    for (int i = 0; i < AHCI_MAX_HBAS; i++)
+        if (ahci_pci[i] && msi_enable(ahci_pci[i], ahci_msi, (void *)(uintptr_t)i, "ahci") >= 0)
+            ahci_enable_interrupts(i);
+    for (int i = 0; i < NVME_MAX_CTRLS; i++) {
+        int v = nvme_pci[i] ? msi_enable(nvme_pci[i], nvme_msi, (void *)(uintptr_t)i, "nvme") : -1;
+        if (v >= 0) nvme_enable_interrupts(i, msi_is_msix(v));
+    }
 }
 
 void storage_shutdown(void)

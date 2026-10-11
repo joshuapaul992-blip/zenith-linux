@@ -336,6 +336,12 @@ struct xhci_platform {
     void     (*log_putc)(char c);
     void     (*on_key)(const struct usb_key_event *ev);
     void     (*on_mouse)(const struct usb_mouse_event *ev);
+    /* Optional: wait for a completion without spinning. pause(chan, us)
+     * returns after wake(chan), or whenever the platform likes (it must
+     * not wait long without one); NULL: delay_us(us). wake(chan) is called
+     * from xhci_poll() when a command or transfer completes. */
+    void     (*pause)(void *chan, uint32_t us);
+    void     (*wake)(void *chan);
 };
 
 enum usb_dev_kind { USB_KIND_OTHER = 0, USB_KIND_KEYBOARD, USB_KIND_MOUSE, USB_KIND_HUB, USB_KIND_STORAGE };
@@ -366,6 +372,10 @@ struct xhci_msc_info {
  * devices already connected. Returns the number of HID interfaces
  * configured, or a negative XHCI_ERR_*. One controller is supported. */
 int  xhci_init(uint64_t mmio, const struct xhci_platform *plat);
+
+/* The controller's interrupt is wired up (MSI/MSI-X): let it interrupt,
+ * with `moderation_250ns` between interrupts. Its handler calls xhci_poll(). */
+void xhci_enable_interrupts(uint16_t moderation_250ns);
 
 /* Drain the event ring: completes commands/transfers, dispatches HID
  * reports, re-arms report buffers, generates key repeat and records port

@@ -70,7 +70,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/sys
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
-           drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
+           drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/msi.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
            kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kestrel_font.c drivers/image.c drivers/halt_screen.c drivers/video/edid.c drivers/video/bochs_dispi.c \

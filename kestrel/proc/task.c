@@ -467,7 +467,7 @@ void kmutex_unlock(struct kmutex *m)
 {
     uint64_t f = irq_save();
     if (m->owner != cur) panic("kmutex_unlock: not the owner (pid %d)", cur->pid);
-    if (--m->depth == 0) { m->owner = NULL; wakeup(m); }
+    if (--m->depth == 0) { m->owner = NULL; wakeup_waiters(m); }   /* nobody polls a mutex */
     irq_restore(f);
 }
 
@@ -487,6 +487,26 @@ void wakeup(void *chan)
             make_ready(t);
     }
 }
+
+void wakeup_waiters(void *chan)
+{
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = &tasks[i];
+        if ((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && t->wait_chan == chan) make_ready(t);
+    }
+}
+
+void io_pause(void *chan, uint32_t us)
+{
+    if (!running || cur->pid == 0 || !irqs_enabled()) { udelay(us); return; }
+    uint64_t f = irq_save();
+    task_block_self(chan, time_ms() + 1);       /* the next tick at the latest */
+    schedule();
+    cur->wait_chan = NULL;
+    irq_restore(f);
+}
+
+void io_wake(void *chan) { wakeup_waiters(chan); }
 
 uint64_t poll_seq_read(void) { return __atomic_load_n(&poll_seq, __ATOMIC_SEQ_CST); }
 

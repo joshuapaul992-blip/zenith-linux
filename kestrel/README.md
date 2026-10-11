@@ -284,7 +284,7 @@ Mechanism #1 only reaches the first 256 bytes of configuration space. PCIe exten
   3. Allocate the command list (1 KiB, 1 KiB aligned), the received-FIS area (256 B aligned) and one 128-byte-aligned command table per slot.
   4. Clear SERR/IS, power up / spin up, enable FIS receive, check `SSTS.DET` and the signature, wait for BSY/DRQ to clear, start the engine.
   5. IDENTIFY: model, serial, LBA48 support, capacity, and logical sector size (512e/4Kn).
-- **I/O:** `ahci_read()`, `ahci_write()` and `ahci_flush()` are synchronous and polled.
+- **I/O:** `ahci_read()`, `ahci_write()` and `ahci_flush()` are synchronous. Once Kestrel has routed the HBA's MSI to `ahci_irq()` and called `ahci_enable_interrupts()`, a command that does not finish within a short spin sleeps until the port interrupts (DHRS, PSS, SDBS or an error), so the CPU and the kernel lock are free meanwhile. Without MSI the driver polls.
   - Commands are READ/WRITE DMA EXT (48-bit LBA), with a 28-bit fallback for drives without LBA48.
   - The PRDT is built page by page and physically contiguous pages are merged. Large requests are split across commands.
   - If the device reports an error, the driver logs PxIS/PxTFD/PxSERR and runs the AHCI §6.2.2 port recovery.
@@ -308,12 +308,13 @@ Tested in QEMU (ICH9 AHCI) under SeaBIOS and OVMF with a 200 GiB disk. The tests
   1. Read CAP. Require the NVM command set and 4 KiB pages (`MPSMIN = 0`). Take the doorbell stride (`4 << DSTRD`) and the ready timeout (`CAP.TO`, in 500 ms units).
   2. Disable: clear `CC.EN` and wait for `CSTS.RDY = 0`. If an enable is still in progress, it is allowed to finish first.
   3. Write AQA, ASQ and ACQ with the admin rings (up to 32 entries each, clamped to `MQES + 1`).
-  4. Write CC: NVM command set, 4 KiB pages, round robin, 64-byte SQEs and 16-byte CQEs. Then set `EN` and wait for `RDY = 1`, failing early on `CSTS.CFS`. Mask interrupts through INTMS, since the driver polls.
+  4. Write CC: NVM command set, 4 KiB pages, round robin, 64-byte SQEs and 16-byte CQEs. Then set `EN` and wait for `RDY = 1`, failing early on `CSTS.CFS`. Pin and MSI interrupts stay masked through INTMS until Kestrel routes them.
   5. Identify Controller: model, serial, firmware, NN, VWC, RTD3E, MDTS and the minimum SQE/CQE sizes.
-  6. Set Features (Number of Queues), then Create I/O Completion Queue and Create I/O Submission Queue. Queue 1 holds up to 64 entries and is physically contiguous; the CQ is created with interrupts off.
+  6. Set Features (Number of Queues), then Create I/O Completion Queue and Create I/O Submission Queue. Queue 1 holds up to 64 entries and is physically contiguous; its CQ raises interrupt vector 0.
   7. Namespaces come from the active namespace list (CNS 02h), or from a scan of every NSID up to NN on NVMe 1.0 controllers. Each one gets an Identify Namespace, which gives its size and active LBA format. Formats with metadata are skipped.
 - **Doorbells:** `SQyTDBL` sits at `0x1000 + 2y × stride` and `CQyHDBL` at `0x1000 + (2y + 1) × stride`.
 - **Completions:** each queue tracks its head and an expected phase tag, which starts at 1 and flips whenever the head wraps. A CQE is new when its phase bit matches. The driver then checks the command identifier, takes the SQ head from DW2 and rings the CQ head doorbell. A completion with another CID belongs to an abandoned command and is discarded.
+- **Interrupts:** Kestrel routes vector 0 by MSI-X (or MSI, unmasked through INTMC) to `nvme_irq()`, after which a command that does not complete within a short spin sleeps until the interrupt, and a request waiting for the controller lock sleeps until it is released. Without MSI the driver polls.
 - **I/O:** `nvme_read()`, `nvme_write()` and `nvme_flush()` are synchronous. Requests are split at the controller's MDTS, capped by `NVME_MAX_TRANSFER` (default 1 MiB), and NLB is 16 bits. A per-controller lock serialises namespaces that share the I/O queue.
 - **PRPs** (§4.3): every 4 KiB page of the caller's buffer is translated on its own through `virt_to_phys()`, so the buffer only has to be dword aligned.
   - PRP1 points at the first byte, which may sit at an offset in its page.
@@ -341,7 +342,7 @@ Tested in QEMU 8.2 (`-device nvme`, NVMe 1.4) under SeaBIOS and OVMF, with two c
 QEMU accepts at most 1024 mappings per command. On a controller with `mdts=0`, a 4 MiB build therefore fails misaligned transfers that span 1025 pages, with Internal Error (SC 06h). This is a limit of the emulator, and the default 1 MiB cap stays well below it.
 
 Not implemented yet:
-- interrupts (MSI-X); completions are polled
+- more than one interrupt vector
 - more than one I/O queue pair, or more than one command in flight
 - SGLs, metadata and end-to-end protection
 - Write Zeroes, Dataset Management (TRIM) and namespace management
@@ -370,7 +371,8 @@ Not implemented yet:
   - Keyboard reports are compared with the previous report to produce press and release events. Caps Lock is tracked, US-layout ASCII is generated, and the driver repeats held keys itself (500 ms, then 30 per second).
   - Mouse reports deliver dx/dy/wheel/buttons.
 - **Concurrency:**
-  - `xhci_poll()` drains the event ring from the 1 kHz timer interrupt. It completes commands and transfers, re-arms report buffers and records port changes.
+  - `xhci_poll()` drains the event ring. It completes commands and transfers, re-arms report buffers and records port changes. It runs from the controller's MSI-X (or MSI) interrupt, with 40 µs moderation, and from the 1 kHz timer as a fallback.
+  - Commands, control and bulk transfers sleep while they wait (through the platform's `pause`/`wake` hooks), and `xhci_poll()` wakes them, so a USB disk read no longer holds the CPU and the kernel lock.
   - `xhci_service()` runs in the `usbd` thread. It enumerates hot-plugged devices, frees removed ones, and recovers halted endpoints (Reset Endpoint, then Set TR Dequeue).
 - **Kestrel integration:** USB keys go into the same queue as PS/2, so the boot manager works with a USB-only keyboard. The mouse drives an overlay pointer. Status is in `/proc/usb` (the `usb` shell command) and in the System Information tool.
 
@@ -382,7 +384,6 @@ Tested in QEMU `qemu-xhci` under SeaBIOS and OVMF. On OVMF, BAR0 sat at 0xC0_000
 Not implemented yet:
 - devices behind external hubs (route strings, transaction translators)
 - HID report-descriptor parsing for non-boot devices
-- MSI-X or INTx interrupts in place of the timer poll
 - more than one controller
 - isochronous transfers; the only bulk class driver is mass storage (below)
 
@@ -419,7 +420,7 @@ The function returns the number of ports still in progress. `xhci_init()` runs i
 **5. Block layer** (`kernel/block.c`). Disks are named by kind (`usb0`, `sata0`, `nvme0`) and their partitions are named `usb0p1`, ….
 - **MBR:** primary and logical partitions (EBR chain with loop guard).
 - **GPT:** header and entry-array CRC32 are checked; if the primary GPT is invalid, the backup is used.
-- Requests are bounds-checked and serialised per disk.
+- Requests are bounds-checked and serialised per disk; a request waiting for the disk sleeps.
 - Devices that disappear are marked removed, and later reads return `-ENODEV`.
 - Every device gets a `/dev` node; `/proc/partitions` (`lsblk`) lists them.
 
@@ -591,7 +592,8 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
                              chmod chown date uname neofetch (+ cu_lib.c helpers, table.c)
               ramdisk.c      Multiboot2 modules as read-only /dev/ramN (the ISO's boot volume)
               storage.c      PCI -> AHCI and NVMe glue, boot-time MBR verify, /dev/sdX, nvmeN,
-                             NVMe self-test and shutdown
+                             NVMe self-test and shutdown, MSI hookup
+              msi.c          MSI/MSI-X: vectors 0x50-0x6F for PCI devices, /proc/interrupts lines
               usbhost.c      PCI -> xHCI glue, key injection, mouse pointer, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
               time.c         invariant TSC / HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts
@@ -838,11 +840,11 @@ make usbimg
 
 ## Multiprocessor support and robustness
 
-**Processors** (`arch/x86_64/apic.c`, `smp.c`, `trampoline.asm`). The ACPI MADT lists the CPUs and IO APICs. The 8259 PICs are masked; the PS/2 keyboard comes through the IO APIC (honouring the MADT's interrupt source overrides), and every CPU runs its own local APIC timer at 1 kHz, calibrated against the HPET/TSC clock. The other CPUs are started with INIT and STARTUP IPIs into a real-mode trampoline at `0x8000`, which switches to long mode on the kernel's page tables; each gets its GDT/TSS, IST stacks, SYSCALL MSRs, the boot CPU's CR0/CR4/PAT, and an idle thread. Up to 16 CPUs. Boot options: `kestrel.smp=0` (or `maxcpus=1`) keeps one CPU, `kestrel.noapic` stays on the PIC and PIT. Without an MADT the kernel does the same by itself.
+**Processors** (`arch/x86_64/apic.c`, `smp.c`, `trampoline.asm`). The ACPI MADT lists the CPUs and IO APICs. The 8259 PICs are masked; the PS/2 keyboard comes through the IO APIC (honouring the MADT's interrupt source overrides), the xHCI, AHCI and NVMe controllers interrupt by MSI-X or MSI to the boot CPU (vectors `0x50`–`0x6F`, listed in `/proc/interrupts`), and every CPU runs its own local APIC timer at 1 kHz, calibrated against the HPET/TSC clock. The other CPUs are started with INIT and STARTUP IPIs into a real-mode trampoline at `0x8000`, which switches to long mode on the kernel's page tables; each gets its GDT/TSS, IST stacks, SYSCALL MSRs, the boot CPU's CR0/CR4/PAT, and an idle thread. Up to 16 CPUs. Boot options: `kestrel.smp=0` (or `maxcpus=1`) keeps one CPU, `kestrel.noapic` stays on the PIC and PIT. Without an MADT the kernel does the same by itself.
 
 **Per-CPU data.** In the kernel, the GS base points at the CPU's `struct percpu` (`include/kernel/smp.h`); entries from ring 3 run `SWAPGS`, and NMI, #DF and #MC (which can arrive between `SYSCALL` and its `SWAPGS`) decide from the GS base itself. The running task is read with a single GS-relative load, so a thread that is preempted and moved to another CPU never reads the wrong one.
 
-**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. `/proc/kstat` shows how long each CPU holds the lock and waits for it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
+**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. Disk I/O does not hold it while the device works: USB, SATA and NVMe commands sleep until the controller's MSI wakes them (`io_pause()`/`io_wake()`), and unlocking a kernel mutex wakes only the tasks waiting for it. `/proc/kstat` shows how long each CPU holds the lock and waits for it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
 
 **TLB shootdowns.** When a mapping loses rights or goes away, every CPU that has that address space loaded drops the translation (`invlpg`, or a CR3 reload for large ranges) through an IPI, and the call waits for each to acknowledge before a frame is freed or reused. Waiting for the kernel lock services pending requests, so a shootdown can always complete. Changes to the kernel's identity map (guard pages, cache types) go to every CPU.
 
@@ -1082,7 +1084,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 4. **Job control** (stop/continue signals, `SIGTSTP`/`SIGCONT` on the terminal).
 5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.
 6. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
-7. **Hardware support:** MSI/MSI-X interrupts for storage and USB (they are polled today), USB hubs, an EHCI driver for machines without xHCI.
+7. **Hardware support:** MSI/MSI-X interrupts for network and sound cards (storage and USB have them), USB hubs, an EHCI driver for machines without xHCI.
 8. **Firefox, properly:** seccomp-bpf and namespaces so its sandboxes can stay on, GLX in the X server, non-PIE executables, and finer locking so it starts quickly.
 
 ## Licenses

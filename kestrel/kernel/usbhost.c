@@ -24,6 +24,7 @@
 #include <kernel/posix.h>
 #include <kernel/kinput.h>
 #include "pci.h"
+#include <kernel/msi.h>
 #include "xhci.h"
 #include "usb_legacy.h"
 #include "usb_msc.h"
@@ -154,7 +155,12 @@ static const struct xhci_platform kestrel_usb = {
     .log_putc  = klog_putc,
     .on_key    = on_key,
     .on_mouse  = on_mouse,
+    .pause     = io_pause,                      /* transfers sleep until their completion event */
+    .wake      = io_wake,
 };
+
+static void xhci_msi(void *arg) { (void)arg; xhci_poll(); }
+static struct pci_device *usb_pci;
 
 /* ---- bring-up ------------------------------------------------------------------ */
 void usb_init(void)
@@ -195,7 +201,15 @@ void usb_init(void)
     if (xhci_init(bar->base, &kestrel_usb) < 0) return;
     kprintf("usb: controller up and initial ports settled in %lu ms\n", time_ms() - t0);
     usb_up = true;
+    usb_pci = dev;
     pit_add_tick_hook(xhci_poll);               /* drain the event ring every 1 ms */
+}
+
+/* With the APIC up: an MSI drains the event ring at once (40 us moderation),
+ * so a thread waiting for a transfer wakes as soon as it completes. */
+void usb_enable_irqs(void)
+{
+    if (usb_up && msi_enable(usb_pci, xhci_msi, NULL, "xhci") >= 0) xhci_enable_interrupts(160);
 }
 
 static int usbd_main(void *arg)

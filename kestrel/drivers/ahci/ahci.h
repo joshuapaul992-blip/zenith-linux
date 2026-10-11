@@ -285,6 +285,14 @@ struct ahci_platform {
     void     (*delay_us)(uint32_t us);
     /* Debug output, one character at a time. NULL: polled COM1 (0x3F8). */
     void     (*log_putc)(char c);
+    /* Optional: wait for a command without spinning, once
+     * ahci_enable_interrupts() has run. pause(chan, us) returns after
+     * wake(chan) (called from ahci_irq()) or whenever the platform likes;
+     * NULL or interrupts off: delay_us(us). now_us: a microsecond clock for
+     * timeouts while pausing; NULL: the delays are counted instead. */
+    void     (*pause)(void *chan, uint32_t us);
+    void     (*wake)(void *chan);
+    uint64_t (*now_us)(void);
 };
 
 struct ahci_disk {
@@ -305,6 +313,11 @@ struct ahci_disk {
  * `plat` may be NULL. Returns the number of ATA disks found on this HBA,
  * or a negative AHCI_ERR_*. May be called once per controller. */
 int  ahci_init(uint64_t abar, const struct ahci_platform *plat);
+/* The HBA's interrupt (MSI) is wired up: enable completion and error
+ * interrupts on every port; the handler calls ahci_irq(hba). */
+void ahci_enable_interrupts(int hba);
+void ahci_irq(int hba);
+int  ahci_hba_count(void);
 
 int               ahci_disk_count(void);
 struct ahci_disk *ahci_disk_get(int index);

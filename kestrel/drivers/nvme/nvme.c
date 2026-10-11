@@ -159,7 +159,10 @@ struct ctrl {
     uint8_t  *idbuf;  uint64_t idbuf_phys;  /* 2 pages                                  */
     uint16_t next_cid;
     volatile int lock;
+    volatile int lock_waiters;              /* sleeping in ctrl_lock()                  */
     bool     alive;                         /* I/O queues usable                        */
+    bool     irq_on;                        /* nvme_enable_interrupts(): waits sleep    */
+    bool     msix;                          /* INTMS/INTMC are off limits               */
     bool     vwc;
     uint32_t nn;
     char     model[41], serial[21], firmware[9];
@@ -176,6 +179,7 @@ static void out_ctrl(const struct ctrl *c)
 }
 
 static inline void delay_us(const struct ctrl *c, uint32_t us) { c->plat.delay_us(us); }
+static inline bool can_sleep(const struct ctrl *c) { return c->irq_on && c->plat.pause; }
 
 /* Poll CSTS until (value & mask) == want. A fatal status ends the wait early
  * unless that is what the caller waits for. */
@@ -194,9 +198,18 @@ static int wait_csts(const struct ctrl *c, uint32_t mask, uint32_t want, uint32_
 static void ctrl_lock(struct ctrl *c)
 {
     while (__atomic_exchange_n(&c->lock, 1, __ATOMIC_ACQUIRE))
-        while (__atomic_load_n(&c->lock, __ATOMIC_RELAXED)) c->plat.yield();
+        while (__atomic_load_n(&c->lock, __ATOMIC_RELAXED)) {
+            if (!can_sleep(c)) { c->plat.yield(); continue; }
+            __atomic_add_fetch(&c->lock_waiters, 1, __ATOMIC_RELAXED);
+            c->plat.pause((void *)&c->lock, 1000);
+            __atomic_sub_fetch(&c->lock_waiters, 1, __ATOMIC_RELAXED);
+        }
 }
-static void ctrl_unlock(struct ctrl *c) { __atomic_store_n(&c->lock, 0, __ATOMIC_RELEASE); }
+static void ctrl_unlock(struct ctrl *c)
+{
+    __atomic_store_n(&c->lock, 0, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&c->lock_waiters, __ATOMIC_RELAXED) && c->plat.wake) c->plat.wake((void *)&c->lock);
+}
 
 /* ======================================================================== */
 /*  queues and command submission                                              */
@@ -252,6 +265,7 @@ static int submit_wait(struct ctrl *c, struct queue *q, struct nvme_sqe *cmd, ui
     *q->sq_tail_db = q->sq_tail;
 
     uint32_t waited = 0;
+    uint64_t t0 = c->plat.now_us ? c->plat.now_us() : 0;
     for (uint32_t spin = 0;; spin++) {
         volatile struct nvme_cqe *e = &q->cq[q->cq_head];
         uint16_t status = e->status;
@@ -273,7 +287,7 @@ static int submit_wait(struct ctrl *c, struct queue *q, struct nvme_sqe *cmd, ui
             }
             return NVME_OK;
         }
-        if (spin < 2000) continue;                  /* fast path: no MMIO, no delay */
+        if (spin < (can_sleep(c) ? 200u : 2000u)) continue;   /* fast path: no MMIO, no delay */
         if ((spin & 63) == 0 && (rd32(&c->regs->csts) & NVME_CSTS_CFS)) {
             out_ctrl(c); out_s("controller fatal status during command 0x"); out_hex(cmd->opcode, 2); out_c('\n');
             return NVME_ERR_FATAL;
@@ -283,7 +297,13 @@ static int submit_wait(struct ctrl *c, struct queue *q, struct nvme_sqe *cmd, ui
             out_dec(q->id); out_s(" timed out, CSTS=0x"); out_hex(rd32(&c->regs->csts), 8); out_c('\n');
             return NVME_ERR_TIMEOUT;
         }
-        delay_us(c, 10); waited += 10;
+        if (can_sleep(c)) {                         /* nvme_irq() wakes the queue */
+            if (c->plat.now_us) waited = (uint32_t)(c->plat.now_us() - t0);
+            c->plat.pause(q, 10);
+        } else {
+            delay_us(c, 10);
+        }
+        waited += 10;
     }
 }
 
@@ -341,31 +361,36 @@ static int ctrl_start_admin(struct ctrl *c)
         out_s("): "); out_s(nvme_strerror(rc)); out_c('\n');
         return rc;
     }
-    /* Polled operation: keep pin-based/MSI interrupts masked (the host has
-     * not configured MSI-X, so INTMS is valid to write). */
-    wr32(&c->regs->intms, 0xFFFFFFFFu);
+    /* Pin-based/MSI vectors stay masked until nvme_enable_interrupts();
+     * with MSI-X the mask registers must not be touched. */
+    if (!c->msix) wr32(&c->regs->intms, 0xFFFFFFFFu);
+    if (!c->msix && c->irq_on) wr32(&c->regs->intmc, 1u);       /* after a reset */
     return NVME_OK;
 }
 
-/* Number of Queues feature, then Create I/O Completion Queue followed by
- * Create I/O Submission Queue (a SQ names its CQ, which must exist). */
-static int create_io_queues(struct ctrl *c)
+/* Number of Queues feature (only allowed once after a reset), then Create
+ * I/O Completion Queue followed by Create I/O Submission Queue (a SQ names
+ * its CQ, which must exist). */
+static int create_io_queues(struct ctrl *c, bool after_reset)
 {
     struct nvme_sqe cmd;
     uint32_t granted = 0;
+    int rc;
 
-    mem_zero(&cmd, sizeof cmd);
-    cmd.opcode = NVME_ADMIN_SET_FEATURES;
-    cmd.cdw10  = NVME_FEAT_NUM_QUEUES;
-    cmd.cdw11  = 0;                                 /* NCQR = NSQR = 0: one queue each (0's based) */
-    int rc = admin_cmd(c, &cmd, &granted);
-    if (rc != NVME_OK) return rc;
+    if (after_reset) {
+        mem_zero(&cmd, sizeof cmd);
+        cmd.opcode = NVME_ADMIN_SET_FEATURES;
+        cmd.cdw10  = NVME_FEAT_NUM_QUEUES;
+        cmd.cdw11  = 0;                             /* NCQR = NSQR = 0: one queue each (0's based) */
+        rc = admin_cmd(c, &cmd, &granted);
+        if (rc != NVME_OK) return rc;
+    }
 
     mem_zero(&cmd, sizeof cmd);
     cmd.opcode = NVME_ADMIN_CREATE_CQ;
     cmd.prp1   = c->io.cq_phys;
     cmd.cdw10  = (uint32_t)(c->io.depth - 1) << 16 | IO_QID;
-    cmd.cdw11  = NVME_QUEUE_PHYS_CONTIG;            /* IEN = 0: polled, vector 0 unused */
+    cmd.cdw11  = NVME_QUEUE_PHYS_CONTIG | NVME_CQ_IRQ_ENABLED;   /* IV 0: silent until routed */
     rc = admin_cmd(c, &cmd, NULL);
     if (rc != NVME_OK) { out_ctrl(c); out_s("Create I/O CQ failed\n"); return rc; }
 
@@ -381,12 +406,27 @@ static int create_io_queues(struct ctrl *c)
     return NVME_OK;
 }
 
+/* Delete I/O Submission Queue, then its Completion Queue. */
+static void delete_io_queues(struct ctrl *c)
+{
+    struct nvme_sqe cmd;
+    mem_zero(&cmd, sizeof cmd);
+    cmd.opcode = NVME_ADMIN_DELETE_SQ;
+    cmd.cdw10  = IO_QID;
+    admin_cmd(c, &cmd, NULL);
+    mem_zero(&cmd, sizeof cmd);
+    cmd.opcode = NVME_ADMIN_DELETE_CQ;
+    cmd.cdw10  = IO_QID;
+    admin_cmd(c, &cmd, NULL);
+    c->alive = false;
+}
+
 /* After a timeout or fatal status the outstanding command may still own its
  * PRPs; only a controller reset guarantees the DMA is dead. */
 static void ctrl_recover(struct ctrl *c)
 {
     out_ctrl(c); out_s("resetting controller\n");
-    if (ctrl_start_admin(c) == NVME_OK && create_io_queues(c) == NVME_OK) {
+    if (ctrl_start_admin(c) == NVME_OK && create_io_queues(c, true) == NVME_OK) {
         out_ctrl(c); out_s("recovered\n");
         return;
     }
@@ -622,7 +662,7 @@ int nvme_init(uint64_t bar, const struct nvme_platform *plat)
     g_nctrl++;                                      /* the slot is owned from here on */
     int rc = ctrl_start_admin(c);
     if (rc == NVME_OK) rc = identify_controller(c);
-    if (rc == NVME_OK) rc = create_io_queues(c);
+    if (rc == NVME_OK) rc = create_io_queues(c, true);
     if (rc != NVME_OK) {
         out_ctrl(c); out_s("initialisation failed: "); out_s(nvme_strerror(rc)); out_c('\n');
         c->alive = false;
@@ -634,6 +674,37 @@ int nvme_init(uint64_t bar, const struct nvme_platform *plat)
 }
 
 int nvme_namespace_count(void) { return g_nns; }
+int nvme_ctrl_count(void) { return g_nctrl; }
+
+/* A controller may tie a queue to its vector when the queue is created
+ * (QEMU does: an MSI-X vector no queue was created on never fires), so the
+ * I/O queue pair is created again now that the vector is routed. */
+void nvme_enable_interrupts(int ci, bool msix)
+{
+    if (ci < 0 || ci >= g_nctrl) return;
+    struct ctrl *c = &g_ctrl[ci];
+    ctrl_lock(c);
+    c->msix = msix;
+    if (!msix) wr32(&c->regs->intmc, 1u);           /* vector 0 */
+    if (c->alive) {
+        delete_io_queues(c);
+        queue_reset(&c->io);
+        if (create_io_queues(c, false) != NVME_OK) ctrl_recover(c);
+    }
+    c->irq_on = true;
+    ctrl_unlock(c);
+}
+
+/* The I/O queue (or, during a reset, the admin queue) has completions:
+ * wake whoever waits on either. The waiter consumes them itself. */
+void nvme_irq(int ci)
+{
+    if (ci < 0 || ci >= g_nctrl) return;
+    struct ctrl *c = &g_ctrl[ci];
+    if (!c->plat.wake) return;
+    c->plat.wake(&c->io);
+    c->plat.wake(&c->admin);
+}
 
 struct nvme_namespace *nvme_namespace_get(int index)
 {
@@ -713,18 +784,7 @@ void nvme_shutdown_all(void)
         struct ctrl *c = &g_ctrl[i];
         if (!(rd32(&c->regs->cc) & NVME_CC_EN)) continue;
         ctrl_lock(c);
-        if (c->alive) {
-            struct nvme_sqe cmd;
-            mem_zero(&cmd, sizeof cmd);
-            cmd.opcode = NVME_ADMIN_DELETE_SQ;
-            cmd.cdw10  = IO_QID;
-            admin_cmd(c, &cmd, NULL);
-            mem_zero(&cmd, sizeof cmd);
-            cmd.opcode = NVME_ADMIN_DELETE_CQ;
-            cmd.cdw10  = IO_QID;
-            admin_cmd(c, &cmd, NULL);
-            c->alive = false;
-        }
+        if (c->alive) delete_io_queues(c);
         uint32_t cc = rd32(&c->regs->cc) & ~NVME_CC_SHN_MASK;
         wr32(&c->regs->cc, cc | NVME_CC_SHN_NORMAL);
         int rc = wait_csts(c, NVME_CSTS_SHST_MASK, NVME_CSTS_SHST_DONE,

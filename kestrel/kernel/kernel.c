@@ -442,6 +442,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     bool apic = apic_init();    /* MADT: local APIC + IO APIC replace the 8259s */
     if (apic) lapic_timer_start();
     else pit_init(PIT_HZ);
+    if (apic) { usb_enable_irqs(); storage_enable_irqs(); }    /* MSI */
     keyboard_init();
     if (apic) ioapic_route_isa(IRQ_KEYBOARD, IRQ_BASE + IRQ_KEYBOARD);
     uvm_init();                 /* shared kernel PDPTs, before any address space */

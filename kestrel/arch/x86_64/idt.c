@@ -10,7 +10,7 @@
 #include <kernel/vm.h>
 #include <kernel/posix.h>
 #include <kernel/smp.h>
-#include <kernel/smp.h>
+#include <kernel/msi.h>
 
 struct idt_gate {
     uint16_t offset_lo;
@@ -343,6 +343,12 @@ void isr_dispatch(struct int_frame *f)
             this_cpu()->ks.irq_n++;
             this_cpu()->ks.irq_cyc += rdtsc() - t0;
         }
+    } else if (f->vector >= VEC_MSI_BASE && f->vector < VEC_MSI_BASE + VEC_MSI_COUNT) {
+        lapic_eoi();                                    /* edge-triggered: EOI first, like the PIC path */
+        uint64_t t0 = rdtsc();
+        msi_dispatch((int)f->vector);
+        this_cpu()->ks.irq_n++;
+        this_cpu()->ks.irq_cyc += rdtsc() - t0;
     } else if (f->vector == VEC_LAPIC_TIMER) {
         lapic_eoi();
         this_cpu()->ticks++;

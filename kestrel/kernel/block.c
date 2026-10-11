@@ -57,7 +57,8 @@ void blk_guid_str(const uint8_t g[16], char out[37])
 /*  I/O                                                                        */
 /* ======================================================================== */
 /* Drivers keep per-device transport state (BOT tags, AHCI slots), so a disk
- * serves one request at a time; other threads yield until it is free. */
+ * serves one request at a time; other threads sleep until it is free. (The
+ * request itself may sleep while the device works: see io_pause.) */
 static void disk_lock(struct blkdev *d)
 {
     for (;;) {
@@ -66,10 +67,10 @@ static void disk_lock(struct blkdev *d)
         if (ok) d->io_busy = true;
         irq_restore(f);
         if (ok) return;
-        if (irqs_enabled()) sched_yield(); else cpu_relax();
+        io_pause(d, 20);
     }
 }
-static void disk_unlock(struct blkdev *d) { d->io_busy = false; }
+static void disk_unlock(struct blkdev *d) { d->io_busy = false; io_wake(d); }
 
 int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
 {

@@ -189,6 +189,18 @@ void        sleep_on(void *chan);       /* call with interrupts disabled */
 /* sleep_on() that also ends at deadline_ms of time_ms() (0: none) */
 void        sleep_on_until(void *chan, uint64_t deadline_ms);
 void        wakeup(void *chan);
+/* Wake only the tasks sleeping on chan, not every poll()/epoll sleeper as
+ * wakeup() does: for things nobody polls (mutexes, device completions). */
+void        wakeup_waiters(void *chan);
+
+/* Device waits. A driver polling its hardware for a completion calls
+ * io_pause() between polls: the thread sleeps until io_wake(chan) (the
+ * device's interrupt handler, or whatever noticed the completion) or the
+ * next timer tick, so the CPU and the kernel lock serve other work
+ * meanwhile. Where sleeping is impossible (interrupts off, no scheduler
+ * yet, the idle thread) it busy-waits `us` microseconds instead. */
+void        io_pause(void *chan, uint32_t us);
+void        io_wake(void *chan);
 
 /* Waiting for any of many objects (poll, select, epoll). Every wakeup()
  * advances a global sequence number and wakes the pollers: a poller reads

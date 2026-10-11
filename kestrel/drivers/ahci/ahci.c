@@ -138,6 +138,7 @@ struct port_state {
     struct ahci_received_fis *fis;    uint64_t fis_phys;
     struct ahci_cmd_table   *tables;  uint64_t tables_phys;
     uint8_t                 *scratch; uint64_t scratch_phys; uint32_t scratch_sector;
+    volatile uint32_t        irq_is;        /* PxIS bits the interrupt handler cleared */
 };
 
 struct hba_state {
@@ -145,6 +146,7 @@ struct hba_state {
     uint64_t abar;
     uint32_t cap, cap2, vs, pi;
     uint32_t nslots;
+    bool     irq_on;                        /* ahci_enable_interrupts() ran: waits can sleep */
     struct ahci_platform plat;
     struct port_state ports[32];
 };
@@ -155,6 +157,10 @@ static struct ahci_disk g_disks[AHCI_MAX_DISKS];
 static int              g_ndisks;
 
 static inline void delay_us(const struct hba_state *h, uint32_t us) { h->plat.delay_us(us); }
+static inline void pause_us(const struct hba_state *h, void *chan, uint32_t us)
+{
+    if (h->irq_on && h->plat.pause) h->plat.pause(chan, us); else h->plat.delay_us(us);
+}
 
 /* Poll `reg` until (value & mask) == want, or the timeout expires. */
 static bool wait_reg(const struct hba_state *h, volatile uint32_t *reg, uint32_t mask,
@@ -284,20 +290,24 @@ static int run_cmd(struct port_state *p, uint8_t ata_cmd, uint64_t lba, uint16_t
 
     if (!port_wait_idle(p, T_IDLE_US)) return AHCI_ERR_TIMEOUT;
     REG(r->is) = 0xFFFFFFFFu;
+    p->irq_is = 0;
     mmio_barrier();                             /* table + header visible before CI */
     REG(r->ci) = 1u << slot;
 
+    const struct hba_state *hb = p->hba;
     uint32_t bit = 1u << slot, is = 0, waited = 0;
+    uint64_t t0 = hb->plat.now_us ? hb->plat.now_us() : 0;
     uint32_t limit = ata_cmd == ATA_CMD_FLUSH_CACHE_EXT ? T_FLUSH_US : T_CMD_US;
     int err = AHCI_OK;
     for (uint32_t spin = 0;; spin++) {
-        is = REG(r->is);
+        is = REG(r->is) | p->irq_is;
         if (is & AHCI_PxIS_TFES)                              { err = AHCI_ERR_IO;  break; }
         if (is & (AHCI_PxIS_HBFS | AHCI_PxIS_HBDS | AHCI_PxIS_IFS)) { err = AHCI_ERR_HBA; break; }
         if (!(REG(r->ci) & bit)) break;
-        if (spin > 2000) {                      /* stop spinning, start sleeping */
+        if (spin > 200) {                       /* stop spinning: sleep until the interrupt */
+            if (hb->plat.now_us) waited = (uint32_t)(hb->plat.now_us() - t0);
             if (waited >= limit) { err = AHCI_ERR_TIMEOUT; break; }
-            delay_us(p->hba, 10); waited += 10;
+            pause_us(hb, p, 10); waited += 10;
         }
     }
     mmio_barrier();
@@ -783,4 +793,43 @@ int ahci_selftest_rw(struct ahci_disk *d)
 fail:
     out_s("ahci:   selftest aborted: "); out_s(ahci_strerror(rc)); out_c('\n');
     return rc;
+}
+
+/* ======================================================================== */
+/*  interrupts                                                                 */
+/* ======================================================================== */
+int ahci_hba_count(void) { return g_nhba; }
+
+void ahci_enable_interrupts(int hi)
+{
+    if (hi < 0 || hi >= g_nhba || !g_hba[hi].regs) return;
+    struct hba_state *h = &g_hba[hi];
+    for (int n = 0; n < 32; n++) {
+        struct port_state *p = &h->ports[n];
+        if (!p->ready) continue;
+        REG(p->regs->is) = 0xFFFFFFFFu;
+        REG(p->regs->ie) = AHCI_PxIS_DHRS | AHCI_PxIS_PSS | (1u << 3) /* SDBS */ | AHCI_PxIS_ERRORS;
+    }
+    REG(h->regs->is) = 0xFFFFFFFFu;
+    REG(h->regs->ghc) = REG(h->regs->ghc) | AHCI_GHC_IE;
+    h->irq_on = true;
+}
+
+/* Note what each port reports, clear it (so the next event interrupts
+ * again) and wake whoever waits on the port. */
+void ahci_irq(int hi)
+{
+    if (hi < 0 || hi >= g_nhba || !g_hba[hi].regs) return;
+    struct hba_state *h = &g_hba[hi];
+    uint32_t is = REG(h->regs->is);
+    for (int n = 0; n < 32; n++) {
+        if (!(is & (1u << n))) continue;
+        struct port_state *p = &h->ports[n];
+        if (!p->regs) continue;
+        uint32_t pis = REG(p->regs->is);
+        p->irq_is |= pis;
+        REG(p->regs->is) = pis;
+        if (h->plat.wake) h->plat.wake(p);
+    }
+    REG(h->regs->is) = is;
 }
