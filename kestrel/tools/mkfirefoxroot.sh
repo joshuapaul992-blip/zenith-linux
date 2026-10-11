@@ -29,7 +29,7 @@ OUT=$1; FF=$2; CACHE=${3:-$(dirname "$OUT")/debcache}
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/ffroot.XXXXXX")
 trap 'rm -rf "${ROOT:?}"' EXIT
 
-PKGS="bash coreutils findutils grep sed gawk procps util-linux xz-utils zstd less
+PKGS="bash dash coreutils findutils grep sed gawk procps util-linux xz-utils zstd less
       libgtk-3-0t64 libgtk-3-bin gtk-3-examples libasound2t64 alsa-utils libdbus-1-3 dbus-daemon dbus-x11
       libgl1-mesa-dri libegl1 libegl-mesa0 mesa-utils x11-utils x11-apps x11-xserver-utils
       fonts-dejavu-core fontconfig hicolor-icon-theme adwaita-icon-theme librsvg2-common shared-mime-info
@@ -56,6 +56,7 @@ for p in $real; do
 done
 
 echo "mkfirefoxroot: configuring"
+[ -e "$ROOT/usr/bin/sh" ] || ln -s dash "$ROOT/usr/bin/sh"            # dpkg would make it
 cat > "$ROOT/etc/asound.conf" <<'EOF'
 # ALSA programs (aplay, speaker-test) play through Kestrel's OSS devices
 pcm.!default { type oss device /dev/dsp }
