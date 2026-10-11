@@ -216,7 +216,9 @@ int main(void)
     int mf = open("/proc/self/maps", O_RDONLY);
     read(mf, maps, sizeof maps - 1);
     close(mf);
-    CHECK(strstr(maps, "[stack]") && strstr(maps, "r-xp") && strstr(maps, "/boot/bin/vmtest"), "/proc/self/maps lists the regions");
+    char exe[256] = { 0 };
+    readlink("/proc/self/exe", exe, sizeof exe - 1);    /* /boot/bin/vmtest or /bin/vmtest */
+    CHECK(strstr(maps, "[stack]") && strstr(maps, "r-xp") && exe[0] && strstr(maps, exe), "/proc/self/maps lists the regions");
 
     /* ---- out of memory ----------------------------------------------------- */
     c = fork();
