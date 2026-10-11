@@ -211,6 +211,9 @@ struct int_frame;
 #define SYS_capset       126
 #define SYS_quotactl     179
 #define SYS_readahead    187
+#define SYS_mbind        237
+#define SYS_set_mempolicy 238
+#define SYS_get_mempolicy 239
 #define SYS_time         201
 #define SYS_fadvise64    221
 #define SYS_waitid       247

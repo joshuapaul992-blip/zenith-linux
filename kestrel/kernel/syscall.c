@@ -441,6 +441,18 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
     for (size_t i = 0; i < sizeof ioctl_args / sizeof *ioctl_args; i++)
         if (ioctl_args[i].req == (uint32_t)req) { size = ioctl_args[i].size; dir = ioctl_args[i].dir; break; }
     int64_t r;
+    if ((uint32_t)req == FIONBIO) {                     /* every kind of file, as on Linux */
+        uint32_t on;
+        if (get_user_u32(&on, (const void *)arg)) { r = -EFAULT; goto out; }
+        if (on) f->flags |= O_NONBLOCK; else f->flags &= ~O_NONBLOCK;
+        r = 0;
+        goto out;
+    }
+    if ((uint32_t)req == 0x5451 || (uint32_t)req == 0x5450) {   /* FIOCLEX, FIONCLEX */
+        current_task()->files->cloexec[fd] = (uint32_t)req == 0x5451;
+        r = 0;
+        goto out;
+    }
     if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f))) {
         r = net_user_ioctl((unsigned long)req, arg);           /* interfaces and routes: any socket */
     } else if (size < 0) {
@@ -2767,7 +2779,7 @@ static int64_t sys_personality(uint64_t persona, uint64_t a2, uint64_t a3, uint6
 { (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return (uint32_t)persona == 0xffffffffu || !(uint32_t)persona ? 0 : -EINVAL; }
 
 /* Known absent on purpose (callers fall back): rseq, pidfds, System V
- * shared memory. ENOSYS without the "unimplemented" log line. */
+ * shared memory, NUMA policies (as on a kernel built without NUMA). ENOSYS without the "unimplemented" log line. */
 static int64_t sys_absent(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -2945,7 +2957,8 @@ void syscall_init(void)
     REG(SYS_readahead, sys_readahead); REG(SYS_waitid, sys_waitid);
     REG(SYS_capget, sys_capget);       REG(SYS_capset, sys_capset);
     REG(SYS_rseq, sys_absent);         REG(SYS_pidfd_open, sys_absent);
-    REG(SYS_quotactl, sys_absent);
+    REG(SYS_quotactl, sys_absent);     REG(SYS_mbind, sys_absent);
+    REG(SYS_set_mempolicy, sys_absent); REG(SYS_get_mempolicy, sys_absent);
     REG(SYS_shmget, sys_absent);       REG(SYS_shmat, sys_absent);
     REG(SYS_shmctl, sys_absent);       REG(SYS_shmdt, sys_absent);
 
