@@ -72,7 +72,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kerne
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
            drivers/usb/usb_legacy.c drivers/usb/usb_msc.c kernel/time.c \
-           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
+           kernel/block.c kernel/bootvol.c kernel/recovery.c fs/tarfs.c fs/ext2.c fs/rootfs.c fs/pipe.c fs/pty.c fs/unixsock.c lib/crc32.c \
            drivers/kestrel_font.c drivers/image.c drivers/halt_screen.c drivers/video/edid.c drivers/video/bochs_dispi.c \
            kernel/display.c kernel/tty.c kernel/vt.c kernel/report.c \
            drivers/gpu/nvidia/nvbios.c drivers/gpu/nvidia/nvbios_disp.c drivers/gpu/nvidia/nvfmt.c \
@@ -194,7 +194,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
@@ -278,9 +278,27 @@ $(BUILD)/kestrel.vol: $(ROOTFS_STAGE).stamp tools/mkusbimg.py
 	@echo "  VOLUME  $@"
 	@$(PYTHON) tools/mkusbimg.py $@ --rootfs $(ROOTFS_STAGE) --ramdisk >/dev/null
 
+# The root file system: an ext2 volume labelled "kestrel-root" holding the
+# same tree plus the usual top-level directories. The kernel finds it by its
+# label and makes it "/" (fs/rootfs.c); without mke2fs the stick has none
+# and "/" stays in memory. ROOTDISK_MB sets its size.
+MKE2FS      ?= $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null)
+ROOTDISK    := $(BUILD)/rootdisk.ext2
+ROOTDISK_MB ?= 96
+ROOTDISK_FLAGS ?=
+$(ROOTDISK): $(ROOTFS_STAGE).stamp
+	@echo "  EXT2    $@ ($(ROOTDISK_MB) MiB)"
+	@rm -rf $(BUILD)/rootdisk $@
+	@cp -a $(ROOTFS_STAGE) $(BUILD)/rootdisk
+	@cd $(BUILD)/rootdisk && mkdir -p boot dev etc home/user mnt proc root sys tmp usr/bin var/log var/tmp && \
+	    chmod 1777 tmp var/tmp && chmod 700 root && chown 1000:1000 home/user 2>/dev/null || true
+	@$(MKE2FS) -q -F -t ext2 -O ^dir_index -L kestrel-root -E root_owner=0:0 $(ROOTDISK_FLAGS) -d $(BUILD)/rootdisk $@ $(ROOTDISK_MB)M
+
 USBIMG := $(BUILD)/kestrel-usb.img
 USBIMG_FLAGS ?=
-$(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).stamp $(BUILD)/cmdline.stamp
+USBIMG_ROOT  := $(if $(MKE2FS),$(ROOTDISK))
+USBIMG_SIZE  ?= $(if $(MKE2FS),$(shell echo $$(($(ROOTDISK_MB) + 64))),64)
+$(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).stamp $(BUILD)/cmdline.stamp $(USBIMG_ROOT)
 	@test -n "$(GRUB_MKIMAGE)" || { echo "error: grub-mkimage not found"; exit 1; }
 	@rm -rf $(BUILD)/usbdir
 	@mkdir -p $(BUILD)/usbdir/boot/grub
@@ -305,7 +323,7 @@ $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).
 	@echo "  USBIMG  $@"
 	@$(PYTHON) tools/mkusbimg.py $@ --rootfs $(ROOTFS_STAGE) --boot-img $(GRUB_LIB)/i386-pc/boot.img \
 	    --core-img $(BUILD)/usb-core.img $$(test -f $(BUILD)/usb-esp.img && echo --esp-img $(BUILD)/usb-esp.img) \
-	    $(USBIMG_FLAGS)
+	    --size $(USBIMG_SIZE) $(if $(USBIMG_ROOT),--root-img $(USBIMG_ROOT)) $(USBIMG_FLAGS)
 
 usbimg: $(USBIMG)
 

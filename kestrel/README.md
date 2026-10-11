@@ -839,6 +839,66 @@ make usbimg
 
 Together with `libctest`, `proctest`, `ptytest`, `socktest` and the shell script test they pass on 1 and on 4 CPUs (QEMU, `-smp 4 -accel tcg,thread=multi`).
 
+## Files on disk: ext2, symbolic links, a real root
+
+**Root file system** (`fs/rootfs.c`). At boot `/` is an in-memory tree with `/dev`, `/proc`, `/sys` and the boot volume on `/boot`. If any disk has an ext2 volume labelled `kestrel-root`, it becomes `/`:
+- The in-memory mounts move into it, and `/tmp` gets a fresh tmpfs.
+- The `/boot/bin` → `/bin` and `/boot/lib` → `/lib` binds are dropped when the volume has its own `/bin` and `/lib`.
+- Files the system needs in `/etc` (hostname, passwd, group, profile, motd, os-release) are written once if the volume lacks them.
+- Only the volume chosen this way is ever written. Other Linux file systems on the machine are left alone.
+
+Boot options:
+- `kestrel.rootfs=auto` (default): the volume labelled `kestrel-root`.
+- `kestrel.rootfs=LABEL=<name>`: the ext2 volume with that label.
+- `kestrel.rootfs=<device>`, e.g. `sata0p2`: that partition or disk.
+- `kestrel.rootfs=none`: stay on the in-memory root.
+- `kestrel.rootro=1`: mount the root read-only.
+
+The USB image built by `make usbimg` has such a partition: `ROOTDISK_MB` MiB (default 96), made by `mke2fs -d` from the same tree as the boot volume. `ROOTDISK_FLAGS` passes extra `mke2fs` options, e.g. `-b 1024 -I 128`.
+
+**ext2** (`fs/ext2.c`), read and write.
+
+What it supports:
+- Revision 0 and 1, block sizes of 1, 2 and 4 KiB, any inode size.
+- Direct, indirect, double- and triple-indirect blocks, and sparse files.
+- File types in directory entries, sparse superblocks, large files, flexible block groups.
+- ext3 volumes whose journal is empty. The journal itself is left alone.
+
+How it handles everything else:
+- Directories with an htree index (`dir_index`) are read linearly. A directory Kestrel changes loses its index flag, as `e2fsck` expects from a kernel without htree support.
+- Unknown read-only-compatible features (metadata checksums, huge files, ...) mount read-only.
+- Extents (ext4), 64-bit block numbers, journals that need recovery and compression are refused.
+
+How it works:
+- **Inodes:** hard links share one in-memory copy of the raw on-disk inode, so fields Kestrel does not interpret survive a write.
+- **Write-back cache:** metadata and data go through a block cache (4 MiB per volume). A kernel thread writes dirty blocks every 5 seconds; `sync`, `fsync`, `poweroff` and `reboot` write everything.
+- **Clean flag:** the superblock is marked clean only at shutdown, like an unmount on Linux, so `e2fsck` checks a volume that was not shut down cleanly.
+- **Untrusted disk:** nothing on it is trusted. Block numbers are range-checked before any I/O, and directory records are validated. A corrupt structure gives `EIO`, not a kernel fault.
+- **Free blocks:** new blocks come zeroed, so no stale data reaches a file, and an unlinked file that is still open keeps its blocks until the last close.
+
+**VFS** (`fs/vfs.c`):
+- **Names and links:** symbolic links (at most 40 per lookup, then `ELOOP`), 255-byte names and 1023-byte paths.
+- **`*at` calls:** they take real directory descriptors (`AT_FDCWD`, `AT_EMPTY_PATH`, `AT_SYMLINK_NOFOLLOW`/`FOLLOW`, `AT_REMOVEDIR`, `RENAME_NOREPLACE`).
+- **Operations:** `O_NOFOLLOW`, `O_PATH`, hard links, `statfs`, and `chown`/`chmod`/`utimensat` on every kind of path.
+- **File system interface:** a disk file system plugs in through `create`/`link`/`remove`/`rename`/`setattr`/`readlink`/`evict` hooks and a per-mount `sync` and `statfs`.
+- **Directory offsets:** `getdents` offsets are stable per entry, so a program that deletes entries while reading a directory (`rm -r`) sees each of them once.
+
+**Tests:**
+- `fstest` (in `/bin` on the root volume) runs 45 checks:
+  - files in every block-map class, sparse files, truncation, `O_APPEND`;
+  - fast and slow symbolic links, link loops, `O_NOFOLLOW`;
+  - hard links, renames of files and directories (and `..`), 400-entry directories;
+  - unlinked open files, `chmod`/`chown`;
+  - free space returning exactly to where it started.
+- `fstest -r` writes files, restarts the machine, and checks them after the reboot.
+- After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
+
+**Not yet:**
+- Shared writable `mmap` of disk files (read-only shared mappings work).
+- ext4 extents.
+- Device nodes, FIFOs and sockets on disk (`/dev` is devfs).
+- `mount(2)` for other volumes.
+
 ## Memory map at boot
 
 | Range | Use |
@@ -853,7 +913,7 @@ Together with `libctest`, `proctest`, `ptytest`, `socktest` and the shell script
 Phase 1 (foundations for real applications) is done: user mode with fault-safe user access, demand-paged copy-on-write memory with W^X and NX, dynamic linking, threads and futexes, epoll and the other event descriptors, descriptor passing, and SMP. Next, in order:
 
 1. **Finer kernel locking:** split the big kernel lock (scheduler run queue, memory manager, VFS, sockets), so system-call-heavy programs scale across CPUs.
-2. **A writable file system** (ext2 or FAT) on the block layer, next to the read-only tarfs, and symbolic links.
+2. **A writable file system**: done for ext2, with symbolic links and the root on disk (see above). Next: ext4 extents, a page cache (shared writable mappings of disk files), `mount(2)`.
 3. **Networking:** a TCP/IP stack and a NIC driver (virtio-net, Intel e1000), which a browser needs.
 4. **Job control** (stop/continue signals, `SIGTSTP`/`SIGCONT` on the terminal).
 5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.

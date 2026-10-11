@@ -44,6 +44,8 @@ void vfs_node_add(struct vnode *dir, struct vnode *child)
 {
     child->parent = dir;
     child->sibling = NULL;
+    if (dir->dnext < 2) dir->dnext = 2;                 /* 0 and 1 are "." and ".." */
+    child->dpos = dir->dnext++;                         /* stable while others come and go */
     struct vnode **pp = &dir->children;         /* append: keeps creation order */
     while (*pp) pp = &(*pp)->sibling;
     *pp = child;
@@ -109,51 +111,98 @@ static struct vnode *child_named(struct vnode *dir, const char *name)
     return NULL;
 }
 
-/* Resolve `path`. If `parent_out` is non-NULL, resolve everything except
- * the final component, return the parent directory and copy the final
- * component into `last` (VFS_NAME_MAX bytes). */
-static int walk(const char *path, struct vnode **out, struct vnode **parent_out, char *last)
+/* The target of symbolic link vn into buf (NUL-terminated); its length. */
+static int link_target(struct vnode *vn, char *buf, size_t size)
 {
-    if (!path || !*path) return -ENOENT;
-    if (strlen(path) >= VFS_PATH_MAX) return -ENAMETOOLONG;
-
-    char buf[VFS_PATH_MAX];
-    strlcpy(buf, path, sizeof buf);
-    struct vnode *vn = path[0] == '/' ? root : cwd_node();
-
-    /* split into components first so we know which one is last */
-    char *comps[64]; int n = 0; char *save;
-    for (char *tok = strtok_r(buf, "/", &save); tok && n < 64; tok = strtok_r(NULL, "/", &save))
-        comps[n++] = tok;
-
-    int stop = parent_out ? n - 1 : n;
-    for (int i = 0; i < stop; i++) {
-        if (vn->type != VDIR) return -ENOTDIR;
-        if (strcmp(comps[i], ".") == 0) continue;
-        if (strcmp(comps[i], "..") == 0) { vn = vn->parent ? vn->parent : root; continue; }
-        if (strlen(comps[i]) >= VFS_NAME_MAX) return -ENAMETOOLONG;
-        struct vnode *c = child_named(vn, comps[i]);
-        if (!c) return -ENOENT;
-        vn = c;
-    }
-    if (parent_out) {
-        if (n == 0) return -EEXIST;                 /* path was "/" */
-        if (vn->type != VDIR) return -ENOTDIR;
-        if (strlen(comps[n - 1]) >= VFS_NAME_MAX) return -ENAMETOOLONG;
-        *parent_out = vn;
-        strlcpy(last, comps[n - 1], VFS_NAME_MAX);
-        return 0;
-    }
-    *out = vn;
-    return 0;
+    if (vn->type != VLNK || !vn->ops || !vn->ops->readlink) return -EINVAL;
+    int n = vn->ops->readlink(vn, buf, size - 1);
+    if (n < 0) return n;
+    buf[n] = 0;
+    return n;
 }
 
-int vfs_lookup(const char *path, struct vnode **out) { return walk(path, out, NULL, NULL); }
+#define WALK_FOLLOW 1           /* follow a symbolic link in the last component */
+#define WALK_PARENT 2           /* stop before the last component, return its name */
+
+/* Resolve `path` from `base` (NULL: the cwd). WALK_PARENT: return the
+ * directory holding the last component in *out and copy that component into
+ * `last` (VFS_NAME_MAX bytes); the last component itself is not looked up.
+ * Symbolic links in the middle of the path are always followed: the rest of
+ * the path is appended to the link's target and the walk goes on from "/"
+ * or from the link's directory. */
+static int walk(struct vnode *base, const char *path, int flags, struct vnode **out, char *last)
+{
+    if (!path || !*path) return -ENOENT;
+    size_t plen = strlen(path);
+    if (plen >= VFS_PATH_MAX) return -ENAMETOOLONG;
+    const size_t cap = 2 * VFS_PATH_MAX;
+    char *buf = kmalloc(cap), *tmp = kmalloc(cap);
+    int r = 0;
+    if (!buf || !tmp) { r = -ENOMEM; goto out; }
+    memcpy(buf, path, plen + 1);
+    char *p = buf;
+    struct vnode *vn = path[0] == '/' ? root : (base ? base : cwd_node());
+    int links = 0;
+    for (;;) {
+        while (*p == '/') p++;
+        if (!*p) {                                      /* no component left */
+            if (flags & WALK_PARENT) { r = -EEXIST; goto out; }    /* the path was "/" */
+            *out = vn;
+            goto out;
+        }
+        char *e = p;
+        while (*e && *e != '/') e++;
+        size_t clen = (size_t)(e - p);
+        if (clen >= VFS_NAME_MAX) { r = -ENAMETOOLONG; goto out; }
+        char comp[VFS_NAME_MAX];
+        memcpy(comp, p, clen);
+        comp[clen] = 0;
+        bool is_last = true;
+        for (char *q = e; *q; q++) if (*q != '/') { is_last = false; break; }
+        bool slash = *e == '/';                         /* "name/": must be a directory */
+        if (vn->type != VDIR) { r = -ENOTDIR; goto out; }
+        if (is_last && (flags & WALK_PARENT)) {
+            *out = vn;
+            memcpy(last, comp, clen + 1);
+            goto out;
+        }
+        if (!strcmp(comp, ".")) { p = e; continue; }
+        if (!strcmp(comp, "..")) { vn = vn->parent ? vn->parent : root; p = e; continue; }
+        struct vnode *c = child_named(vn, comp);
+        if (!c) { r = -ENOENT; goto out; }
+        if (c->type == VLNK && (!is_last || slash || (flags & WALK_FOLLOW))) {
+            if (++links > VFS_MAX_SYMLINKS) { r = -ELOOP; goto out; }
+            int tl = link_target(c, tmp, VFS_PATH_MAX);
+            if (tl < 0) { r = tl; goto out; }
+            if (tl == 0) { r = -ENOENT; goto out; }
+            size_t rl = strlen(e);
+            if ((size_t)tl + rl + 1 > cap) { r = -ENAMETOOLONG; goto out; }
+            memcpy(tmp + tl, e, rl + 1);                /* target + the rest of the path */
+            char *sw = buf; buf = tmp; tmp = sw;
+            p = buf;
+            if (*p == '/') vn = root;                   /* else: from the link's directory */
+            continue;
+        }
+        vn = c;
+        p = e;
+    }
+out:
+    kfree(buf);
+    kfree(tmp);
+    return r;
+}
+
+int vfs_lookup_at(struct vnode *base, const char *path, bool follow, struct vnode **out)
+{
+    return walk(base, path, follow ? WALK_FOLLOW : 0, out, NULL);
+}
+
+int vfs_lookup(const char *path, struct vnode **out) { return walk(NULL, path, WALK_FOLLOW, out, NULL); }
 
 int vfs_path_of(struct vnode *vn, char *buf, size_t size)
 {
-    const char *parts[64]; int n = 0;
-    while (vn && vn != root && n < 64) { parts[n++] = vn->name; vn = vn->parent; }
+    const char *parts[128]; int n = 0;
+    while (vn && vn != root && n < 128) { parts[n++] = vn->name; vn = vn->parent; }
     size_t pos = 0;
     if (n == 0) { if (size < 2) return -ERANGE; strlcpy(buf, "/", size); return 0; }
     buf[0] = 0;
@@ -173,18 +222,72 @@ static int check_writable_dir(struct vnode *dir)
     return 0;
 }
 
-int vfs_mkdir(const char *path, mode_t mode)
+static const struct vnode_ops ramfs_link_ops;
+
+/* A new entry `name` in `dir`: through the file system's create operation
+ * if it has one, else an in-memory node. Owned by the caller's uid/gid. */
+static int create_node(struct vnode *dir, const char *name, enum vtype t, uint32_t mode, const char *target,
+                       struct vnode **out)
 {
-    struct vnode *parent; char name[VFS_NAME_MAX];
-    int r = walk(path, NULL, &parent, name);
+    int r = check_writable_dir(dir);
+    if (r < 0) return r;
+    struct tcb *self = current_task();
+    struct vnode *vn = NULL;
+    if (dir->ops && dir->ops->create) {
+        if ((r = dir->ops->create(dir, name, t, mode, target, &vn)) < 0) return r;
+    } else {
+        vn = vfs_node_new(dir->fs, name, t, mode & 07777, t == VLNK ? &ramfs_link_ops : &ramfs_ops);
+        if (!vn) return -ENOMEM;
+        if (t == VLNK) {
+            vn->mode = S_IFLNK | 0777;
+            if (!(vn->data = kstrdup(target))) { kfree(vn); return -ENOMEM; }
+            vn->size = strlen(target);
+        }
+        if (self) { vn->uid = self->uid; vn->gid = self->gid; }
+    }
+    strlcpy(vn->name, name, sizeof vn->name);
+    vfs_node_add(dir, vn);
+    *out = vn;
+    return 0;
+}
+
+static int setattr(struct vnode *vn)
+{
+    vn->ctime = (uint64_t)time_realtime_sec();
+    return vn->ops && vn->ops->setattr ? vn->ops->setattr(vn) : 0;
+}
+
+int vfs_mkdir_at(struct vnode *base, const char *path, mode_t mode)
+{
+    struct vnode *parent, *d; char name[VFS_NAME_MAX];
+    int r = walk(base, path, WALK_PARENT, &parent, name);
     if (r < 0) return r;
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return -EEXIST;
     if (child_named(parent, name)) return -EEXIST;
-    if ((r = check_writable_dir(parent)) < 0) return r;
-    struct vnode *d = vfs_node_new(parent->fs, name, VDIR, mode & 0777, &ramfs_ops);
-    if (!d) return -ENOMEM;
-    vfs_node_add(parent, d);
-    return 0;
+    struct tcb *t = current_task();
+    return create_node(parent, name, VDIR, mode & 07777 & ~(t && t->fs ? t->fs->umask : 022), NULL, &d);
+}
+
+int vfs_mkdir(const char *path, mode_t mode) { return vfs_mkdir_at(NULL, path, mode); }
+
+int vfs_symlink_at(const char *target, struct vnode *base, const char *path)
+{
+    struct vnode *parent, *l; char name[VFS_NAME_MAX];
+    if (!target || !*target) return -ENOENT;
+    if (strlen(target) >= VFS_PATH_MAX) return -ENAMETOOLONG;
+    int r = walk(base, path, WALK_PARENT, &parent, name);
+    if (r < 0) return r;
+    if (!strcmp(name, ".") || !strcmp(name, "..") || child_named(parent, name)) return -EEXIST;
+    return create_node(parent, name, VLNK, 0777, target, &l);
+}
+
+int vfs_readlink_at(struct vnode *base, const char *path, char *buf, size_t size)
+{
+    struct vnode *vn;
+    int r = walk(base, path, 0, &vn, NULL);
+    if (r < 0) return r;
+    if (vn->type != VLNK || !vn->ops || !vn->ops->readlink) return -EINVAL;
+    return vn->ops->readlink(vn, buf, size);
 }
 
 /* A socket's name in the file system: a node with no operations that
@@ -192,13 +295,13 @@ int vfs_mkdir(const char *path, mode_t mode)
 int vfs_mksock(const char *path, mode_t mode, struct vnode **out)
 {
     struct vnode *parent; char name[VFS_NAME_MAX];
-    int r = walk(path, NULL, &parent, name);
+    int r = walk(NULL, path, WALK_PARENT, &parent, name);
     if (r < 0) return r;
     if (child_named(parent, name)) return -EADDRINUSE;
     if ((r = check_writable_dir(parent)) < 0) return r;
     struct vnode *s = vfs_node_new(parent->fs, name, VSOCK, mode & 0777, NULL);
     if (!s) return -ENOMEM;
-    vfs_node_add(parent, s);
+    vfs_node_add(parent, s);                            /* in memory only, also on a disk */
     *out = s;
     return 0;
 }
@@ -206,6 +309,7 @@ int vfs_mksock(const char *path, mode_t mode, struct vnode **out)
 /* Find the entry `name` in `dir` (the covered node, not a mount root). */
 static struct vnode *entry_named(struct vnode *dir, const char *name)
 {
+    if (dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
     for (struct vnode *c = dir->children; c; c = c->sibling)
         if (strcmp(c->name, name) == 0) return c;
     return NULL;
@@ -213,7 +317,9 @@ static struct vnode *entry_named(struct vnode *dir, const char *name)
 
 static void node_destroy(struct vnode *vn)
 {
+    if (vn->ops && vn->ops->evict) vn->ops->evict(vn);
     if (vn->ops == &ramfs_ops && vn->type == VREG && vn->data) vmobj_put(vn->data);
+    if (vn->ops == &ramfs_link_ops) kfree(vn->data);
     kfree(vn);
 }
 
@@ -228,26 +334,37 @@ static void node_free(struct vnode *vn)
     if (now) node_destroy(vn);
 }
 
-/* unlink(2): files and devices only */
-int vfs_unlink(const char *path)
+static int remove_node(struct vnode *dir, struct vnode *vn)
+{
+    if (dir->ops && dir->ops->remove) {
+        int r = dir->ops->remove(dir, vn);
+        if (r < 0) return r;
+    }
+    node_remove(dir, vn);
+    node_free(vn);
+    return 0;
+}
+
+/* unlink(2): anything but directories (symbolic links themselves) */
+int vfs_unlink_at(struct vnode *base, const char *path)
 {
     struct vnode *parent; char name[VFS_NAME_MAX];
-    int r = walk(path, NULL, &parent, name);
+    int r = walk(base, path, WALK_PARENT, &parent, name);
     if (r < 0) return r;
     struct vnode *vn = entry_named(parent, name);
     if (!vn) return -ENOENT;
     if (vn->type == VDIR) return -EISDIR;
     if ((r = check_writable_dir(parent)) < 0) return r;
-    node_remove(parent, vn);
-    node_free(vn);
-    return 0;
+    return remove_node(parent, vn);
 }
 
+int vfs_unlink(const char *path) { return vfs_unlink_at(NULL, path); }
+
 /* rmdir(2): empty directories only, never a mount point or "." */
-int vfs_rmdir(const char *path)
+int vfs_rmdir_at(struct vnode *base, const char *path)
 {
     struct vnode *parent; char name[VFS_NAME_MAX];
-    int r = walk(path, NULL, &parent, name);
+    int r = walk(base, path, WALK_PARENT, &parent, name);
     if (r < 0) return r;
     if (!strcmp(name, ".")) return -EINVAL;
     if (!strcmp(name, "..")) return -ENOTEMPTY;
@@ -255,22 +372,24 @@ int vfs_rmdir(const char *path)
     if (!vn) return -ENOENT;
     if (vn->type != VDIR) return -ENOTDIR;
     if (vn->mounted) return -EBUSY;
+    if (vn->ops && vn->ops->refresh) vn->ops->refresh(vn);
     if (vn->children) return -ENOTEMPTY;
     if ((r = check_writable_dir(parent)) < 0) return r;
     struct tcb *t = current_task();
+    if ((r = remove_node(parent, vn)) < 0) return r;
     if (t && t->fs && t->fs->cwd == vn) t->fs->cwd = parent;    /* don't leave a dangling cwd */
-    node_remove(parent, vn);
-    node_free(vn);
     return 0;
 }
 
+int vfs_rmdir(const char *path) { return vfs_rmdir_at(NULL, path); }
+
 /* rename(2) within one mounted file system; -EXDEV across mounts. */
-int vfs_rename(const char *from, const char *to)
+int vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, const char *to)
 {
     struct vnode *op, *np; char oname[VFS_NAME_MAX], nname[VFS_NAME_MAX];
-    int r = walk(from, NULL, &op, oname);
+    int r = walk(obase, from, WALK_PARENT, &op, oname);
     if (r < 0) return r;
-    if ((r = walk(to, NULL, &np, nname)) < 0) return r;
+    if ((r = walk(nbase, to, WALK_PARENT, &np, nname)) < 0) return r;
     if (!strcmp(oname, ".") || !strcmp(oname, "..") || !strcmp(nname, ".") || !strcmp(nname, "..")) return -EINVAL;
     struct vnode *vn = entry_named(op, oname);
     if (!vn) return -ENOENT;
@@ -287,51 +406,94 @@ int vfs_rename(const char *from, const char *to)
         if (old->mounted) return -EBUSY;
         if (old->type == VDIR && vn->type != VDIR) return -EISDIR;
         if (old->type != VDIR && vn->type == VDIR) return -ENOTDIR;
-        if (old->type == VDIR && old->children) return -ENOTEMPTY;
-        node_remove(np, old);
-        node_free(old);
+        if (old->type == VDIR) {
+            if (old->ops && old->ops->refresh) old->ops->refresh(old);
+            if (old->children) return -ENOTEMPTY;
+        }
     }
+    if (op->ops && op->ops->rename && (r = op->ops->rename(op, vn, np, nname, old)) < 0) return r;
+    if (old) { node_remove(np, old); node_free(old); }
     node_remove(op, vn);
     strlcpy(vn->name, nname, sizeof vn->name);
     vfs_node_add(np, vn);
     return 0;
 }
 
-static int attr_target(const char *path, struct vnode **out)
+int vfs_rename(const char *from, const char *to) { return vfs_rename_at(NULL, from, NULL, to); }
+
+/* link(2): a second name for a file, on file systems that have it. */
+int vfs_link_at(struct vnode *obase, const char *from, bool follow, struct vnode *nbase, const char *to)
 {
-    int r = vfs_lookup(path, out);
+    struct vnode *vn, *parent, *nv; char name[VFS_NAME_MAX];
+    int r = walk(obase, from, follow ? WALK_FOLLOW : 0, &vn, NULL);
+    if (r < 0) return r;
+    if (vn->type == VDIR) return -EPERM;
+    if ((r = walk(nbase, to, WALK_PARENT, &parent, name)) < 0) return r;
+    if (!strcmp(name, ".") || !strcmp(name, "..") || child_named(parent, name)) return -EEXIST;
+    if (parent->fs != vn->fs) return -EXDEV;
+    if ((r = check_writable_dir(parent)) < 0) return r;
+    if (!parent->ops || !parent->ops->link) return -EPERM;  /* the in-memory tree: one name per node */
+    if ((r = parent->ops->link(parent, name, vn, &nv)) < 0) return r;
+    strlcpy(nv->name, name, sizeof nv->name);
+    vfs_node_add(parent, nv);
+    return 0;
+}
+
+static int attr_target(struct vnode *base, const char *path, bool follow, struct vnode **out)
+{
+    int r = walk(base, path, follow ? WALK_FOLLOW : 0, out, NULL);
     if (r < 0) return r;
     if ((*out)->fs && ((*out)->fs->flags & MNT_RDONLY)) return -EROFS;
     return 0;
 }
 
-int vfs_chmod(const char *path, mode_t mode)
+int vfs_chmod_vn(struct vnode *vn, mode_t mode)
 {
-    struct vnode *vn;
-    int r = attr_target(path, &vn);
-    if (r < 0) return r;
+    if (vn->fs && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
+    if (vn->type == VLNK) return -EOPNOTSUPP;
     vn->mode = (vn->mode & ~07777u) | (mode & 07777u);
-    return 0;
+    return setattr(vn);
 }
 
-int vfs_chown(const char *path, int uid, int gid)
+int vfs_chown_vn(struct vnode *vn, int uid, int gid)
 {
-    struct vnode *vn;
-    int r = attr_target(path, &vn);
-    if (r < 0) return r;
+    if (vn->fs && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
     if (uid != -1) vn->uid = (uint32_t)uid;
     if (gid != -1) vn->gid = (uint32_t)gid;
-    return 0;
+    return setattr(vn);
 }
 
-int vfs_utime(const char *path, int64_t mtime)
+int vfs_utime_vn(struct vnode *vn, int64_t mtime)
+{
+    if (vn->fs && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
+    vn->mtime = (uint64_t)(mtime < 0 ? time_realtime_sec() : mtime);
+    return setattr(vn);
+}
+
+int vfs_chmod_at(struct vnode *base, const char *path, bool follow, mode_t mode)
 {
     struct vnode *vn;
-    int r = attr_target(path, &vn);
-    if (r < 0) return r;
-    vn->mtime = (uint64_t)(mtime < 0 ? time_realtime_sec() : mtime);
-    return 0;
+    int r = attr_target(base, path, follow, &vn);
+    return r < 0 ? r : vfs_chmod_vn(vn, mode);
 }
+
+int vfs_chown_at(struct vnode *base, const char *path, bool follow, int uid, int gid)
+{
+    struct vnode *vn;
+    int r = attr_target(base, path, follow, &vn);
+    return r < 0 ? r : vfs_chown_vn(vn, uid, gid);
+}
+
+int vfs_utime_at(struct vnode *base, const char *path, bool follow, int64_t mtime)
+{
+    struct vnode *vn;
+    int r = attr_target(base, path, follow, &vn);
+    return r < 0 ? r : vfs_utime_vn(vn, mtime);
+}
+
+int vfs_chmod(const char *path, mode_t mode) { return vfs_chmod_at(NULL, path, true, mode); }
+int vfs_chown(const char *path, int uid, int gid) { return vfs_chown_at(NULL, path, true, uid, gid); }
+int vfs_utime(const char *path, int64_t mtime) { return vfs_utime_at(NULL, path, true, mtime); }
 
 static uint64_t node_size(struct vnode *vn)
 {
@@ -339,30 +501,35 @@ static uint64_t node_size(struct vnode *vn)
     return vn->ops && vn->ops->size ? vn->ops->size(vn) : vn->size;
 }
 
-static void fill_stat(struct vnode *vn, struct stat *st)
+void vfs_fill_stat(struct vnode *vn, struct stat *st)
 {
+    if (vn->ops && vn->ops->getattr) vn->ops->getattr(vn);
     memset(st, 0, sizeof *st);
     st->st_dev = vn->fs ? vn->fs->dev : 0;
     st->st_ino = vn->ino;
-    st->st_nlink = vn->type == VDIR ? 2 : 1;
+    st->st_nlink = vn->nlink ? vn->nlink : vn->type == VDIR ? 2 : 1;
     st->st_mode = vn->mode;
     st->st_uid = vn->uid;
     st->st_gid = vn->gid;
     st->st_rdev = vn->rdev;
     st->st_size = (int64_t)node_size(vn);
     st->st_blksize = 4096;
-    st->st_blocks = (st->st_size + 511) / 512;
-    st->st_mtim.tv_sec = st->st_ctim.tv_sec = st->st_atim.tv_sec = (int64_t)vn->mtime;
+    st->st_blocks = vn->blocks ? (int64_t)vn->blocks : (st->st_size + 511) / 512;
+    st->st_mtim.tv_sec = (int64_t)vn->mtime;
+    st->st_atim.tv_sec = (int64_t)(vn->atime ? vn->atime : vn->mtime);
+    st->st_ctim.tv_sec = (int64_t)(vn->ctime ? vn->ctime : vn->mtime);
 }
 
-int vfs_stat(const char *path, struct stat *st)
+int vfs_stat_at(struct vnode *base, const char *path, bool follow, struct stat *st)
 {
     struct vnode *vn;
-    int r = vfs_lookup(path, &vn);
+    int r = walk(base, path, follow ? WALK_FOLLOW : 0, &vn, NULL);
     if (r < 0) return r;
-    fill_stat(vn, st);
+    vfs_fill_stat(vn, st);
     return 0;
 }
+
+int vfs_stat(const char *path, struct stat *st) { return vfs_stat_at(NULL, path, true, st); }
 
 int vfs_chdir(const char *path)
 {
@@ -376,25 +543,45 @@ int vfs_chdir(const char *path)
 
 int vfs_getcwd(char *buf, size_t size) { return vfs_path_of(cwd_node(), buf, size); }
 
+int vfs_statfs(struct vnode *vn, struct kstatfs *st)
+{
+    memset(st, 0, sizeof *st);
+    struct mount *m = vn->fs;
+    st->f_bsize = st->f_frsize = 4096;
+    st->f_namelen = VFS_NAME_MAX - 1;
+    st->f_type = 0x858458f6;                            /* RAMFS_MAGIC unless the fs says else */
+    if (m) { st->f_fsid[0] = (int32_t)m->dev; if (m->flags & MNT_RDONLY) st->f_flags |= 1; }
+    if (m && m->statfs) return m->statfs(m, st);
+    st->f_blocks = st->f_bfree = st->f_bavail = pmm_free_bytes() / 4096;   /* memory is the limit */
+    return 0;
+}
+
+void vfs_sync_all(bool final)
+{
+    for (struct mount *m = mounts; m; m = m->next)
+        if (m->sync && strcmp(m->fstype, "bind")) m->sync(m, final);
+}
+
 /* ======================================================================= */
 /*  open file objects                                                        */
 /* ======================================================================= */
 
-int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
+int vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, struct file **out)
 {
     struct vnode *vn;
-    int r = vfs_lookup(path, &vn);
+    bool follow = !(flags & O_NOFOLLOW);
+    int r = walk(base, path, follow ? WALK_FOLLOW : 0, &vn, NULL);
     bool created = false;
 
     if (r == -ENOENT && (flags & O_CREAT)) {
-        created = true;
         struct vnode *parent; char name[VFS_NAME_MAX];
-        if ((r = walk(path, NULL, &parent, name)) < 0) return r;
-        if ((r = check_writable_dir(parent)) < 0) return r;
+        if ((r = walk(base, path, WALK_PARENT, &parent, name)) < 0) return r;
+        if (!strcmp(name, ".") || !strcmp(name, "..")) return -EISDIR;
+        if (entry_named(parent, name)) return -EEXIST;  /* a dangling symlink: not followed */
         struct tcb *t = current_task();
-        vn = vfs_node_new(parent->fs, name, VREG, mode & ~(t && t->fs ? t->fs->umask : 022) & 0777, &ramfs_ops);
-        if (!vn) return -ENOMEM;
-        vfs_node_add(parent, vn);
+        if ((r = create_node(parent, name, VREG, mode & 07777 & ~(t && t->fs ? t->fs->umask : 022), NULL, &vn)) < 0)
+            return r;
+        created = true;
     } else if (r < 0) {
         return r;
     } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
@@ -402,17 +589,26 @@ int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
     }
 
     int acc = flags & O_ACCMODE;
-    if (vn->type == VSOCK) return -ENXIO;                   /* sockets are connect()ed, not opened */
+    if (vn->type == VLNK && !(flags & O_PATH)) return -ELOOP;  /* O_NOFOLLOW on a link */
+    if (vn->type == VSOCK && !(flags & O_PATH)) return -ENXIO;  /* sockets are connect()ed, not opened */
     if (vn->type == VDIR && acc != O_RDONLY) return -EISDIR;
     if ((flags & O_DIRECTORY) && vn->type != VDIR) return -ENOTDIR;
+    if (flags & O_PATH) {                               /* a handle on the node only */
+        struct file *f = vfs_file_new(vn, O_PATH | (flags & O_CLOEXEC));
+        if (!f) return -ENOMEM;
+        *out = f;
+        return 0;
+    }
     if (acc != O_RDONLY && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
     /* POSIX: the creating open gets the access it asked for whatever the new
      * mode says; root (uid 0) is not limited by permission bits. */
     struct tcb *self = current_task();
     if (acc != O_RDONLY && !(vn->mode & 0222) && !created && self && self->uid != 0) return -EACCES;
 
-    if ((flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops && vn->ops->truncate)
-        vn->ops->truncate(vn, 0);
+    if ((flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops && vn->ops->truncate) {
+        if ((r = vn->ops->truncate(vn, 0)) < 0) return r;
+        vn->mtime = (uint64_t)time_realtime_sec();
+    }
     if (vn->ops && vn->ops->open) {
         int r2 = vn->ops->open(vn, flags, out);
         if (r2 == 0 && (*out)->vn) __atomic_add_fetch(&(*out)->vn->refs, 1, __ATOMIC_ACQ_REL);
@@ -425,6 +621,11 @@ int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
     __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
     *out = f;
     return 0;
+}
+
+int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
+{
+    return vfs_open_at(NULL, path, flags, mode, out);
 }
 
 ssize_t vfs_read(struct file *f, void *buf, size_t len)
@@ -480,7 +681,14 @@ off_t vfs_lseek(struct file *f, off_t off, int whence)
 
 static uint8_t dtype(struct vnode *vn)
 {
-    return vn->type == VDIR ? DT_DIR : vn->type == VCHR ? DT_CHR : vn->type == VREG ? DT_REG : DT_UNKNOWN;
+    switch (vn->type) {
+    case VDIR:  return DT_DIR;
+    case VCHR:  return DT_CHR;
+    case VREG:  return DT_REG;
+    case VLNK:  return DT_LNK;
+    case VSOCK: return DT_SOCK;
+    default:    return DT_UNKNOWN;
+    }
 }
 
 /* getdents64: f->off is the index of the next entry ("." = 0, ".." = 1) */
@@ -491,15 +699,18 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
     if (f->off == 0 && dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
     size_t pos = 0;
     for (;;) {
-        uint64_t idx = f->off;
+        /* f->off is the dpos of the next entry to return: entries removed
+         * or added meanwhile do not make readers skip or repeat others
+         * (rm -r deletes while it reads) */
+        uint64_t idx = f->off, next;
         const char *name; struct vnode *vn;
-        if (idx == 0)      { name = ".";  vn = dir; }
-        else if (idx == 1) { name = ".."; vn = dir->parent ? dir->parent : dir; }
+        if (idx == 0)      { name = ".";  vn = dir; next = 1; }
+        else if (idx == 1) { name = ".."; vn = dir->parent ? dir->parent : dir; next = 2; }
         else {
-            vn = dir->children;
-            for (uint64_t i = 2; vn && i < idx; i++) vn = vn->sibling;
+            for (vn = dir->children; vn && vn->dpos < idx; vn = vn->sibling) {}
             if (!vn) break;
             name = vn->name;
+            next = vn->dpos + 1;
         }
         size_t nlen = strlen(name);
         size_t reclen = (offsetof(struct linux_dirent64, d_name) + nlen + 1 + 7) & ~(size_t)7;
@@ -507,12 +718,12 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
         struct linux_dirent64 *d = (struct linux_dirent64 *)((uint8_t *)buf + pos);
         struct vnode *shown = vn->mounted ? vn->mounted : vn;
         d->d_ino = shown->ino;
-        d->d_off = (int64_t)idx + 1;
+        d->d_off = (int64_t)next;
         d->d_reclen = (uint16_t)reclen;
         d->d_type = dtype(shown);
         memcpy(d->d_name, name, nlen + 1);
         pos += reclen;
-        f->off++;
+        f->off = next;
     }
     return (int)pos;
 }
@@ -524,7 +735,7 @@ int vfs_ioctl(struct file *f, unsigned long req, void *arg)
     return f->vn->ops->ioctl(f->vn, req, arg);
 }
 
-int vfs_fstat(struct file *f, struct stat *st) { fill_stat(f->vn, st); return 0; }
+int vfs_fstat(struct file *f, struct stat *st) { vfs_fill_stat(f->vn, st); return 0; }
 
 /* Reference counts change with locked instructions: descriptors are shared
  * between threads, duplicated by dup/fork and carried in SCM_RIGHTS
@@ -617,6 +828,17 @@ static int ramfs_truncate(struct vnode *vn, uint64_t size)
 
 const struct vnode_ops ramfs_ops = { .read = ramfs_read, .write = ramfs_write, .size = ramfs_size,
                                      .truncate = ramfs_truncate, .vmobject = ramfs_vmobject };
+
+/* in-memory symbolic links: the target string in vn->data */
+static int ramfs_readlink(struct vnode *vn, char *buf, size_t size)
+{
+    size_t n = strlen(vn->data);
+    if (n > size) n = size;
+    memcpy(buf, vn->data, n);
+    return (int)n;
+}
+
+static const struct vnode_ops ramfs_link_ops = { .readlink = ramfs_readlink };
 
 /* An open file on a ramfs node that is in no directory (memfd_create):
  * freed with its last close. */
@@ -728,6 +950,58 @@ int vfs_bind(const char *src, const char *dst)
     while (*pp) pp = &(*pp)->next;
     *pp = m;
     kprintf("vfs: bound %s on %s\n", src, dst);
+    return 0;
+}
+
+/* Make the file system `m` "/". Each mount whose mount point was a
+ * directory of the old root moves to the same path in the new one (the
+ * directory is made if the new root lacks it); a bind mount whose
+ * destination the new root already has is dropped (its own /bin wins over
+ * /boot/bin). Working directories in the old root move to the new one.
+ * The old root's nodes stay allocated: open files on them keep working. */
+int vfs_pivot_root(struct mount *m)
+{
+    struct mount *oldm = root->fs;
+    root = m->root;
+    root->parent = root;
+    m->covered = NULL;
+    strlcpy(m->path, "/", sizeof m->path);
+    for (struct mount **pp = &mounts; *pp; pp = &(*pp)->next)    /* the old root leaves the list */
+        if (*pp == oldm) { *pp = oldm->next; break; }
+    m->next = mounts;
+    mounts = m;
+    kprintf("vfs: %s is now the root file system\n", m->fstype);
+
+    for (struct mount **pp = &m->next; *pp;) {
+        struct mount *mt = *pp;
+        if (!mt->covered || mt->covered->fs != oldm) { pp = &mt->next; continue; }
+        bool bind = !strcmp(mt->fstype, "bind");
+        struct vnode *d;
+        int r = vfs_lookup(mt->path, &d);
+        if (r == 0 && bind) {
+            kprintf("vfs: %s: the new root has its own, bind dropped\n", mt->path);
+            goto drop;
+        }
+        if (r == -ENOENT && (r = vfs_mkdir(mt->path, 0755)) == 0) r = vfs_lookup(mt->path, &d);
+        if (r < 0 || d->type != VDIR || d->mounted || d == root) {
+            kprintf("vfs: %s cannot move to the new root (%d): no longer reachable\n", mt->path, r);
+            goto drop;
+        }
+        mt->covered->mounted = NULL;
+        d->mounted = mt->root;
+        mt->covered = d;
+        if (!bind) { mt->root->parent = d->parent; strlcpy(mt->root->name, d->name, sizeof mt->root->name); }
+        pp = &mt->next;
+        continue;
+drop:
+        mt->covered->mounted = NULL;
+        *pp = mt->next;
+        kfree(mt);
+    }
+    for (int i = 0; i < MAX_TASKS; i++) {               /* nothing may stay behind in the old tree */
+        struct tcb *t = task_slot(i);
+        if (t && t->fs && t->fs->cwd && t->fs->cwd->fs == oldm) t->fs->cwd = root;
+    }
     return 0;
 }
 

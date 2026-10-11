@@ -7,6 +7,8 @@ Layout (MBR, the default):
   LBA 1..     GRUB core.img (kernel + grub.cfg inside its memdisk)
   LBA 2048..  partition type 0x4B (option A): Kestrel volume header,
               then the ustar payload built from --rootfs
+  then        optional ext2 root file system (MBR type 0x83, from --root-img;
+              volume label "kestrel-root"), which the kernel makes "/"
   then        optional EFI System Partition (type 0xEF, from --esp-img) with
               EFI/BOOT/BOOTX64.EFI, so the same stick boots on UEFI machines
   after it    FAT16 partition "KESTREL RPT" (MBR type 0x0E, first table entry
@@ -193,6 +195,7 @@ def main():
     ap.add_argument("--corrupt-payload", action="store_true")
     ap.add_argument("--no-report", action="store_true", help="no FAT report volume")
     ap.add_argument("--esp-img", help="FAT image placed in an EFI System Partition (UEFI boot)")
+    ap.add_argument("--root-img", help="ext2 image placed in a Linux partition after the Kestrel volume")
     ap.add_argument("--ramdisk", action="store_true",
                     help="write only a small disk image holding the boot volume (sector-0 marker, header,"
                          " payload), for loading as a Multiboot2 module (the ISO)")
@@ -237,7 +240,16 @@ def main():
     esp_start = report_start - esp_sectors
     esp_start -= esp_start % 2048
     part_count = (esp_start if esp else report_start if report_sectors else end) - part_start
-    need = (PAYLOAD_OFFSET + len(payload)) // SECTOR
+    need = (PAYLOAD_OFFSET + len(payload) + SECTOR - 1) // SECTOR
+    rootimg = open(a.root_img, "rb").read() if a.root_img else b""
+    root_sectors = (len(rootimg) + SECTOR - 1) // SECTOR
+    root_start = 0
+    if rootimg:                                 # the Kestrel volume shrinks to its payload, the root follows
+        root_start = part_start + ((need + 2047) // 2048) * 2048
+        if root_start + root_sectors > part_start + part_count:
+            raise SystemExit(f"root image ({len(rootimg)} bytes) does not fit; use a larger --size")
+        part_count = root_start - part_start
+        img[root_start * SECTOR:root_start * SECTOR + len(rootimg)] = rootimg
     if need > part_count:
         raise SystemExit(f"payload ({len(payload)} bytes) does not fit; use a larger --size")
     if report_sectors:
@@ -267,6 +279,8 @@ def main():
     if a.layout == "mbr":
         ptype = 0x83 if a.plain_type else 0x4B
         entries = [mbr_entry(0x80, ptype, part_start, part_count)]
+        if rootimg:
+            entries.append(mbr_entry(0x00, 0x83, root_start, root_sectors))
         if esp:
             entries.insert(0, mbr_entry(0x00, 0xEF, esp_start, esp_sectors))
         if report_sectors:      # first entry: older Windows mounts only that one on removable media
@@ -278,6 +292,9 @@ def main():
         ktype = uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4").bytes_le if a.plain_type else GPT_TYPE
         parts = [(gpt_guid_bytes(BIOS_BOOT_GUID), uuid.uuid4().bytes_le, 34, part_start - 1, "BIOS boot")] if core else []
         parts.append((ktype, vol_uuid.bytes_le, part_start, part_start + part_count - 1, a.label))
+        if rootimg:
+            parts.append((uuid.UUID("0fc63daf-8483-4772-8e79-3d69d8477de4").bytes_le, uuid.uuid4().bytes_le,
+                          root_start, root_start + root_sectors - 1, "kestrel-root"))
         if esp:
             parts.append((ESP_GUID.bytes_le, uuid.uuid4().bytes_le, esp_start, esp_start + esp_sectors - 1, "EFI system"))
         if report_sectors:
@@ -291,6 +308,7 @@ def main():
     print(f"{a.out}: {a.size} MiB {a.layout.upper()}, GRUB core {core_sectors} sectors, "
           f"Kestrel partition at LBA {part_start} ({'0x83/linux' if a.plain_type else 'kestrel'} type), "
           f"payload {len(payload)} bytes crc {crc32(payload):08x}, uuid {vol_uuid}"
+          f"{f', ext2 root at LBA {root_start}' if rootimg else ''}"
           f"{f', ESP at LBA {esp_start}' if esp else ''}"
           f"{f', report volume at LBA {report_start}' if report_sectors else ''}"
           f"{', no sector-0 marker' if a.no_marker else ''}{', CORRUPTED payload' if a.corrupt_payload else ''}")

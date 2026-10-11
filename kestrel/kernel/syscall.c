@@ -215,32 +215,47 @@ static int64_t sys_pread64(uint64_t fd, uint64_t buf, uint64_t len, uint64_t off
 static int64_t sys_pwrite64(uint64_t fd, uint64_t buf, uint64_t len, uint64_t off, uint64_t a5, uint64_t a6)
 { (void)a5; (void)a6; return pio(fd, buf, len, (int64_t)off, true); }
 
-static int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode, uint64_t a4, uint64_t a5, uint64_t a6)
+#define AT_FDCWD            -100
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR        0x200
+#define AT_SYMLINK_FOLLOW   0x400
+#define AT_EMPTY_PATH       0x1000
+
+/* Where a *at call's relative path starts: NULL (the cwd) for AT_FDCWD or an
+ * absolute path, else the directory open as dirfd. Its file is held in
+ * *hold until the call is done (fput(hold); fput(NULL) is fine). */
+static int at_dir(int64_t dirfd, const char *p, struct vnode **base, struct file **hold)
 {
-    (void)a4; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
+    *base = NULL;
+    *hold = NULL;
+    if (p[0] == '/' || (int)dirfd == AT_FDCWD) return 0;
+    struct file *f = fget((int)dirfd);
+    if (!f) return -EBADF;
+    if (f->vn->type != VDIR) { fput(f); return -ENOTDIR; }
+    *base = f->vn;
+    *hold = f;
+    return 0;
+}
+
+/* Copy the path and find its starting directory: the start of every *at call. */
+#define AT_PATH(dirfd, upath)                                               \
+    char p[VFS_PATH_MAX]; struct vnode *base; struct file *hold;            \
+    { int r_ = get_path(upath, p); if (r_) return r_;                       \
+      if ((r_ = at_dir(dirfd, p, &base, &hold))) return r_; }
+
+static int64_t sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mode, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    AT_PATH(dirfd, path);
     struct file *f;
-    r = vfs_open(p, (int)flags, (mode_t)mode, &f);
+    int r = vfs_open_at(base, p, (int)flags, (mode_t)mode, &f);
+    fput(hold);
     if (r < 0) return r;
     return install(f, (flags & O_CLOEXEC) != 0);
 }
 
-#define AT_FDCWD   -100
-/* openat and the other *at calls: AT_FDCWD or absolute paths only. */
-static int64_t sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mode, uint64_t a5, uint64_t a6)
-{
-    (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
-    struct file *f;
-    r = vfs_open(p, (int)flags, (mode_t)mode, &f);
-    if (r < 0) return r;
-    return install(f, (flags & O_CLOEXEC) != 0);
-}
+static int64_t sys_open(uint64_t path, uint64_t flags, uint64_t mode, uint64_t a4, uint64_t a5, uint64_t a6)
+{ return sys_openat((uint64_t)(int64_t)AT_FDCWD, path, flags, mode, a4, a5 + 0 * a6); }
 
 static int64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
@@ -251,16 +266,11 @@ static int64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uin
     return 0;
 }
 
-static int64_t sys_stat(uint64_t path, uint64_t st, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+static int64_t put_stat(uint64_t ust, struct vnode *vn)
 {
-    (void)a3; (void)a4; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
     struct stat ks;
-    memset(&ks, 0, sizeof ks);
-    if ((r = vfs_stat(p, &ks)) < 0) return r;
-    return copy_to_user((void *)st, &ks, sizeof ks) ? -EFAULT : 0;
+    vfs_fill_stat(vn, &ks);
+    return copy_to_user((void *)ust, &ks, sizeof ks) ? -EFAULT : 0;
 }
 
 static int64_t sys_fstat(uint64_t fd, uint64_t st, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -268,29 +278,64 @@ static int64_t sys_fstat(uint64_t fd, uint64_t st, uint64_t a3, uint64_t a4, uin
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
-    struct stat ks;
-    memset(&ks, 0, sizeof ks);
-    int r = vfs_fstat(f, &ks);
+    int64_t r = put_stat(st, f->vn);
     fput(f);
-    if (r < 0) return r;
-    return copy_to_user((void *)st, &ks, sizeof ks) ? -EFAULT : 0;
+    return r;
 }
 
-/* newfstatat(dirfd, path, st, flags): AT_FDCWD, absolute paths, or
- * AT_EMPTY_PATH on a descriptor. */
-#define AT_EMPTY_PATH 0x1000
+/* newfstatat(dirfd, path, st, flags): AT_SYMLINK_NOFOLLOW, AT_EMPTY_PATH */
 static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t st, uint64_t flags, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
     char p[VFS_PATH_MAX];
     long n = strncpy_from_user(p, (const char *)path, sizeof p);
-    if (n < 0) return n;
+    if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
     if (n == 0) {
         if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
+        if ((int)dirfd == AT_FDCWD) { struct vnode *vn; int r = vfs_lookup(".", &vn); return r ? r : put_stat(st, vn); }
         return sys_fstat(dirfd, st, 0, 0, 0, 0);
     }
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
-    return sys_stat(path, st, 0, 0, 0, 0);
+    struct vnode *base, *vn; struct file *hold;
+    int r = at_dir((int64_t)dirfd, p, &base, &hold);
+    if (r) return r;
+    r = vfs_lookup_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), &vn);
+    int64_t ret = r ? r : put_stat(st, vn);
+    fput(hold);
+    return ret;
+}
+
+static int64_t sys_stat(uint64_t path, uint64_t st, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_newfstatat((uint64_t)(int64_t)AT_FDCWD, path, st, 0, 0, 0); }
+
+static int64_t sys_lstat(uint64_t path, uint64_t st, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_newfstatat((uint64_t)(int64_t)AT_FDCWD, path, st, AT_SYMLINK_NOFOLLOW, 0, 0); }
+
+static int64_t do_statfs(struct vnode *vn, uint64_t ubuf)
+{
+    struct kstatfs k;
+    int r = vfs_statfs(vn, &k);
+    if (r < 0) return r;
+    return copy_to_user((void *)ubuf, &k, sizeof k) ? -EFAULT : 0;
+}
+
+static int64_t sys_statfs(uint64_t path, uint64_t buf, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    char p[VFS_PATH_MAX];
+    struct vnode *vn;
+    int r = get_path(path, p);
+    if (!r) r = vfs_lookup(p, &vn);
+    return r ? r : do_statfs(vn, buf);
+}
+
+static int64_t sys_fstatfs(uint64_t fd, uint64_t buf, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int64_t r = do_statfs(f->vn, buf);
+    fput(f);
+    return r;
 }
 
 static int64_t sys_lseek(uint64_t fd, uint64_t off, uint64_t whence, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -377,80 +422,186 @@ static int64_t sys_getcwd(uint64_t buf, uint64_t size, uint64_t a3, uint64_t a4,
     return copy_to_user((void *)buf, k, n) ? -EFAULT : (int64_t)n;
 }
 
-#define PATH_CALL(name, expr)                                                       \
-static int64_t name(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6) \
-{                                                                                    \
-    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;                               \
-    char p[VFS_PATH_MAX];                                                            \
-    int r = get_path(path, p);                                                       \
-    return r ? r : (expr);                                                           \
-}
-PATH_CALL(sys_chdir, vfs_chdir(p))
-PATH_CALL(sys_mkdir, vfs_mkdir(p, (mode_t)a2))
-PATH_CALL(sys_unlink, vfs_unlink(p))
-PATH_CALL(sys_rmdir, vfs_rmdir(p))
-PATH_CALL(sys_chmod, vfs_chmod(p, (mode_t)a2))
-
-static int64_t sys_rename(uint64_t from, uint64_t to, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+static int64_t sys_chdir(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)a3; (void)a4; (void)a5; (void)a6;
-    char a[VFS_PATH_MAX], b[VFS_PATH_MAX];
-    int r = get_path(from, a);
-    if (!r) r = get_path(to, b);
-    return r ? r : vfs_rename(a, b);
-}
-
-static int64_t sys_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
-{
-    (void)a4; (void)a5; (void)a6;
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     char p[VFS_PATH_MAX];
     int r = get_path(path, p);
-    if (r) return r;
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
-    return (flags & 0x200) ? vfs_rmdir(p) : vfs_unlink(p);     /* AT_REMOVEDIR */
+    return r ? r : vfs_chdir(p);
+}
+
+static int64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int r = f->vn->type == VDIR ? 0 : -ENOTDIR;
+    if (!r && current_task()->fs) current_task()->fs->cwd = f->vn;
+    fput(f);
+    return r;
 }
 
 static int64_t sys_mkdirat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
-    return vfs_mkdir(p, (mode_t)mode);
+    AT_PATH(dirfd, path);
+    int r = vfs_mkdir_at(base, p, (mode_t)mode);
+    fput(hold);
+    return r;
 }
 
-/* Permission bits are not enforced on open files; accept and ignore. */
+static int64_t sys_mkdir(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_mkdirat((uint64_t)(int64_t)AT_FDCWD, path, mode, 0, 0, 0); }
+
+static int64_t sys_unlinkat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (flags & ~(uint64_t)AT_REMOVEDIR) return -EINVAL;
+    AT_PATH(dirfd, path);
+    int r = (flags & AT_REMOVEDIR) ? vfs_rmdir_at(base, p) : vfs_unlink_at(base, p);
+    fput(hold);
+    return r;
+}
+
+static int64_t sys_unlink(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return sys_unlinkat((uint64_t)(int64_t)AT_FDCWD, path, 0, 0, 0, 0); }
+
+static int64_t sys_rmdir(uint64_t path, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return sys_unlinkat((uint64_t)(int64_t)AT_FDCWD, path, AT_REMOVEDIR, 0, 0, 0); }
+
+/* renameat2(olddirfd, old, newdirfd, new, flags): RENAME_NOREPLACE (1);
+ * RENAME_EXCHANGE and RENAME_WHITEOUT are not supported. */
+static int64_t sys_renameat2(uint64_t odfd, uint64_t from, uint64_t ndfd, uint64_t to, uint64_t flags, uint64_t a6)
+{
+    (void)a6;
+    if (flags & ~1ull) return -EINVAL;
+    char a[VFS_PATH_MAX], b[VFS_PATH_MAX];
+    struct vnode *ob, *nb; struct file *oh, *nh;
+    int r = get_path(from, a);
+    if (!r) r = get_path(to, b);
+    if (r) return r;
+    if ((r = at_dir((int64_t)odfd, a, &ob, &oh))) return r;
+    if ((r = at_dir((int64_t)ndfd, b, &nb, &nh))) { fput(oh); return r; }
+    struct vnode *exists;
+    if ((flags & 1) && vfs_lookup_at(nb, b, false, &exists) == 0) r = -EEXIST;
+    else r = vfs_rename_at(ob, a, nb, b);
+    fput(oh);
+    fput(nh);
+    return r;
+}
+
+static int64_t sys_renameat(uint64_t odfd, uint64_t from, uint64_t ndfd, uint64_t to, uint64_t a5, uint64_t a6)
+{ (void)a5; (void)a6; return sys_renameat2(odfd, from, ndfd, to, 0, 0); }
+
+static int64_t sys_rename(uint64_t from, uint64_t to, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_renameat2((uint64_t)(int64_t)AT_FDCWD, from, (uint64_t)(int64_t)AT_FDCWD, to, 0, 0); }
+
+static int64_t sys_symlinkat(uint64_t target, uint64_t dirfd, uint64_t path, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    char t[VFS_PATH_MAX];
+    int r = get_path(target, t);
+    if (r) return r;
+    AT_PATH(dirfd, path);
+    r = vfs_symlink_at(t, base, p);
+    fput(hold);
+    return r;
+}
+
+static int64_t sys_symlink(uint64_t target, uint64_t path, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_symlinkat(target, (uint64_t)(int64_t)AT_FDCWD, path, 0, 0, 0); }
+
+static int64_t sys_linkat(uint64_t odfd, uint64_t from, uint64_t ndfd, uint64_t to, uint64_t flags, uint64_t a6)
+{
+    (void)a6;
+    if (flags & ~(uint64_t)(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH)) return -EINVAL;
+    char a[VFS_PATH_MAX], b[VFS_PATH_MAX];
+    struct vnode *ob, *nb; struct file *oh, *nh;
+    int r = get_path(from, a);
+    if (!r) r = get_path(to, b);
+    if (r) return r;
+    if ((r = at_dir((int64_t)odfd, a, &ob, &oh))) return r;
+    if ((r = at_dir((int64_t)ndfd, b, &nb, &nh))) { fput(oh); return r; }
+    r = vfs_link_at(ob, a, (flags & AT_SYMLINK_FOLLOW) != 0, nb, b);
+    fput(oh);
+    fput(nh);
+    return r;
+}
+
+static int64_t sys_link(uint64_t from, uint64_t to, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_linkat((uint64_t)(int64_t)AT_FDCWD, from, (uint64_t)(int64_t)AT_FDCWD, to, 0, 0); }
+
+static int64_t sys_fchmodat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    AT_PATH(dirfd, path);
+    int r = vfs_chmod_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), (mode_t)mode);
+    fput(hold);
+    return r;
+}
+
+static int64_t sys_chmod(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_fchmodat((uint64_t)(int64_t)AT_FDCWD, path, mode, 0, 0, 0); }
+
 static int64_t sys_fchmod(uint64_t fd, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
-    (void)mode; (void)a3; (void)a4; (void)a5; (void)a6;
+    (void)a3; (void)a4; (void)a5; (void)a6;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
+    int r = vfs_chmod_vn(f->vn, (mode_t)mode);
     fput(f);
-    return 0;
+    return r;
+}
+
+/* Only root may give files away. */
+static int64_t sys_fchownat(uint64_t dirfd, uint64_t path, uint64_t uid, uint64_t gid, uint64_t flags, uint64_t a6)
+{
+    (void)a6;
+    if (current_task()->uid != 0) return -EPERM;
+    char p[VFS_PATH_MAX];
+    long n = strncpy_from_user(p, (const char *)path, sizeof p);
+    if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
+    if (n == 0) {                                       /* AT_EMPTY_PATH: the descriptor itself */
+        if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
+        struct file *f = fget((int)dirfd);
+        if (!f) return -EBADF;
+        int r = vfs_chown_vn(f->vn, (int)uid, (int)gid);
+        fput(f);
+        return r;
+    }
+    struct vnode *base; struct file *hold;
+    int r = at_dir((int64_t)dirfd, p, &base, &hold);
+    if (r) return r;
+    r = vfs_chown_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), (int)uid, (int)gid);
+    fput(hold);
+    return r;
 }
 
 static int64_t sys_chown(uint64_t path, uint64_t uid, uint64_t gid, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sys_fchownat((uint64_t)(int64_t)AT_FDCWD, path, uid, gid, 0, 0); }
+
+static int64_t sys_lchown(uint64_t path, uint64_t uid, uint64_t gid, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sys_fchownat((uint64_t)(int64_t)AT_FDCWD, path, uid, gid, AT_SYMLINK_NOFOLLOW, 0); }
+
+static int64_t sys_fchown(uint64_t fd, uint64_t uid, uint64_t gid, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    if (current_task()->uid != 0) return -EPERM;        /* only root may give files away */
-    return vfs_chown(p, (int)uid, (int)gid);
+    if (current_task()->uid != 0) return -EPERM;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int r = vfs_chown_vn(f->vn, (int)uid, (int)gid);
+    fput(f);
+    return r;
 }
 
-/* utimensat(dirfd, path, times[2], flags): AT_FDCWD (or absolute paths)
- * only; times NULL or UTIME_NOW = now. Only the modification time is kept. */
+/* utimensat(dirfd, path, times[2], flags): path NULL is futimens(dirfd).
+ * times NULL or UTIME_NOW = now. The modification time is kept (ext2 also
+ * stores the access time, set to the same). */
 #define UTIME_NOW  ((1l << 30) - 1l)
 #define UTIME_OMIT ((1l << 30) - 2l)
 static int64_t sys_utimensat(uint64_t dirfd, uint64_t path, uint64_t times, uint64_t flags, uint64_t a5, uint64_t a6)
 {
-    (void)flags; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
+    (void)a5; (void)a6;
     int64_t mtime = -1;
     if (times) {
         struct timespec ts[2];
@@ -461,7 +612,17 @@ static int64_t sys_utimensat(uint64_t dirfd, uint64_t path, uint64_t times, uint
             mtime = ts[1].tv_sec;
         }
     }
-    return vfs_utime(p, mtime);
+    if (!path) {
+        struct file *f = fget((int)dirfd);
+        if (!f) return -EBADF;
+        int r = vfs_utime_vn(f->vn, mtime);
+        fput(f);
+        return r;
+    }
+    AT_PATH(dirfd, path);
+    int r = vfs_utime_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), mtime);
+    fput(hold);
+    return r;
 }
 
 /* ---- processes ---------------------------------------------------------- */
@@ -740,11 +901,12 @@ static int64_t sys_truncate(uint64_t path, uint64_t len, uint64_t a3, uint64_t a
     return vfs_truncate(vn, len);
 }
 
-/* sync(2)/syncfs(2): files live in memory; ask every block device to
- * commit its write cache (the report volume, raw writes). */
+/* sync(2)/syncfs(2): write back every disk file system, then ask every
+ * block device to commit its write cache. */
 static int64_t sys_sync(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     UNUSED6(a1, a2, a3, a4, a5, a6);
+    vfs_sync_all(false);
     for (int i = 0; i < blk_count(); i++) { struct blkdev *b = blk_get(i); if (b) blk_flush(b); }
     return 0;
 }
@@ -754,8 +916,10 @@ static int64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uin
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
+    struct mount *m = f->vn ? f->vn->fs : NULL;
+    int r = m && m->sync ? m->sync(m, false) : 0;       /* the whole volume: simple and safe */
     fput(f);
-    return 0;                                           /* everything lives in memory */
+    return r;
 }
 
 /* memfd_create(name, flags): an anonymous ramfs file (page-backed, so it can
@@ -1291,49 +1455,42 @@ static int64_t sys_pselect6(uint64_t n, uint64_t rp, uint64_t wp, uint64_t ep, u
 
 /* readlink: there are no symbolic links, except /proc/self/exe and
  * /proc/self/fd/N */
-static int64_t do_readlink(const char *p, uint64_t buf, uint64_t len)
-{
-    if ((int64_t)len <= 0) return -EINVAL;
-    struct tcb *t = current_task();
-    char out[VFS_PATH_MAX];
-    if (!strcmp(p, "/proc/self/exe") && t->exe[0]) {
-        strlcpy(out, t->exe, sizeof out);
-    } else if (!strncmp(p, "/proc/self/fd/", 14)) {     /* ttyname(): the file behind a descriptor */
-        int fd = 0;
-        const char *q = p + 14;
-        if (!*q) return -ENOENT;
-        for (; *q >= '0' && *q <= '9' && fd < MAX_FDS; q++) fd = fd * 10 + (*q - '0');
-        if (*q) return -ENOENT;
-        struct file *f = fget(fd);
-        if (!f) return -ENOENT;
-        int r = vfs_path_of(f->vn, out, sizeof out);
-        fput(f);
-        if (r < 0) return r;
-    } else {
-        struct stat st;
-        int r = vfs_stat(p, &st);
-        return r < 0 ? r : -EINVAL;                     /* exists, but is not a link */
-    }
-    size_t n = strlen(out);
-    if (n > len) n = len;
-    return copy_to_user((void *)buf, out, n) ? -EFAULT : (int64_t)n;   /* not NUL-terminated, like Linux */
-}
-static int64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
-{
-    (void)a4; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    return r ? r : do_readlink(p, buf, len);
-}
+/* readlink: symbolic links, plus /proc/self/exe and /proc/self/fd/N */
 static int64_t sys_readlinkat(uint64_t dirfd, uint64_t path, uint64_t buf, uint64_t len, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
-    return do_readlink(p, buf, len);
+    if ((int64_t)len <= 0) return -EINVAL;
+    AT_PATH(dirfd, path);
+    struct tcb *t = current_task();
+    char out[VFS_PATH_MAX];
+    int n;
+    if (!strcmp(p, "/proc/self/exe") && t->exe[0]) {
+        strlcpy(out, t->exe, sizeof out);
+        n = (int)strlen(out);
+    } else if (!strncmp(p, "/proc/self/fd/", 14)) {     /* ttyname(): the file behind a descriptor */
+        int fd = 0;
+        const char *q = p + 14;
+        n = -ENOENT;
+        if (*q) {
+            for (; *q >= '0' && *q <= '9' && fd < MAX_FDS; q++) fd = fd * 10 + (*q - '0');
+            struct file *f = *q ? NULL : fget(fd);
+            if (f) {
+                n = vfs_path_of(f->vn, out, sizeof out);
+                if (!n) n = (int)strlen(out);
+                fput(f);
+            }
+        }
+    } else {
+        n = vfs_readlink_at(base, p, out, sizeof out);
+    }
+    fput(hold);
+    if (n < 0) return n;
+    if ((uint64_t)n > len) n = (int)len;
+    return copy_to_user((void *)buf, out, (size_t)n) ? -EFAULT : n;    /* not NUL-terminated, like Linux */
 }
+
+static int64_t sys_readlink(uint64_t path, uint64_t buf, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; return sys_readlinkat((uint64_t)(int64_t)AT_FDCWD, path, buf, len, 0, 0); }
 
 /* ITIMER_REAL timers: SIGALRM from the scheduler tick (proc/task.c). */
 struct ktimeval { int64_t sec, usec; };
@@ -1463,26 +1620,20 @@ static int64_t sys_sysinfo(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4, ui
     return copy_to_user((void *)p, &si, sizeof si) ? -EFAULT : 0;
 }
 
-static int64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
-{
-    (void)a3; (void)a4; (void)a5; (void)a6;
-    if (mode & ~7ull) return -EINVAL;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    struct stat st;
-    return vfs_stat(p, &st);                            /* existence; everyone is root */
-}
-
 static int64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
-    char p[VFS_PATH_MAX];
-    int r = get_path(path, p);
-    if (r) return r;
-    if ((int)dirfd != AT_FDCWD && p[0] != '/') return -ENOSYS;
-    return sys_access(path, mode, 0, 0, 0, 0);
+    if (mode & ~7ull) return -EINVAL;
+    AT_PATH(dirfd, path);
+    struct vnode *vn;
+    int r = vfs_lookup_at(base, p, true, &vn);              /* existence; root may do anything */
+    if (!r && (mode & 2) && vn->fs && (vn->fs->flags & MNT_RDONLY)) r = -EROFS;
+    fput(hold);
+    return r;
 }
+
+static int64_t sys_access(uint64_t path, uint64_t mode, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sys_faccessat((uint64_t)(int64_t)AT_FDCWD, path, mode, 0, 0, 0); }
 
 static int64_t sys_umask(uint64_t mask, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
@@ -2085,7 +2236,7 @@ void syscall_init(void)
     REG(SYS_getppid, sys_getppid);     REG(SYS_getdents64, sys_getdents64);
     REG(SYS_clock_gettime, sys_clock_gettime);
     REG(SYS_clock_getres, sys_clock_getres);
-    REG(SYS_lstat, sys_stat);          /* no symlinks: lstat == stat */
+    REG(SYS_lstat, sys_lstat);
     REG(SYS_geteuid, sys_getuid);      REG(SYS_getegid, sys_getgid);
     REG(SYS_getpgid, sys_getpgid);     REG(SYS_fchmod, sys_fchmod);
     REG(SYS_reboot, sys_reboot);
@@ -2096,6 +2247,13 @@ void syscall_init(void)
     REG(SYS_set_tid_address, sys_set_tid_address);
     REG(SYS_gettid, sys_gettid);
     REG(SYS_futex, sys_futex);
+    REG(SYS_fchdir, sys_fchdir);                 REG(SYS_link, sys_link);
+    REG(SYS_symlink, sys_symlink);               REG(SYS_fchown, sys_fchown);
+    REG(SYS_lchown, sys_lchown);                 REG(SYS_statfs, sys_statfs);
+    REG(SYS_fstatfs, sys_fstatfs);               REG(SYS_fchownat, sys_fchownat);
+    REG(SYS_renameat, sys_renameat);             REG(SYS_linkat, sys_linkat);
+    REG(SYS_symlinkat, sys_symlinkat);           REG(SYS_fchmodat, sys_fchmodat);
+    REG(SYS_renameat2, sys_renameat2);
     REG(SYS_sync, sys_sync);                     REG(SYS_syncfs, sys_sync);
     REG(SYS_epoll_create, sys_epoll_create);     REG(SYS_epoll_create1, sys_epoll_create1);
     REG(SYS_epoll_ctl, sys_epoll_ctl);           REG(SYS_epoll_wait, sys_epoll_wait);

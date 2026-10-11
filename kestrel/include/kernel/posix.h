@@ -61,6 +61,7 @@ typedef uint32_t gid_t;
 #define ENAMETOOLONG 36
 #define ENOSYS       38
 #define ENOTEMPTY    39
+#define EMLINK       31
 #define EMSGSIZE     90
 #define EOWNERDEAD  130
 #define ENOTSUP      EOPNOTSUPP
@@ -80,6 +81,8 @@ typedef uint32_t gid_t;
 #define O_NONBLOCK   04000
 #define O_CLOEXEC    02000000
 #define O_DIRECTORY  0200000
+#define O_NOFOLLOW   0400000
+#define O_PATH       010000000
 
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -92,9 +95,12 @@ typedef uint32_t gid_t;
 #define S_IFREG  0100000
 #define S_IFLNK  0120000
 #define S_IFSOCK 0140000
+#define S_IFIFO  0010000
+#define S_IFBLK  0060000
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 
 /* ---- struct stat (Linux x86_64 layout) -------------------------------------- */
 struct timespec { int64_t tv_sec; int64_t tv_nsec; };
@@ -120,6 +126,8 @@ struct stat {
 #define DT_CHR     2
 #define DT_DIR     4
 #define DT_REG     8
+#define DT_LNK     10
+#define DT_SOCK    12
 struct linux_dirent64 {
     uint64_t d_ino;
     int64_t  d_off;

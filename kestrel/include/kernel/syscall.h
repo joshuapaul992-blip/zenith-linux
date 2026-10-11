@@ -167,6 +167,19 @@ struct int_frame;
 #define SYS_memfd_create  319
 #define SYS_membarrier    324
 #define SYS_rseq          334
+#define SYS_fchdir        81
+#define SYS_link          86
+#define SYS_symlink       88
+#define SYS_fchown        93
+#define SYS_lchown        94
+#define SYS_statfs        137
+#define SYS_fstatfs       138
+#define SYS_fchownat      260
+#define SYS_renameat      264
+#define SYS_linkat        265
+#define SYS_symlinkat     266
+#define SYS_fchmodat      268
+#define SYS_renameat2     316
 #define SYS_MAX           336
 
 typedef int64_t (*syscall_fn)(uint64_t a1, uint64_t a2, uint64_t a3,

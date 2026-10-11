@@ -22,6 +22,7 @@
 #include <kernel/storage.h>
 #include <kernel/string.h>
 #include <kernel/image.h>
+#include <kernel/vfs.h>
 
 /* FADT field offsets (ACPI 6.x, table 5.9) */
 #define FADT_DSDT          40
@@ -53,6 +54,7 @@ static void delay_ms(uint64_t ms)
 static void quiesce(const char *what)
 {
     kprintf("power: %s\n", what);
+    vfs_sync_all(true);                                 /* disk file systems: written back, marked clean */
     storage_shutdown();                                 /* NVMe: clean shutdown first */
     cli();
     smp_stop_others();                                  /* the other CPUs halt where they are */

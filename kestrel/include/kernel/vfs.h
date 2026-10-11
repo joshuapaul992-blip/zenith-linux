@@ -18,10 +18,11 @@
 #include <stdbool.h>
 #include <kernel/posix.h>
 
-#define VFS_NAME_MAX 64
-#define VFS_PATH_MAX 256
+#define VFS_NAME_MAX 256              /* a name, with its NUL (Linux NAME_MAX 255) */
+#define VFS_PATH_MAX 1024             /* a path given to a call, with its NUL */
+#define VFS_MAX_SYMLINKS 40           /* links followed in one lookup (ELOOP) */
 
-enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK };
+enum vtype { VNON = 0, VREG, VDIR, VCHR, VSOCK, VLNK };
 
 struct vnode;
 struct mount;
@@ -54,6 +55,21 @@ struct vnode_ops {
     /* Optional: the time_ms() at which readiness may change on its own
      * (timerfd expiry), so poll/epoll sleep exactly that long. 0: never. */
     uint64_t (*poll_deadline)(struct file *f);
+    /* Symbolic links: copy the target (no NUL) into buf, return its length. */
+    int     (*readlink)(struct vnode *vn, char *buf, size_t size);
+    /* A disk file system's directory operations (on the directory's ops).
+     * Without them the in-memory tree is the whole truth (ramfs). The VFS
+     * has checked names, types, emptiness and write access; on success it
+     * updates the in-memory tree itself. */
+    int     (*create)(struct vnode *dir, const char *name, enum vtype t, uint32_t mode, const char *target,
+                      struct vnode **out);      /* file, directory or symlink (target) */
+    int     (*link)(struct vnode *dir, const char *name, struct vnode *target, struct vnode **out);
+    int     (*remove)(struct vnode *dir, struct vnode *vn);         /* unlink / rmdir */
+    int     (*rename)(struct vnode *odir, struct vnode *vn, struct vnode *ndir, const char *nname,
+                      struct vnode *replaced);  /* replaced: the entry overwritten, or NULL */
+    int     (*setattr)(struct vnode *vn);       /* mode, uid, gid, times changed: write back */
+    void    (*evict)(struct vnode *vn);         /* the vnode is being freed */
+    void    (*getattr)(struct vnode *vn);       /* refresh size, nlink, times (before stat) */
 };
 
 /* poll(2) bits */
@@ -86,10 +102,24 @@ struct vnode {
     int         refs;               /* open files on it (atomic)          */
     bool        unlinked;           /* removed from its directory: freed
                                        when the last open file closes      */
+    bool        loaded;             /* directory: children read (refresh)  */
+    uint32_t    nlink;              /* hard links (0: 1, or 2 for a dir)   */
+    uint64_t    atime, ctime;       /* seconds (0: same as mtime)          */
+    uint64_t    blocks;             /* 512-byte blocks used (0: from size) */
+    uint64_t    dpos;               /* its getdents offset in its directory */
+    uint64_t    dnext;              /* directory: the next child's dpos     */
 };
 
 #define MNT_RDONLY   0x1
 #define MNT_NOCREATE 0x2            /* pseudo fs: structure fixed by kernel */
+
+/* statfs(2), Linux x86_64 layout */
+struct kstatfs {
+    int64_t  f_type, f_bsize;
+    uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    int32_t  f_fsid[2];
+    int64_t  f_namelen, f_frsize, f_flags, f_spare[4];
+};
 
 struct mount {
     char          path[VFS_PATH_MAX];
@@ -99,6 +129,10 @@ struct mount {
     uint32_t      flags;
     uint32_t      dev;
     struct mount *next;
+    /* a disk file system's own state and whole-volume operations */
+    void         *priv;
+    int         (*sync)(struct mount *m, bool final);           /* write back everything; final: shutting down */
+    int         (*statfs)(struct mount *m, struct kstatfs *st);
 };
 
 struct epitem;
@@ -121,8 +155,33 @@ struct vnode *vfs_mkfs(const char *fstype, uint32_t flags, struct mount **out);
 int           vfs_mount(struct mount *m, const char *path);
 int           vfs_bind(const char *src, const char *dst);     /* show src's contents at dst */
 
-/* ---- path operations (relative paths use the current task's cwd) ------- */
+/* ---- path operations ------------------------------------------------------
+ * Relative paths start at `base` (a directory, the *at calls' dirfd), or the
+ * current task's cwd when base is NULL. Symbolic links are followed, at most
+ * VFS_MAX_SYMLINKS per lookup, except in the last component when `follow`
+ * is false (lstat, unlink, O_NOFOLLOW ...). */
 int     vfs_lookup(const char *path, struct vnode **out);
+int     vfs_lookup_at(struct vnode *base, const char *path, bool follow, struct vnode **out);
+int     vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, struct file **out);
+int     vfs_mkdir_at(struct vnode *base, const char *path, mode_t mode);
+int     vfs_unlink_at(struct vnode *base, const char *path);
+int     vfs_rmdir_at(struct vnode *base, const char *path);
+int     vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, const char *to);
+int     vfs_symlink_at(const char *target, struct vnode *base, const char *path);
+int     vfs_link_at(struct vnode *obase, const char *from, bool follow, struct vnode *nbase, const char *to);
+int     vfs_readlink_at(struct vnode *base, const char *path, char *buf, size_t size);
+int     vfs_stat_at(struct vnode *base, const char *path, bool follow, struct stat *st);
+int     vfs_chmod_at(struct vnode *base, const char *path, bool follow, mode_t mode);
+int     vfs_chown_at(struct vnode *base, const char *path, bool follow, int uid, int gid);
+int     vfs_utime_at(struct vnode *base, const char *path, bool follow, int64_t mtime);
+/* the same on an open file's node (fchmod, fchown, futimens) */
+int     vfs_chmod_vn(struct vnode *vn, mode_t mode);
+int     vfs_chown_vn(struct vnode *vn, int uid, int gid);
+int     vfs_utime_vn(struct vnode *vn, int64_t mtime);
+int     vfs_statfs(struct vnode *vn, struct kstatfs *st);
+void    vfs_sync_all(bool final);               /* every mounted disk file system */
+/* make the file system `m` the root ("/"), moving the other mounts into it */
+int     vfs_pivot_root(struct mount *m);
 int     vfs_mkdir(const char *path, mode_t mode);
 int     vfs_mksock(const char *path, mode_t mode, struct vnode **out);   /* bind(2) */
 int     vfs_unlink(const char *path);
@@ -144,6 +203,7 @@ ssize_t vfs_pread(struct file *f, void *buf, size_t len, uint64_t off);     /* p
 ssize_t vfs_pwrite(struct file *f, const void *buf, size_t len, uint64_t off);
 off_t   vfs_lseek(struct file *f, off_t off, int whence);
 int     vfs_getdents(struct file *f, void *buf, size_t len);
+void    vfs_fill_stat(struct vnode *vn, struct stat *st);
 int     vfs_ioctl(struct file *f, unsigned long req, void *arg);
 int     vfs_fstat(struct file *f, struct stat *st);
 int     vfs_poll(struct file *f, int events);   /* ready subset of events (+ERR/HUP) */

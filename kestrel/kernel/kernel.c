@@ -44,6 +44,7 @@
 #include <kernel/vm.h>
 #include <kernel/time.h>
 #include <kernel/bootvol.h>
+#include <kernel/rootfs.h>
 #include <kernel/block.h>
 
 #define KERNEL_HEAP_SIZE (8u << 20)
@@ -481,6 +482,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
      * waiting for USB storage to settle; a mandatory volume that is missing
      * or unreadable ends in the recovery console, not a crash. */
     bootvol_mount_root();
+    /* An ext2 volume labelled "kestrel-root" (any disk) becomes "/". */
+    rootfs_mount();
 
     /* No serial port on many machines: write REPORT.TXT (and the video BIOS)
      * to the stick's "KESTREL RPT" volume, if there is one. */

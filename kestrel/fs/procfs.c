@@ -319,9 +319,7 @@ static void proc_refresh(struct vnode *dir)
             }
             d->pid = t->pid;
             snprintf(d->dir->name, sizeof d->dir->name, "%d", t->pid);
-            d->dir->parent = dir;
-            d->dir->sibling = dir->children;            /* attach */
-            dir->children = d->dir;
+            vfs_node_add(dir, d->dir);                  /* attach (at the end: getdents offsets) */
             d->attached = true;
             break;
         }
