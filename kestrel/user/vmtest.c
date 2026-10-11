@@ -15,6 +15,10 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <sys/auxv.h>
+#include <sched.h>
+#include <time.h>
+#include <sys/time.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -54,6 +58,86 @@ static long rss_kib(void)
     close(fd);
     char *v = strstr(b, "VmRSS:");
     return v ? atol(v + 6) : -1;
+}
+
+/* ---- vDSO (include/kernel/vdso.h) -------------------------------------------- */
+static int64_t ts_ns(const struct timespec *t) { return (int64_t)t->tv_sec * 1000000000 + t->tv_nsec; }
+
+static void vdso_checks(void)
+{
+    unsigned long ehdr = getauxval(AT_SYSINFO_EHDR);
+    CHECK(ehdr && !memcmp((void *)ehdr, "\177ELF", 4), "AT_SYSINFO_EHDR points at the vDSO's ELF header");
+    char maps[8192] = { 0 };
+    int mf = open("/proc/self/maps", O_RDONLY);
+    read(mf, maps, sizeof maps - 1);
+    close(mf);
+    char *vv = strstr(maps, "[vvar]"), *vd = strstr(maps, "[vdso]");
+    CHECK(vv && vd, "/proc/self/maps lists [vvar] and [vdso]");
+    if (!ehdr) return;
+    const volatile uint32_t *vvar = (const volatile uint32_t *)(ehdr - 4096);
+    int tsc = vvar[1] == 1;                             /* struct vdso_data: clock_mode */
+    printf("  (the vDSO reads the clock %s)\n", tsc ? "from the TSC" : "with a system call");
+
+    /* the vDSO and the system call agree, both ways round, many times */
+    int ordered = 1;
+    for (int i = 0; i < 2000 && ordered; i++) {
+        struct timespec a, b, c;
+        clock_gettime(CLOCK_MONOTONIC, &a);
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &b);
+        clock_gettime(CLOCK_MONOTONIC, &c);
+        if (ts_ns(&a) > ts_ns(&b) || ts_ns(&b) > ts_ns(&c)) ordered = 0;
+    }
+    CHECK(ordered, "CLOCK_MONOTONIC from the vDSO and from the kernel never go backwards");
+    struct timespec r1, r2;
+    clock_gettime(CLOCK_REALTIME, &r1);
+    syscall(SYS_clock_gettime, CLOCK_REALTIME, &r2);
+    CHECK(llabs(ts_ns(&r2) - ts_ns(&r1)) < 50000000, "CLOCK_REALTIME agrees with the kernel");
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    time_t now = time(NULL);
+    CHECK(llabs((long long)tv.tv_sec - r2.tv_sec) <= 1 && llabs((long long)now - r2.tv_sec) <= 1,
+          "gettimeofday() and time() agree with it");
+    struct timespec res;
+    CHECK(clock_getres(CLOCK_MONOTONIC, &res) == 0 && res.tv_sec == 0 && res.tv_nsec == 1 &&
+          clock_getres(99, &res) == -1 && errno == EINVAL, "clock_getres(): 1 ns, EINVAL for an unknown clock");
+    struct timespec p0, p1;
+    CHECK(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &p0) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &p1) == 0,
+          "the CPU-time clocks still work (through the kernel)");
+    unsigned cpu = 99, kcpu = 98;
+    int same = 0;
+    for (int i = 0; i < 20 && !same; i++) {             /* a migration in between is possible */
+        int c = sched_getcpu();
+        syscall(SYS_getcpu, &kcpu, NULL, NULL);
+        cpu = (unsigned)c;
+        same = cpu == kcpu;
+    }
+    CHECK(same, "sched_getcpu() agrees with the getcpu system call");
+    CHECK(mprotect((void *)ehdr, 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES &&
+          mprotect((void *)(ehdr - 4096), 4096, PROT_READ | PROT_WRITE) == -1 && errno == EACCES,
+          "neither page can be made writable");
+    catch(SIGSEGV);
+    CHECK(touch((char *)ehdr, 1) == SIGSEGV && touch((char *)ehdr - 4096, 1) == SIGSEGV, "writing them faults");
+    pid_t c = fork();
+    if (c == 0) {
+        struct timespec t;
+        _exit(clock_gettime(CLOCK_MONOTONIC, &t) == 0 && t.tv_sec >= 0 && getauxval(AT_SYSINFO_EHDR) == ehdr ? 0 : 1);
+    }
+    int st;
+    waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "a forked child reads the clock through it too");
+
+    /* cost: the vDSO against the system call */
+    struct timespec t0, t1, x;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < 100000; i++) clock_gettime(CLOCK_MONOTONIC, &x);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t v = (ts_ns(&t1) - ts_ns(&t0)) / 100000;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (int i = 0; i < 100000; i++) syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &x);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    int64_t k = (ts_ns(&t1) - ts_ns(&t0)) / 100000;
+    printf("  (clock_gettime: %lld ns through the vDSO, %lld ns as a system call)\n", (long long)v, (long long)k);
+    if (tsc) CHECK(v < k, "...and the vDSO is the faster");
 }
 
 int main(void)
@@ -219,6 +303,7 @@ int main(void)
     char exe[256] = { 0 };
     readlink("/proc/self/exe", exe, sizeof exe - 1);    /* /boot/bin/vmtest or /bin/vmtest */
     CHECK(strstr(maps, "[stack]") && strstr(maps, "r-xp") && exe[0] && strstr(maps, exe), "/proc/self/maps lists the regions");
+    vdso_checks();
 
     /* ---- out of memory ----------------------------------------------------- */
     c = fork();

@@ -184,6 +184,10 @@ static int write_back(struct e2fs *fs, struct buf *b)
     return r;
 }
 
+static uint64_t cache_hits, cache_misses;          /* all volumes (kstat.h) */
+
+void ext2_cache_stats(uint64_t *hits, uint64_t *misses) { *hits = cache_hits; *misses = cache_misses; }
+
 /* The cached block `blk`, pinned (brelse() when done). With `read` false the
  * contents are not read from the disk: the caller overwrites all of it. */
 static struct buf *bget(struct e2fs *fs, uint32_t blk, bool read)
@@ -192,6 +196,7 @@ static struct buf *bget(struct e2fs *fs, uint32_t blk, bool read)
     unsigned h = (blk * 2654435761u) >> 24;
     for (struct buf *b = fs->hash[h]; b; b = b->hnext)
         if (b->blk == blk && b->valid) {
+            cache_hits++;
             b->pins++;
             b->used = ++fs->clock;
             if (!read) memset(b->data, 0, fs->bs);      /* a cached copy from the block's last owner */
@@ -214,6 +219,7 @@ static struct buf *bget(struct e2fs *fs, uint32_t blk, bool read)
         v->valid = false;
     }
     if (read) {
+        cache_misses++;
         if (dev_io(fs, blk, 1, v->data, false) < 0) return NULL;
     } else {
         memset(v->data, 0, fs->bs);

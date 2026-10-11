@@ -345,6 +345,8 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
 {
     bool writable = v->prot & PROT_WRITE;
     uint64_t phys;
+    struct tcb *t = current_task();
+    t->fault_kind = (v->flags & VMA_SHARED) ? KF_SHARED : (v->file && va < v->file_end) ? KF_FILE : KF_ANON;
     if (v->flags & VMA_SHARED) {
         uint64_t off = v->off + (va - v->start);
         if (off >= pgup(v->obj->size)) return -EIO;     /* past the end of the object: SIGBUS */
@@ -372,6 +374,7 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
 static int fault_cow(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t va)
 {
     uint64_t e = *pte, old = e & ADDR_MASK;
+    current_task()->fault_kind = KF_COW;
     if ((v->flags & VMA_SHARED) || page_refs(old) == 1) {
         *pte = (e | PTE_W) & ~PTE_COW;                  /* nobody else has it: take it back */
         tlb_page(mm, va);
@@ -410,11 +413,8 @@ static int fault_once(struct mm *mm, uint64_t addr, uint64_t err)
     return fault_missing(mm, v, pte, va);
 }
 
-int vm_fault(uint64_t addr, uint64_t err, bool user_mode)
+static int fault_retry(struct tcb *t, struct mm *mm, uint64_t addr, uint64_t err, bool user_mode)
 {
-    struct tcb *t = current_task();
-    struct mm *mm = t ? t->mm : NULL;
-    if (!mm || !t->user || !user_range_ok(addr, 1)) return -EFAULT;
     for (int attempt = 0;; attempt++) {
         kmutex_lock(&mm->lock);
         int r = fault_once(mm, addr, err);
@@ -428,6 +428,18 @@ int vm_fault(uint64_t addr, uint64_t err, bool user_mode)
         }
         task_sleep_ms(50);
     }
+}
+
+int vm_fault(uint64_t addr, uint64_t err, bool user_mode)
+{
+    struct tcb *t = current_task();
+    struct mm *mm = t ? t->mm : NULL;
+    if (!mm || !t->user || !user_range_ok(addr, 1)) return -EFAULT;
+    uint64_t t0 = rdtsc();
+    t->fault_kind = KF_OTHER;
+    int r = fault_retry(t, mm, addr, err, user_mode);
+    if (r == 0) kstat_fault(t, t->fault_kind, rdtsc() - t0);    /* kstat.h */
+    return r;
 }
 
 int vm_populate(struct mm *mm, uint64_t addr, uint64_t len, bool write)
@@ -530,6 +542,7 @@ int vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot)
         if ((prot & PROT_WRITE) && (v->flags & VMA_SHARED) && v->file == NULL && v->obj && v->obj->seals & 0x0008) {
             r = -EACCES; goto out;                      /* F_SEAL_WRITE */
         }
+        if ((prot & PROT_WRITE) && (v->flags & (VMA_VVAR | VMA_VDSO))) { r = -EACCES; goto out; }   /* shared by all */
         a = v->end;
     }
     if ((r = split_at(mm, addr)) || (r = split_at(mm, end))) goto out;
@@ -694,6 +707,8 @@ size_t vm_maps(struct mm *mm, char *buf, size_t cap)
         if (v->file && v->file->vn) vfs_path_of(v->file->vn, path, sizeof path);
         else if (v->flags & VMA_STACK) strlcpy(path, "[stack]", sizeof path);
         else if (v->flags & VMA_HEAP) strlcpy(path, "[heap]", sizeof path);
+        else if (v->flags & VMA_VVAR) strlcpy(path, "[vvar]", sizeof path);
+        else if (v->flags & VMA_VDSO) strlcpy(path, "[vdso]", sizeof path);
         else if (v->obj) strlcpy(path, "/memfd: (deleted)", sizeof path);
         n += (size_t)snprintf(buf + n, cap - n, "%012lx-%012lx %c%c%c%c %08lx 00:00 %-10lu %s\n",
                               v->start, v->end, (v->prot & PROT_READ) ? 'r' : '-',

@@ -38,6 +38,7 @@ void percpu_init_bsp(void)
     c->loaded_cr3 = read_cr3() & ADDR_MASK;
     wrmsr(MSR_GS_BASE, (uint64_t)c);
     wrmsr(MSR_KERNEL_GS_BASE, 0);
+    kstat_cpu_online();
 }
 
 bool percpu_is_kernel_gs(uint64_t base)
@@ -55,11 +56,20 @@ void bkl_enter(void)
     uint64_t f = irq_save();                            /* no migration, no nesting mid-acquire */
     struct percpu *c = this_cpu();
     if (c->bkl_depth == 0) {
-        while (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE)) {
-            do { tlb_service(); cpu_relax(); }          /* the holder may wait for our TLB */
-            while (__atomic_load_n(&bkl_word, __ATOMIC_RELAXED));
+        if (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE)) {
+            uint64_t t0 = rdtsc();
+            do {
+                do { tlb_service(); cpu_relax(); }      /* the holder may wait for our TLB */
+                while (__atomic_load_n(&bkl_word, __ATOMIC_RELAXED));
+            } while (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE));
+            uint64_t w = rdtsc() - t0;                  /* kstat.h: time lost waiting */
+            c->ks.lock_spin_n++;
+            c->ks.lock_spin_cyc += w;
+            if (c->current) { c->current->ks.lock_n++; c->current->ks.lock_cyc += w; }
         }
         bkl_owner = c->id;
+        c->ks.lock_acq++;
+        c->ks.lock_since = rdtsc();
     }
     c->bkl_depth++;
     irq_restore(f);
@@ -71,6 +81,7 @@ void bkl_exit(void)
     struct percpu *c = this_cpu();
     if (c->bkl_depth <= 0) panic("bkl_exit: not held on CPU %d", c->id);
     if (--c->bkl_depth == 0) {
+        c->ks.lock_hold_cyc += rdtsc() - c->ks.lock_since;
         bkl_owner = -1;
         __atomic_store_n(&bkl_word, 0, __ATOMIC_RELEASE);
     }
@@ -185,6 +196,33 @@ static void tramp_put(uint8_t *field, uint64_t v)
     *(volatile uint64_t *)(uintptr_t)(TRAMP_BASE + (field - tramp_start)) = v;
 }
 
+/* TSC warp check (as Linux's check_tsc_warp): the starting CPU and the
+ * boot CPU take turns reading their TSCs under a lock. A value lower than
+ * the last one read, by either, means the two counters are not in step,
+ * and then the TSC cannot be the clock (time.c falls back to the HPET). */
+#define WARP_ROUNDS 2000
+static volatile uint32_t warp_lock;
+static volatile uint64_t warp_last;
+static volatile bool warp_ready;
+static bool tsc_warped;
+
+static inline uint64_t rdtsc_ordered(void)
+{
+    __asm__ volatile("lfence" ::: "memory");
+    return rdtsc();
+}
+
+static void warp_run(void)
+{
+    for (int i = 0; i < WARP_ROUNDS; i++) {
+        while (__atomic_exchange_n(&warp_lock, 1, __ATOMIC_ACQUIRE)) cpu_relax();
+        uint64_t now = rdtsc_ordered();
+        if (now < warp_last) tsc_warped = true;
+        warp_last = now;
+        __atomic_store_n(&warp_lock, 0, __ATOMIC_RELEASE);
+    }
+}
+
 __attribute__((noreturn)) static void ap_entry(struct percpu *c)
 {
     gdt_load_cpu(c->id);
@@ -200,6 +238,9 @@ __attribute__((noreturn)) static void ap_entry(struct percpu *c)
     lapic_timer_start();
     c->loaded_cr3 = read_cr3() & ADDR_MASK;
     c->apic_id = lapic_id();
+    __atomic_store_n(&warp_ready, true, __ATOMIC_RELEASE);
+    warp_run();
+    kstat_cpu_online();
     __atomic_store_n(&c->online, true, __ATOMIC_RELEASE);
     __atomic_store_n(&ap_started, true, __ATOMIC_RELEASE);
     bkl_enter();                                        /* the idle loop is entered holding it */
@@ -243,8 +284,12 @@ void smp_boot_aps(void)
         tramp_put(tramp_stack, ((uint64_t)stack + KSTACK_SIZE) & ~0xFull);
         tramp_put(tramp_arg, (uint64_t)c);
         ap_started = false;
+        warp_ready = false;
+        warp_last = 0;
         lapic_send_init_sipi(id, TRAMP_BASE >> 12);
         uint64_t t = time_ns();
+        while (!__atomic_load_n(&warp_ready, __ATOMIC_ACQUIRE) && time_ns() - t < 200000000ull) cpu_relax();
+        if (warp_ready) warp_run();                     /* alongside the new CPU */
         while (!__atomic_load_n(&ap_started, __ATOMIC_ACQUIRE) && time_ns() - t < 200000000ull) cpu_relax();
         if (!ap_started) {                              /* it may still come up late: */
             kprintf("smp: CPU with APIC ID %u did not start; no more CPUs\n", id);   /* reuse nothing */
@@ -253,4 +298,5 @@ void smp_boot_aps(void)
         ncpus++;
     }
     kprintf("smp: %d CPU(s) online\n", ncpus);
+    if (tsc_warped) time_tsc_unstable();
 }

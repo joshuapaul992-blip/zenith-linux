@@ -68,6 +68,8 @@
 #define VMA_SHARED      0x1
 #define VMA_STACK       0x2
 #define VMA_HEAP        0x4
+#define VMA_VVAR        0x8             /* the vDSO's pages (vdso.h): never writable */
+#define VMA_VDSO        0x10
 
 struct file;
 struct vm_object;

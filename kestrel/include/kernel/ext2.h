@@ -10,3 +10,5 @@ bool ext2_probe(struct blkdev *dev, char label[17]);
  * vfs_pivot_root). Read-only if asked, or if the device cannot write or
  * the volume uses features only a reader may ignore. */
 int  ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out);
+/* Block cache lookups that found the block, and those that read it (kstat.h). */
+void ext2_cache_stats(uint64_t *hits, uint64_t *misses);

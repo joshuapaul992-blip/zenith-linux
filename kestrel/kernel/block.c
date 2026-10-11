@@ -85,9 +85,14 @@ int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
         blk_mark_removed(disk);
         return -ENODEV;
     }
+    uint64_t t0 = rdtsc();
     disk_lock(disk);
+    uint64_t t1 = rdtsc();
     int rc = disk->removed ? -ENODEV : disk->ops->read(disk, lba, count, buf);
+    uint64_t t2 = rdtsc();
+    disk->rd_n++; disk->rd_bytes += (uint64_t)count * disk->block_size; disk->busy_cyc += t2 - t1;
     disk_unlock(disk);
+    kstat_io((uint64_t)count * disk->block_size, t2 - t0);
     if (rc < 0) {
         disk->errors++; disk->last_error = rc;
         if (b != disk) { b->errors++; b->last_error = rc; }
@@ -105,9 +110,14 @@ int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
     while (disk->parent) { lba += disk->start; disk = disk->parent; }   /* stays inside the partition */
     if (!disk->ops->write) return -EROFS;
     if (disk->removed || b->removed) return -ENODEV;
+    uint64_t t0 = rdtsc();
     disk_lock(disk);
+    uint64_t t1 = rdtsc();
     int rc = disk->removed ? -ENODEV : disk->ops->write(disk, lba, count, buf);
+    uint64_t t2 = rdtsc();
+    disk->wr_n++; disk->wr_bytes += (uint64_t)count * disk->block_size; disk->busy_cyc += t2 - t1;
     disk_unlock(disk);
+    kstat_io((uint64_t)count * disk->block_size, t2 - t0);
     if (rc < 0) {
         disk->errors++; disk->last_error = rc;
         if (b != disk) { b->errors++; b->last_error = rc; }

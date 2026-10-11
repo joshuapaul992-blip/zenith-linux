@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <kernel/kstat.h>
 
 #define MAX_TASKS       512             /* threads included */
 #define KSTACK_SIZE     (16 * 1024)
@@ -77,6 +78,7 @@ struct signal_struct {              /* CLONE_THREAD: the thread group        */
     void     *exit_wait;            /* execve waits here for the others      */
     bool      exec_kill;            /* execve is ending the other threads:
                                        their deaths are not the group's      */
+    struct kstat_task dead;         /* counters of the threads that exited   */
 };
 
 /* Thread Control Block: one per kernel thread and per user thread. A user
@@ -144,6 +146,8 @@ struct tcb {
 
     int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
     int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */
+    struct kstat_task ks;       /* performance counters (kstat.h)            */
+    int       fault_kind;       /* what the page fault in progress did (enum kfault) */
 };
 
 /* shared process state (proc/task.c) */

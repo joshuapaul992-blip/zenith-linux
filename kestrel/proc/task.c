@@ -390,6 +390,7 @@ void schedule(void)
         wrmsr(MSR_KERNEL_GS_BASE, next->gs_base);
     }
     if (next->cr3 != prev->cr3) cpu_load_cr3(next->cr3);
+    kstat_switch(prev, next);
     context_switch(&prev->rsp, next->rsp);
 }
 
@@ -527,6 +528,7 @@ void task_exit(int code)
      * the address space is still there (this touches user memory). */
     if (cur->user) { sti(); process_thread_exit(cur); }
     cli();
+    kstat_thread_exit(cur);
     kprintf("sched: pid %d (%s) exited with status %d\n", cur->pid, cur->name, code);
     /* close now, not at reap time: pipe and socket peers must see EOF (the
      * table goes when the last thread sharing it is gone) */
@@ -589,8 +591,10 @@ void sched_idle_loop(void)
         if (ready) { schedule(); continue; }
         __atomic_store_n(&c->in_idle, true, __ATOMIC_RELEASE);
         bkl_exit();
+        c->ks.idle_tsc = rdtsc();
         __asm__ volatile("sti; hlt" ::: "memory");   /* atomic: no lost wakeup */
         cli();
+        if (c->ks.idle_tsc) { c->ks.idle_cyc += rdtsc() - c->ks.idle_tsc; c->ks.idle_tsc = 0; }
         __atomic_store_n(&c->in_idle, false, __ATOMIC_RELEASE);
         bkl_enter();
     }

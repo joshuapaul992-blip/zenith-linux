@@ -29,6 +29,7 @@
 #include <kernel/uvm.h>
 #include <kernel/smp.h>
 #include <kernel/vm.h>
+#include <kernel/vdso.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
@@ -87,6 +88,7 @@ struct elf64_phdr {
 #define AT_RANDOM   25
 #define AT_HWCAP2   26
 #define AT_EXECFN   31
+#define AT_SYSINFO_EHDR 33
 #define AT_MINSIGSTKSZ 51
 
 #define MAX_PHDRS   128
@@ -229,12 +231,12 @@ out:
  * argc) argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL. Built in
  * kernel memory and copied to the (demand-paged) stack in one checked copy. */
 static uint64_t build_stack(struct tcb *t, const struct exec_args *a, const struct elf_image *main_img,
-                            uint64_t interp_base)
+                            uint64_t interp_base, uint64_t vdso)
 {
     size_t strbytes = 7 + 16;                           /* "x86_64" + AT_RANDOM */
     for (int i = 0; i < a->argc; i++) strbytes += strlen(a->argv[i]) + 1;
     for (int i = 0; i < a->envc; i++) strbytes += strlen(a->envp[i]) + 1;
-    const int nauxv = 21;
+    const int nauxv = 22;
     size_t words = 1 + (size_t)a->argc + 1 + (size_t)a->envc + 1 + 2 * (size_t)nauxv;
     size_t total = ((strbytes + 15) & ~(size_t)15) + words * 8 + 16;
     if (total > (1u << 20)) return 0;
@@ -267,9 +269,9 @@ static uint64_t build_stack(struct tcb *t, const struct exec_args *a, const stru
         { AT_UID, t->uid }, { AT_EUID, t->uid }, { AT_GID, t->gid }, { AT_EGID, t->gid },
         { AT_PLATFORM, platform }, { AT_HWCAP, cd }, { AT_HWCAP2, 0 }, { AT_CLKTCK, 100 }, { AT_SECURE, 0 },
         { AT_RANDOM, random }, { AT_EXECFN, a->argc ? argv_va[0] : platform }, { AT_MINSIGSTKSZ, 2048 },
-        { AT_NULL, 0 }, { AT_NULL, 0 },
+        { vdso ? AT_SYSINFO_EHDR : AT_NULL, vdso }, { AT_NULL, 0 }, { AT_NULL, 0 },
     };
-    _Static_assert(sizeof auxv / sizeof *auxv == 21, "nauxv");
+    _Static_assert(sizeof auxv / sizeof *auxv == 22, "nauxv");
     uint64_t sp = (pos - words * 8) & ~0xFull;          /* rsp % 16 == 0 at argc */
     uint64_t *w = (uint64_t *)(k + (sp - base));
     *w++ = (uint64_t)a->argc;
@@ -319,8 +321,9 @@ static int exec_load_image_elf(struct tcb *t, const char *path, const struct exe
     if (r < 0) return (int)r;
     vm_mark(mm, UVM_STACK_TOP - 1, VMA_STACK);
     mm->brk_start = mm->brk = page_up(img.end);
+    uint64_t vdso = vdso_map(mm);                       /* clock reads without system calls */
     *entry = start;
-    *sp = build_stack(t, a, &img, interp_base);
+    *sp = build_stack(t, a, &img, interp_base, vdso);
     return *sp ? 0 : -ENOMEM;
 }
 

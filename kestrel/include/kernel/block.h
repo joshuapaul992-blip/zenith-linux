@@ -54,6 +54,7 @@ struct blkdev {
     bool      partitions_scanned;
     uint32_t  errors;
     int       last_error;
+    uint64_t  rd_n, rd_bytes, wr_n, wr_bytes, busy_cyc;    /* disks: requests served (kstat.h) */
     struct vnode *node;                     /* /dev/<name>                       */
 };
 

@@ -5,6 +5,8 @@
 #include <kernel/klog.h>
 #include <kernel/string.h>
 #include <kernel/multiboot2.h>
+#include <kernel/bootinfo.h>
+#include <kernel/vdso.h>
 
 enum source { SRC_NONE, SRC_HPET, SRC_TSC };
 static enum source src;
@@ -18,6 +20,7 @@ static uint64_t hpet_start, hpet_ext, hpet_last32;
 
 /* TSC */
 static uint64_t tsc_freq, tsc_start;
+static bool     tsc_invariant;           /* runs at one rate in every power state */
 
 /* wall clock: CMOS RTC read once at boot, advanced by the clocksource */
 static int64_t boot_epoch;
@@ -282,16 +285,59 @@ void time_realtime(int64_t *sec, int64_t *nsec)
 /* ======================================================================== */
 /*  public API                                                                 */
 /* ======================================================================== */
+/* CPUID 0x80000007 EDX bit 8: the TSC ticks at a constant rate, also in
+ * deep C-states (every Intel CPU since Nehalem, AMD since Barcelona). */
+static bool cpu_tsc_invariant(void)
+{
+    uint32_t a, b, c, d;
+    cpuid(0x80000000, 0, &a, &b, &c, &d);
+    if (a < 0x80000007) return false;
+    cpuid(0x80000007, 0, &a, &b, &c, &d);
+    return d & (1u << 8);
+}
+
+/* A finer TSC rate against the HPET (50 ms, the HPET's own period). */
+static void tsc_calibrate_hpet(void)
+{
+    uint64_t h0 = hpet_read(), t0 = rdtsc();
+    uint64_t span = 50000000000000ull / hpet_period_fs;         /* 50 ms in HPET ticks */
+    while (hpet_read() - h0 < span) cpu_relax();
+    uint64_t h1 = hpet_read(), t1 = rdtsc();
+    uint64_t fs = (h1 - h0) * hpet_period_fs;                   /* femtoseconds elapsed */
+    uint64_t ns = fs / 1000000ull;
+    if (ns) tsc_freq = (t1 - t0) * 1000000000ull / ns;
+}
+
 void time_init(uintptr_t mbi)
 {
     /* calibrate the TSC regardless: it backs udelay() when the HPET exists too */
     bool have_tsc = tsc_init();
     char tsc_desc[64];
     strlcpy(tsc_desc, src_name, sizeof tsc_desc);
+    tsc_invariant = have_tsc && cpu_tsc_invariant();
 
-    if (hpet_init(mbi)) src = SRC_HPET;
-    else if (have_tsc) { src = SRC_TSC; strlcpy(src_name, tsc_desc, sizeof src_name); }
-    else { src = SRC_NONE; strlcpy(src_name, "none (port 0x80 delays)", sizeof src_name); }
+    /* The clock: an invariant TSC if there is one (cheap to read, and the
+     * vDSO can read it in user mode), else the HPET, else a TSC as it is.
+     * kestrel.clocksource=hpet or =tsc decides instead. */
+    bool want_hpet = strstr(g_boot.cmdline, "kestrel.clocksource=hpet") != NULL;
+    bool want_tsc = strstr(g_boot.cmdline, "kestrel.clocksource=tsc") != NULL;
+    bool hpet_ok = hpet_init(mbi);
+    if (have_tsc && !want_hpet && (tsc_invariant || want_tsc || !hpet_ok)) {
+        if (hpet_ok) {
+            tsc_calibrate_hpet();
+            snprintf(tsc_desc, sizeof tsc_desc, "TSC %lu.%03lu GHz (HPET-calibrated%s)",
+                     (unsigned long)(tsc_freq / 1000000000ull), (unsigned long)((tsc_freq / 1000000ull) % 1000),
+                     tsc_invariant ? ", invariant" : "");
+        }
+        tsc_start = rdtsc();
+        src = SRC_TSC;
+        strlcpy(src_name, tsc_desc, sizeof src_name);
+    } else if (hpet_ok) {
+        src = SRC_HPET;
+    } else {
+        src = SRC_NONE;
+        strlcpy(src_name, "none (port 0x80 delays)", sizeof src_name);
+    }
 
     boot_epoch = rtc_read_epoch();
     kprintf("time: RTC wall clock %ld (Unix seconds)\n", (long)boot_epoch);
@@ -330,3 +376,28 @@ void mdelay(uint32_t ms) { while (ms--) udelay(1000); }
 
 const char *time_source(void) { return src_name; }
 uint64_t tsc_hz(void) { return tsc_freq; }
+
+bool time_tsc_clock(uint64_t *start, uint64_t *hz)
+{
+    *start = tsc_start;
+    *hz = tsc_freq;
+    return src == SRC_TSC;
+}
+
+int64_t time_boot_epoch(void) { return boot_epoch; }
+
+/* The CPUs' TSCs are not in step (smp.c): go back to the HPET, carrying the
+ * time on so the clock never jumps (boot time only). */
+void time_tsc_unstable(void)
+{
+    if (src != SRC_TSC || !hpet) return;
+    uint64_t f = irq_save();
+    uint64_t ns = time_ns();
+    hpet_start = hpet_read() - ns * 1000000ull / hpet_period_fs;
+    src = SRC_HPET;
+    uint64_t khz = 1000000000000ull / hpet_period_fs;
+    snprintf(src_name, sizeof src_name, "HPET %lu.%03lu MHz (the TSCs differ between CPUs)", khz / 1000, khz % 1000);
+    irq_restore(f);
+    kprintf("time: the CPUs' TSCs are not in step: clocksource %s\n", src_name);
+    vdso_update();
+}

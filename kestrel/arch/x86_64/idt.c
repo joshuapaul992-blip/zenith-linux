@@ -10,6 +10,7 @@
 #include <kernel/vm.h>
 #include <kernel/posix.h>
 #include <kernel/smp.h>
+#include <kernel/smp.h>
 
 struct idt_gate {
     uint16_t offset_lo;
@@ -309,6 +310,8 @@ static bool lockless(struct int_frame *f)
 
 void isr_dispatch(struct int_frame *f)
 {
+    struct kstat_cpu *k = &this_cpu()->ks;
+    if (k->idle_tsc) { k->idle_cyc += rdtsc() - k->idle_tsc; k->idle_tsc = 0; }   /* woken from hlt */
     if (lockless(f)) return;
     bkl_enter();
     bool user = (f->cs & 3) == 3;
@@ -334,7 +337,12 @@ void isr_dispatch(struct int_frame *f)
             pic_eoi(irq);
         }
         irq_counts[irq]++;
-        if (irq_handlers[irq]) irq_handlers[irq](f);
+        if (irq_handlers[irq]) {
+            uint64_t t0 = rdtsc();
+            irq_handlers[irq](f);
+            this_cpu()->ks.irq_n++;
+            this_cpu()->ks.irq_cyc += rdtsc() - t0;
+        }
     } else if (f->vector == VEC_LAPIC_TIMER) {
         lapic_eoi();
         this_cpu()->ticks++;

@@ -402,6 +402,14 @@ static void proc_link(struct vnode *dir, const char *name, const struct vnode_op
     vfs_node_add(dir, l);
 }
 
+static size_t gen_kstat(char *buf, size_t cap, void *ctx) { (void)ctx; return kstat_gen(buf, cap); }
+
+static size_t gen_pid_kstat(char *buf, size_t cap, void *ctx)
+{
+    struct tcb *t = pid_task(ctx);
+    return t ? kstat_gen_process(t->tgid, buf, cap) : 0;
+}
+
 static void pid_files(struct vnode *dir, void *ctx)
 {
     pseudo_file(dir, "statm", gen_pid_statm, ctx);
@@ -419,6 +427,7 @@ static void pid_files(struct vnode *dir, void *ctx)
     pseudo_file(dir, "cmdline", gen_pid_cmdline, ctx);
     pseudo_file(dir, "comm", gen_pid_comm, ctx);
     pseudo_file(dir, "maps", gen_pid_maps, ctx);
+    pseudo_file(dir, "kstat", gen_pid_kstat, ctx);
 }
 
 static void detach(struct vnode *parent, struct vnode *c)
@@ -482,6 +491,7 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "cmdline",     gen_cmdline, NULL);
     pseudo_file(r, "kmsg",        gen_kmsg, NULL);
     pseudo_file(r, "syscalls",    gen_syscalls, NULL);
+    pseudo_file(r, "kstat",       gen_kstat, NULL);
     pseudo_file(r, "pci",         gen_pci, NULL);
     pseudo_file(r, "usb",         gen_usb, NULL);
     pseudo_file(r, "partitions",  gen_partitions, NULL);

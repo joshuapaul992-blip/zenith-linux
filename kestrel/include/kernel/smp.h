@@ -37,6 +37,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <kernel/kstat.h>
 
 #define MAX_CPUS        16
 
@@ -70,6 +71,7 @@ struct percpu {
     uint64_t       tlb_flushes, ipis;
     void          *tss;                 /* arch/x86_64/gdt.c                   */
     uint8_t       *ist[3];              /* #DF, NMI, #MC stacks                */
+    struct kstat_cpu ks;                /* performance counters (kstat.h)      */
 };
 
 _Static_assert(__builtin_offsetof(struct percpu, kernel_rsp) == 8, "gs:8");

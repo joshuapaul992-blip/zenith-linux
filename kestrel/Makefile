@@ -65,8 +65,8 @@ LDFLAGS   := -nostdlib -static -no-pie -T linker.ld -z max-page-size=0x1000 \
 BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm \
-           arch/x86_64/trampoline.asm
-C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c \
+           arch/x86_64/trampoline.asm arch/x86_64/vdso_blob.asm
+C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c fs/inotify.c fs/lockf.c mm/vm.c mm/vmobj.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
@@ -122,6 +122,22 @@ $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	@echo "  NASM    $<"
 	@$(NASM) $(NASMFLAGS) $< -o $@
+
+# The vDSO (include/kernel/vdso.h): a position-independent shared object
+# with no relocations, embedded in the kernel by vdso_blob.asm.
+VDSO_SO     := $(BUILD)/vdso/vdso.so
+VDSO_CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Iinclude -fPIC -fvisibility=hidden -ffreestanding -fno-builtin \
+               -fno-stack-protector -fno-asynchronous-unwind-tables -mgeneral-regs-only
+VDSO_LDFLAGS := -nostdlib -shared -Wl,-T,vdso/vdso.lds -Wl,--hash-style=both -Wl,-soname=linux-vdso.so.1 \
+               -Wl,--no-undefined -Wl,-z,max-page-size=4096 -Wl,--build-id=none -Wl,-z,noexecstack -Wl,-s
+$(VDSO_SO): vdso/vdso.c vdso/vdso.lds include/kernel/vdso.h
+	@mkdir -p $(dir $@)
+	@echo "  VDSO    $@"
+	@$(CC) $(VDSO_CFLAGS) -c vdso/vdso.c -o $(BUILD)/vdso/vdso.o
+	@$(CC) $(VDSO_LDFLAGS) $(BUILD)/vdso/vdso.o -o $@
+	@if $(CROSS)readelf -r $@ | grep -q R_X86_64; then echo "error: the vDSO has relocations"; rm -f $@; exit 1; fi
+$(BUILD)/arch/x86_64/vdso_blob.o: $(VDSO_SO)
+$(BUILD)/arch/x86_64/vdso_blob.o: NASMFLAGS += -DVDSO_PATH='"$(VDSO_SO)"'
 
 # Two links: the first one's function addresses become the symbol table for
 # crash backtraces (tools/ksyms.py), which the second link adds in .rodata --
@@ -220,7 +236,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest kstat
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

@@ -34,6 +34,7 @@
 #include <kernel/vm.h>
 #include <kernel/vmobj.h>
 #include <kernel/futex.h>
+#include <kernel/vdso.h>
 
 extern void syscall_entry(void);
 
@@ -2977,6 +2978,7 @@ void syscall_cpu_init(void)
     /* SFMASK: RFLAGS bits cleared on entry. IF off until the kernel stack is
      * in place; DF, TF, AC and NT never leak from user space into the kernel. */
     wrmsr(MSR_FMASK, 0x200 | 0x400 | 0x100 | 0x40000 | 0x4000);
+    vdso_cpu_init();                                            /* getcpu() in user mode */
 }
 
 /* kestrel.strace=<text>: log every system call of the processes whose
@@ -3023,13 +3025,19 @@ static bool syscall_fast(struct int_frame *f)
         pagefault_enable();
         if (r) return false;                            /* not mapped yet: the slow path faults it in */
         f->rax = 0;
-        return true;
+        break;
     }
-    case SYS_gettid: f->rax = (uint64_t)t->pid; return true;
-    case SYS_getpid: f->rax = (uint64_t)t->tgid; return true;
+    case SYS_gettid: f->rax = (uint64_t)t->pid; break;
+    case SYS_getpid: f->rax = (uint64_t)t->tgid; break;
     default: return false;
     }
+    t->ks.fast_n++;
+    this_cpu()->ks.fast_n++;
+    return true;
 }
+
+/* Per call number: on-CPU and wall cycles, the longest call (kstat.h) */
+static uint64_t cost_cpu[SYS_MAX], cost_wall[SYS_MAX], cost_max[SYS_MAX];
 
 int syscall_dispatch(struct int_frame *f)
 {
@@ -3054,9 +3062,17 @@ int syscall_dispatch(struct int_frame *f)
         uint64_t a1 = f->rdi, a2 = f->rsi, a3 = f->rdx, a4 = f->r10;
         if (tr && may_block(nr))
             kprintf("strace %d %s(%lx, %lx, %lx, %lx) ...\n", t->pid, names[nr] ? names[nr] : "?", a1, a2, a3, a4);
+        uint64_t w0 = rdtsc(), c0 = kstat_run_cycles(t);
         if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
         int64_t r = table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
         f->rax = (uint64_t)r;
+        cli();
+        uint64_t wall = rdtsc() - w0, cpu = kstat_run_cycles(t) - c0;
+        cost_cpu[nr] += cpu; cost_wall[nr] += wall;
+        if (cpu > cost_max[nr]) cost_max[nr] = cpu;
+        t->ks.sys_n++; t->ks.sys_cyc += cpu; t->ks.sys_wall += wall;
+        struct kstat_cpu *k = &this_cpu()->ks;
+        k->sys_n++; k->sys_cyc += cpu;
         if (tr) kprintf("strace %d %s(%lx, %lx, %lx, %lx) = %ld\n", t->pid, names[nr] ? names[nr] : "?", a1, a2, a3, a4, r);
         /* a write to a pipe or socket nobody reads raises SIGPIPE */
         if (r == -EPIPE && t->user &&
@@ -3076,3 +3092,10 @@ int syscall_dispatch(struct int_frame *f)
 const char *syscall_name(int nr) { return (nr >= 0 && nr < SYS_MAX && names[nr]) ? names[nr] : NULL; }
 int syscall_implemented(int nr) { return nr >= 0 && nr < SYS_MAX && table[nr] && table[nr] != sys_enosys && table[nr] != sys_absent; }
 uint64_t syscall_count(int nr) { return (nr >= 0 && nr < SYS_MAX) ? counts[nr] : 0; }
+
+bool syscall_cost(int nr, uint64_t *calls, uint64_t *cpu, uint64_t *wall, uint64_t *max)
+{
+    if (nr < 0 || nr >= SYS_MAX) return false;
+    *calls = counts[nr]; *cpu = cost_cpu[nr]; *wall = cost_wall[nr]; *max = cost_max[nr];
+    return true;
+}

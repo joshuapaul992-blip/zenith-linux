@@ -48,6 +48,8 @@
 #include <kernel/bootvol.h>
 #include <kernel/rootfs.h>
 #include <kernel/block.h>
+#include <kernel/kstat.h>
+#include <kernel/vdso.h>
 
 #define KERNEL_HEAP_SIZE (8u << 20)
 #define WANT_WIDTH  1024
@@ -366,7 +368,9 @@ static void crashtest_maybe(void)
     if (c) task_create("crashtest", crash_main, (void *)(c + 18));
 }
 
-/* --- kworker/0: CPU-bound work, proves time-slice preemption ------------- */
+/* --- kworker/0: CPU-bound work, proves time-slice preemption ------------- *
+ * Only with kestrel.demoload=1: it runs whenever a CPU has nothing else to
+ * do, so that CPU never halts (power, and under emulation a host core). */
 static volatile uint64_t primes_found;
 
 static int kworker_compute(void *arg)
@@ -388,8 +392,11 @@ static int kworker_heartbeat(void *arg)
     (void)arg;
     for (;;) {
         task_sleep_ms(30000);
-        kprintf("kworker/1: heartbeat, uptime %lus, %lu primes found by kworker/0\n",
-                uptime_ms() / 1000, primes_found);
+        if (primes_found)
+            kprintf("kworker/1: heartbeat, uptime %lus, %lu primes found by kworker/0\n",
+                    uptime_ms() / 1000, primes_found);
+        else
+            kprintf("kworker/1: heartbeat, uptime %lus\n", uptime_ms() / 1000);
     }
     return 0;
 }
@@ -439,6 +446,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     if (apic) ioapic_route_isa(IRQ_KEYBOARD, IRQ_BASE + IRQ_KEYBOARD);
     uvm_init();                 /* shared kernel PDPTs, before any address space */
     vm_init();                  /* EFER.NXE: no-execute for data pages */
+    vdso_init();                /* the clock pages every process maps */
     sched_init();
     sti();
     kprintf("arch: interrupts enabled, %s at %d Hz\n", apic ? "local APIC timer" : "PIT", PIT_HZ);
@@ -493,6 +501,7 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
 
     /* No serial port on many machines: write REPORT.TXT (and the video BIOS)
      * to the stick's "KESTREL RPT" volume, if there is one. */
+    kstat_init();
     if (!strstr(g_boot.cmdline, "kestrel.report=0") && report_locate())
         report_save("written at boot");
 
@@ -514,8 +523,10 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     crashtest_maybe();
     if (!task_create("init", init_main, NULL)) panic("cannot start init");
     if (!(ch.flags & BOOTOPT_SAFE_MODE)) {
-        struct tcb *kw = task_create("kworker/0", kworker_compute, NULL);   /* demo load: idle class */
-        if (kw) task_set_idle_class(kw);
+        if (strstr(g_boot.cmdline, "kestrel.demoload=1")) {
+            struct tcb *kw = task_create("kworker/0", kworker_compute, NULL);   /* demo load: idle class */
+            if (kw) task_set_idle_class(kw);
+        }
         task_create("kworker/1", kworker_heartbeat, NULL);
     }
     usb_start_thread();

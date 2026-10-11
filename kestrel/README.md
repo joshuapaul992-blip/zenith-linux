@@ -193,7 +193,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `grep [-i] [-n] [-v] [-c] [-q] PATTERN` | Fixed-string match, line by line; matches are highlighted on the terminal. |
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
-| `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the HPET. Kestrel has no time zones, so the time is UTC. |
+| `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the kernel's clock (TSC or HPET). Kestrel has no time zones, so the time is UTC. |
 | `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.0-release`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
@@ -396,7 +396,7 @@ The path from "the firmware owns the USB controllers" to "the boot volume is mou
 - **Intel PCH xHCI** (7/8/9 series): `USB3_PSSEN`/`XUSB2PR` are written from their BIOS-provided mask registers, so shared ports switch to the xHCI.
 - **xHCI USBLEGSUP:** requested right before the controller reset, with the same wait-then-force logic. The outcome appears in the diagnostic trace.
 
-**2. Calibrated clock** (`kernel/time.c`). The HPET is found through ACPI (RSDP from the Multiboot2 tags, else the EBDA/BIOS area). If there is none, the TSC is calibrated against PIT channel 2 by polling. Either source works with interrupts off, so settling and transfer timeouts are real milliseconds from the first instruction on.
+**2. Calibrated clock** (`kernel/time.c`). The HPET is found through ACPI (RSDP from the Multiboot2 tags, else the EBDA/BIOS area), and the TSC is calibrated against PIT channel 2 by polling. An invariant TSC (CPUID `0x80000007`, every recent PC) becomes the clock, recalibrated against the HPET: it is read in a few cycles, by the vDSO too. Without one the HPET is the clock, and without an HPET the TSC as it is. `kestrel.clocksource=hpet` or `=tsc` overrides the choice. Each CPU that starts takes turns with the boot CPU reading the TSC under a lock; if either ever sees it go backwards, the counters are not in step and the clock goes back to the HPET. Every source works with interrupts off, so settling and transfer timeouts are real milliseconds from the first instruction on.
 
 **3. Non-blocking settling** (`xhci_settle_step()`). One call is one pass over every root port's `PORTSC`; it never depends on Port Status Change events alone.
 - A new connection is debounced for 100 ms, then enumerated.
@@ -544,8 +544,8 @@ mm/           pmm.c          bitmap frame allocator from the MB2 memory map, fra
               uvm.c          user address-space layout, kernel page-table sharing
 
 proc/task.c                  TCBs, round-robin scheduler on every CPU (10 ms quantum; an idle class for
-                             background work such as kworker/0, which runs only when nothing else is
-                             ready), sleep_on/wakeup, poll sleeps, timed sleep, zombie reaping,
+                             background work, which runs only when nothing else is ready: kworker/0
+                             with kestrel.demoload=1), sleep_on/wakeup, poll sleeps, timed sleep, zombie reaping,
                              a per-CPU idle thread, kernel stacks with guard pages
 proc/exec.c                  hardened ELF64 loader (PT_INTERP, W^X), System V initial stack,
                              kernel-started processes
@@ -593,7 +593,9 @@ kernel/       kernel.c       initialisation sequence, init and worker threads
                              NVMe self-test and shutdown
               usbhost.c      PCI -> xHCI glue, key injection, mouse pointer, usbd thread, /proc/usb,
                              firmware handoff, mass storage -> block devices
-              time.c         HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts
+              time.c         invariant TSC / HPET (ACPI) / PIT-calibrated TSC clock usable before interrupts
+              vdso.c         the vDSO's pages, mapped into every process (clock reads without syscalls)
+              kstat.c        performance counters: /proc/kstat, /proc/PID/kstat, a REPORT.TXT section
               block.c        block device registry, MBR/GPT partitions, /proc/partitions
               bootvol.c      boot volume discovery (option A/B), root policy, failover
               recovery.c     diagnostic trace + recovery console (keyboard and COM1)
@@ -615,6 +617,17 @@ include/kernel/usyscall.h    int 0x80 wrappers used by init
 
 The calling convention is the Linux x86_64 one: the call number goes in `rax`, the arguments in `rdi rsi rdx r10 r8 r9`, and the result (a negative errno on failure) comes back in `rax`.
 
+**The vDSO** (`vdso/vdso.c`, `kernel/vdso.c`, `include/kernel/vdso.h`). Every process gets two read-only pages above its stack, `[vvar]` (the clock's parameters) and `[vdso]` (a small ELF shared object, named in the auxiliary vector as `AT_SYSINFO_EHDR`), as on Linux. glibc and musl find `__vdso_clock_gettime`, `__vdso_gettimeofday`, `__vdso_time`, `__vdso_clock_getres` and `__vdso_getcpu` (version `LINUX_2.6`) there and call them instead of the system calls. With the TSC as the clock they compute the time from it with the kernel's own formula, so the two never disagree; otherwise, and for the CPU-time clocks, they make the system call. `getcpu()` reads the CPU number from `IA32_TSC_AUX` with `RDPID` or `RDTSCP`. `kestrel.vdso=0` leaves the pages out. In QEMU with the TSC clock, `clock_gettime` takes 330 ns through the vDSO against 720 ns as a system call, and 2.8 µs as a system call on the HPET.
+
+**Performance counters** (`kernel/kstat.c`). The kernel counts, in TSC cycles and without locks, where its time goes:
+- per CPU: time holding the big kernel lock, waiting for it, halted, and the rest (user code);
+- system calls by number: calls, time on the CPU, wall time and the longest single call;
+- page faults by kind (anonymous, file, shared, copy-on-write), with their time, and the pages read from files;
+- block requests per disk (count, bytes, busy time), and ext2 block cache hits and misses;
+- per process and per thread: run time, system calls, lock waits, faults and I/O.
+
+`/proc/kstat` has the totals and a table of processes, and `/proc/PID/kstat` one process and its threads. Every line is `key name=value ...` and cumulative, so `kstat` (in `/bin`) can subtract two snapshots: `kstat 10` shows the last 10 seconds, `kstat CMD ARGS` what happened while a command ran, `kstat -d OLD NEW` the change between two saved copies, and `kstat -p PID` the same for one process. The `report` command of the kernel shell writes the totals into `REPORT.TXT` as well, for machines without a serial port.
+
 **Tracing.** `kestrel.strace=<text>` on the kernel command line logs every system call of the programs whose path contains `<text>`: the call, its first four arguments and the result, plus a line when a call that may block starts. `kestrel.strace=firefox` is how the gaps Firefox hit were found. Calls nobody implemented are logged anyway, three times per call number.
 
 Calls can enter through two paths:
@@ -632,7 +645,7 @@ Every pointer a call receives is checked to lie in the user half and copied thro
 - **Processes and threads:** fork, vfork, clone (processes and threads), clone3 (including `CLONE_CLEAR_SIGHAND`, which glibc's `posix_spawn` uses), execve, exit (the thread), exit_group (the process), wait4, waitid (`P_ALL`, `P_PID`, `P_PGID`, `WNOHANG`, `WNOWAIT`), getpid, gettid, getppid, set_tid_address, set_robust_list, get_robust_list, futex, arch_prctl (`ARCH_SET_FS`/`GET_FS`/`SET_GS`/`GET_GS`), sched_yield, sched_getaffinity, sched_setaffinity, the `sched_*` scheduler and priority calls (one class, `SCHED_OTHER`), getpriority, setpriority, ioprio_get/set, getcpu, personality, setsid, setpgid, getpgid, getpgrp, getsid, prctl (`PR_SET_NAME`/`PR_GET_NAME`, dumpable, capability bounding set, no-new-privs), capget and capset (root holds every capability). rseq, pidfd_open, quotactl and the NUMA policy calls (mbind, set_mempolicy, get_mempolicy) answer `ENOSYS` quietly; glibc and Firefox carry on without them.
 - **Signals:** kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, sigaltstack (`SA_ONSTACK` handlers run on it), pause, alarm, getitimer, setitimer (`ITIMER_REAL`).
 - **Identity and limits:** getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; only root may change them), getrlimit, setrlimit, prlimit64 (fixed limits; 1024 descriptors).
-- **Time and system:** nanosleep, clock_nanosleep (with `TIMER_ABSTIME`), time, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET/TSC), gettimeofday, times, getrusage, sysinfo, uname, getrandom, sync, syncfs, reboot.
+- **Time and system:** nanosleep, clock_nanosleep (with `TIMER_ABSTIME`), time, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the TSC or HPET; also answered in user mode by the vDSO), gettimeofday, times, getrusage, sysinfo, uname, getrandom, sync, syncfs, reboot.
 
 **Power:** `poweroff`, `reboot` and `halt` work from any shell (as root). BusyBox asks init with a signal to pid 1, and the kernel plays that part; `reboot(2)` and the `-f` forms go straight to `kernel/power.c`. Power-off uses ACPI S5 (PM1 control ports from the FADT, the `\_S5_` sleep type from the DSDT), so it works on real machines, with the QEMU/Bochs/VirtualBox ports as a fallback. Restart tries the FADT reset register, port `0xCF9`, the keyboard controller, then a triple fault. Storage is flushed and the other CPUs are stopped first.
 
@@ -828,7 +841,7 @@ make usbimg
 
 **Per-CPU data.** In the kernel, the GS base points at the CPU's `struct percpu` (`include/kernel/smp.h`); entries from ring 3 run `SWAPGS`, and NMI, #DF and #MC (which can arrive between `SYSCALL` and its `SWAPGS`) decide from the GS base itself. The running task is read with a single GS-relative load, so a thread that is preempted and moved to another CPU never reads the wrong one.
 
-**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
+**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. `/proc/kstat` shows how long each CPU holds the lock and waits for it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
 
 **TLB shootdowns.** When a mapping loses rights or goes away, every CPU that has that address space loaded drops the translation (`invlpg`, or a CR3 reload for large ranges) through an IPI, and the call waits for each to acknowledge before a frame is freed or reused. Waiting for the kernel lock services pending requests, so a shootdown can always complete. Changes to the kernel's identity map (guard pages, cache types) go to every CPU.
 
@@ -843,7 +856,8 @@ make usbimg
 | Program | What it checks |
 |---|---|
 | `faulttest` | 38 checks: faults to signals with the right `si_code`/`si_addr`, handlers that recover, `-EFAULT` for bad pointers in every kind of call, kernel stays up |
-| `vmtest` | 43 checks: demand paging, copy-on-write, NX, mprotect, file and shared mappings, memfd and seals, mremap, madvise, mincore, brk, OOM killer |
+| `vmtest` | 54 checks (55 with the TSC clock): demand paging, copy-on-write, NX, mprotect, file and shared mappings, memfd and seals, mremap, madvise, mincore, brk, OOM killer, the vDSO (its pages, every clock against the kernel's, `getcpu`, write protection, after fork, and its speed) |
+| `kstat` | not a test: the change in the performance counters over N seconds or while a command runs (`/proc/kstat`) |
 | `dyntest` | a dynamically linked program and shared library through musl's ld.so |
 | `threadtest` | 41 checks: pthreads, TLS, mutex/condvar/semaphore contention, every futex operation and timeout, process-shared futexes, signals and threads, exit/exit_group, fork and execve from threads, robust mutexes, 450 thread lifecycles |
 | `eventtest` | 71 checks: epoll (level, edge, one-shot, nesting, fairness), eventfd, timerfd, signalfd, poll/select sleeps, ppoll masks, `SCM_RIGHTS`, record sockets, POSIX shared memory |
