@@ -1061,7 +1061,7 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 
 **Limits:**
 - Firefox's sandboxes are off (`MOZ_DISABLE_CONTENT_SANDBOX` and the others): they need seccomp-bpf and namespaces.
-- Slow under emulation: in QEMU without KVM, Firefox's window appears after about 90 seconds and a page after two to three minutes. Much of that is the big kernel lock; `clock_gettime`, `getpid` and `gettid` already skip it.
+- Slow under emulation: in QEMU without KVM, Firefox's window appears after about a minute and a page after about a minute and a half. Much of that is the big kernel lock; `clock_gettime`, `getpid` and `gettid` already skip it.
 - Non-PIE programs (linked at a fixed address, such as Ubuntu's `python3.12`) do not load yet.
 - No GLX, no D-Bus daemon, no recording.
 
