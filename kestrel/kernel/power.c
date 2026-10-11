@@ -21,8 +21,7 @@
 #include <kernel/smp.h>
 #include <kernel/storage.h>
 #include <kernel/string.h>
-#include <kernel/fb.h>
-#include <kernel/font.h>
+#include <kernel/image.h>
 
 /* FADT field offsets (ACPI 6.x, table 5.9) */
 #define FADT_DSDT          40
@@ -119,18 +118,12 @@ static void acpi_s5(void)
     delay_ms(500);                                      /* the power should be gone by now */
 }
 
-/* The message also on the screen: the X server may own it, so draw it
- * straight into the frame buffer, as the panic screen does. */
-static void final_screen(const char *line1, const char *line2)
+/* The "safe to turn off" screen (assets/halt_screen.png), drawn straight
+ * into the frame buffer over whatever was there (the X server too). */
+static void final_screen(const char *msg)
 {
-    kprintf("%s %s\n", line1, line2);
-    if (!g_fb.ready) return;
-    int w = 640, h = 96, x = ((int)g_fb.width - w) / 2, y = ((int)g_fb.height - h) / 2;
-    draw_rect(x, y, w, h, RGB(0x10, 0x10, 0x10));
-    draw_rect_outline(x, y, w, h, 2, COL_SILVER);
-    draw_string(x + 16, y + 20, line1, COL_WHITE, FB_TRANSPARENT, &font_12x24);
-    draw_string(x + 16, y + 60, line2, COL_SILVER, FB_TRANSPARENT, &font_8x16);
-    fb_flush();
+    kprintf("%s\n", msg);
+    image_draw_fullscreen(&halt_screen);
 }
 
 void power_off(void)
@@ -141,7 +134,7 @@ void power_off(void)
     outw(0xB004, 0x2000);                               /* Bochs, old QEMU */
     outw(0x4004, 0x3400);                               /* VirtualBox */
     delay_ms(100);
-    final_screen("System halted.", "This machine did not power off. It is now safe to turn it off.");
+    final_screen("power: this machine did not power off; halted. It is now safe to turn it off.");
     cpu_halt_forever();
 }
 
@@ -172,6 +165,6 @@ void power_reboot(void)
 void power_halt(void)
 {
     quiesce("halting");
-    final_screen("System halted.", "It is now safe to turn off your computer.");
+    final_screen("System halted. It is now safe to turn off your computer.");
     cpu_halt_forever();
 }
