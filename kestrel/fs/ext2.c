@@ -21,8 +21,9 @@
  * In memory. Every vnode of an ext2 file points at a shared `struct e2ino`
  * (hard links share one), which holds the raw on-disk inode: fields we do
  * not interpret survive a write-back untouched. Directories are read into
- * the VFS tree when first looked at (refresh). Metadata and data go
- * through a write-back block cache; a kernel thread writes dirty blocks
+ * the VFS tree when first looked at (refresh). Regular files are read
+ * through the page cache (pagecache.h), which mappings share; metadata and
+ * written data go through a write-back block cache; a kernel thread writes dirty blocks
  * every 5 seconds, and sync(2), poweroff and reboot write everything (the
  * superblock is marked clean only at shutdown, like Linux's unmount, so
  * e2fsck checks a volume Kestrel did not shut down cleanly). All entry
@@ -41,6 +42,7 @@
 #include <kernel/posix.h>
 #include <kernel/cpu.h>
 #include <kernel/ext2.h>
+#include <kernel/pagecache.h>
 
 #define EXT2_MAGIC          0xEF53
 #define EXT2_ROOT_INO       2
@@ -111,6 +113,7 @@
 #define CACHE_BYTES   (4u << 20)            /* block cache size per volume */
 #define FLUSH_MS      5000
 #define RAW_INODE     256                   /* bytes of the on-disk inode kept */
+#define RA_PAGES      32                    /* a page cache miss reads up to 128 KiB */
 
 static inline uint16_t g16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
 static inline uint32_t g32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
@@ -130,6 +133,7 @@ struct buf {
 struct e2ino {
     uint32_t ino;
     int      refs;                          /* vnodes */
+    struct pcache *pc;                      /* regular files: cached pages, once read */
     uint8_t  raw[RAW_INODE];
     struct e2ino *next;
 };
@@ -153,6 +157,7 @@ struct e2fs {
     uint32_t nbufs;
     struct buf *hash[256];
     uint64_t clock;
+    uint8_t *ra_buf;                        /* RA_PAGES contiguous pages: read-ahead runs */
     /* inodes in use */
     struct e2ino *inodes_live;
 };
@@ -605,11 +610,146 @@ static ssize_t e2_read_locked(struct e2fs *fs, struct e2ino *e, void *buf, size_
     return (ssize_t)done;
 }
 
+/* ---- the page cache (pagecache.h) ----------------------------------------------------
+ * Regular files are read through it: a page is filled from the disk on
+ * first use, along with up to RA_PAGES - 1 following pages when their
+ * blocks follow on the disk, in one request. A block the block cache holds
+ * is copied from there instead: it may be newer than the disk. Writes go
+ * through the block cache as before and update cached pages in passing. */
+
+/* The block cache's copy of `blk`, if it has one. */
+static struct buf *cached(struct e2fs *fs, uint32_t blk)
+{
+    unsigned h = (blk * 2654435761u) >> 24;
+    for (struct buf *b = fs->hash[h]; b; b = b->hnext)
+        if (b->blk == blk && b->valid) return b;
+    return NULL;
+}
+
+/* The disk blocks of file page `idx`: 0 for a hole or past the end. */
+static int page_blocks(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint32_t pb[4])
+{
+    uint32_t bpp = PAGE_SIZE / fs->bs;
+    uint64_t size = i_size(e);
+    for (uint32_t i = 0; i < bpp; i++) {
+        uint64_t lb = idx * bpp + i;
+        pb[i] = 0;
+        if (lb * fs->bs >= size) continue;
+        int r = bmap(fs, e, lb, false, &pb[i]);
+        if (r < 0) return r;
+    }
+    return 0;
+}
+
+/* Can the page be read straight from the disk: wholly inside the file, no
+ * holes, its blocks consecutive and none of them in the block cache? */
+static bool direct(struct e2fs *fs, struct e2ino *e, uint64_t idx, const uint32_t pb[4])
+{
+    uint32_t bpp = PAGE_SIZE / fs->bs;
+    if ((idx + 1) * PAGE_SIZE > i_size(e)) return false;
+    for (uint32_t i = 0; i < bpp; i++)
+        if (!pb[i] || pb[i] != pb[0] + i || cached(fs, pb[i])) return false;
+    return true;
+}
+
+/* Fill the zeroed page `p` block by block; zeros past the end of the file. */
+static int fill_blocks(struct e2fs *fs, struct e2ino *e, uint64_t idx, const uint32_t pb[4], uint64_t p)
+{
+    uint32_t bpp = PAGE_SIZE / fs->bs;
+    for (uint32_t i = 0; i < bpp; i++) {
+        uint8_t *dst = (uint8_t *)p + i * fs->bs;
+        if (!pb[i]) continue;
+        struct buf *b = cached(fs, pb[i]);
+        if (b) memcpy(dst, b->data, fs->bs);
+        else if (dev_io(fs, pb[i], 1, dst, false) < 0) return -EIO;
+    }
+    uint64_t start = idx * PAGE_SIZE, size = i_size(e);
+    if (start + PAGE_SIZE > size) memset((uint8_t *)p + (size - start), 0, (size_t)(start + PAGE_SIZE - size));
+    return 0;
+}
+
+/* Page `idx` of the file, referenced for the caller; fs->lock held. */
+static int getpage_locked(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint64_t *out)
+{
+    if (!e->pc && !(e->pc = pcache_new())) return -ENOMEM;
+    uint64_t p = pcache_lookup(e->pc, idx, true);
+    if (p) { *out = p; return 0; }
+    if (idx * PAGE_SIZE >= i_size(e)) {                 /* past the end: zeros, not cached */
+        if (!(p = page_alloc())) return -ENOMEM;
+        *out = p;
+        return 0;
+    }
+    uint32_t pb[4];
+    int r = page_blocks(fs, e, idx, pb);
+    if (r < 0) return r;
+    if (!direct(fs, e, idx, pb)) {
+        if (!(p = page_alloc())) return -ENOMEM;
+        if ((r = fill_blocks(fs, e, idx, pb, p)) < 0) { page_unref(p); return r; }
+        *out = pcache_insert(e->pc, idx, p, false);
+        return 0;
+    }
+    /* the pages that follow, while their blocks follow on the disk */
+    uint32_t bpp = PAGE_SIZE / fs->bs, n = 1, next = pb[0] + bpp;
+    while (fs->ra_buf && n < RA_PAGES && !pcache_present(e->pc, idx + n)) {
+        uint32_t nb[4];
+        if (page_blocks(fs, e, idx + n, nb) < 0 || !direct(fs, e, idx + n, nb) || nb[0] != next) break;
+        next += bpp;
+        n++;
+    }
+    if (n == 1) {
+        if (!(p = page_alloc())) return -ENOMEM;
+        if (dev_io(fs, pb[0], bpp, (void *)p, false) < 0) { page_unref(p); return -EIO; }
+        *out = pcache_insert(e->pc, idx, p, false);
+        return 0;
+    }
+    if (dev_io(fs, pb[0], n * bpp, fs->ra_buf, false) < 0) return -EIO;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t q = page_alloc();
+        if (!q) { if (i) break; return -ENOMEM; }
+        memcpy((void *)q, fs->ra_buf + (size_t)i * PAGE_SIZE, PAGE_SIZE);
+        q = pcache_insert(e->pc, idx + i, q, i > 0);
+        if (i) page_unref(q);
+        else *out = q;
+    }
+    return 0;
+}
+
+static int e2_getpage(struct vnode *vn, uint64_t idx, bool io, uint64_t *phys)
+{
+    struct e2ino *e = ino_of(vn);
+    if (!io) {                                          /* no I/O, no volume lock */
+        *phys = e->pc ? pcache_lookup(e->pc, idx, false) : 0;
+        return 0;
+    }
+    struct e2fs *fs = fs_of(vn);
+    kmutex_lock(&fs->lock);
+    int r = getpage_locked(fs, e, idx, phys);
+    kmutex_unlock(&fs->lock);
+    return r;
+}
+
 static ssize_t e2_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
 {
     struct e2fs *fs = fs_of(vn);
     kmutex_lock(&fs->lock);
-    ssize_t r = e2_read_locked(fs, ino_of(vn), buf, len, off);
+    struct e2ino *e = ino_of(vn);
+    uint64_t size = i_size(e);
+    ssize_t r = 0;
+    if (off < size) {
+        if (len > size - off) len = (size_t)(size - off);
+        size_t done = 0;
+        while (done < len) {
+            uint64_t pos = off + done, in = pos % PAGE_SIZE, p;
+            size_t n = PAGE_SIZE - in < len - done ? (size_t)(PAGE_SIZE - in) : len - done;
+            int err = getpage_locked(fs, e, pos / PAGE_SIZE, &p);
+            if (err < 0) { r = done ? (ssize_t)done : err; goto out; }
+            memcpy((uint8_t *)buf + done, (const uint8_t *)p + in, n);
+            page_unref(p);
+            done += n;
+        }
+        r = (ssize_t)done;
+    }
+out:
     kmutex_unlock(&fs->lock);
     return r;
 }
@@ -633,7 +773,7 @@ static ssize_t e2_write_locked(struct e2fs *fs, struct e2ino *e, const void *buf
         size_t n = fs->bs - bo < len - done ? fs->bs - bo : len - done;
         uint32_t pb;
         if ((err = bmap(fs, e, lb, true, &pb)) < 0) break;
-        struct buf *b = bread(fs, pb);                  /* a new block comes zeroed from the cache */
+        struct buf *b = bget(fs, pb, n < fs->bs);       /* whole block: no need to read it; a new one comes zeroed */
         if (!b) { err = -EIO; break; }
         memcpy(b->data + bo, (const uint8_t *)buf + done, n);
         bdirty(b);
@@ -641,6 +781,7 @@ static ssize_t e2_write_locked(struct e2fs *fs, struct e2ino *e, const void *buf
         done += n;
     }
     if (done && off + done > i_size(e)) set_size(fs, e, off + done);
+    if (done) pcache_write(e->pc, buf, done, off);      /* cached pages stay current */
     if (done || err) inode_write(fs, e);                /* block pointers may have changed */
     return done ? (ssize_t)done : err;
 }
@@ -667,6 +808,7 @@ static int e2_truncate(struct vnode *vn, uint64_t size)
     struct e2ino *e = ino_of(vn);
     if (size < i_size(e)) truncate_blocks(fs, e, size);
     set_size(fs, e, size);
+    pcache_truncate(e->pc, size);
     touch(vn, e, true);
     int r = inode_write(fs, e);
     vn->blocks = g32(e->raw + I_BLOCKS);
@@ -725,6 +867,7 @@ static void release_inode(struct e2fs *fs, struct e2ino *e)
     }
     for (struct e2ino **pp = &fs->inodes_live; *pp; pp = &(*pp)->next)
         if (*pp == e) { *pp = e->next; break; }
+    pcache_free(e->pc);
     kfree(e);
 }
 
@@ -1101,7 +1244,7 @@ out:
 }
 
 static const struct vnode_ops e2_file_ops = {
-    .read = e2_read, .write = e2_write, .size = e2_size, .truncate = e2_truncate,
+    .read = e2_read, .write = e2_write, .size = e2_size, .truncate = e2_truncate, .getpage = e2_getpage,
     .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
 };
 static const struct vnode_ops e2_dir_ops = {
@@ -1223,6 +1366,8 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
     uint8_t *pool = kmalloc(CACHE_BYTES);
     if (!fs->bufs || !pool) { kfree(pool); r = -ENOMEM; goto fail; }
     for (uint32_t i = 0; i < fs->nbufs; i++) fs->bufs[i].data = pool + (size_t)i * fs->bs;
+    uint64_t ra = pmm_alloc_contig(RA_PAGES);           /* none: the page cache reads page by page */
+    fs->ra_buf = (uint8_t *)(uintptr_t)ra;
 
     struct mount *m = kzalloc(sizeof *m);
     if (!m) { r = -ENOMEM; goto fail; }

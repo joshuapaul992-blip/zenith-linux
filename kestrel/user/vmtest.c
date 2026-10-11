@@ -19,6 +19,7 @@
 #include <sched.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/statfs.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -58,6 +59,78 @@ static long rss_kib(void)
     close(fd);
     char *v = strstr(b, "VmRSS:");
     return v ? atol(v + 6) : -1;
+}
+
+/* ---- the page cache (include/kernel/pagecache.h) --------------------------------- */
+static unsigned long kstat_field(const char *line, const char *key)
+{
+    char b[8192] = { 0 };
+    int fd = open("/proc/kstat", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = 0, r;
+    while (n < (ssize_t)sizeof b - 1 && (r = read(fd, b + n, sizeof b - 1 - n)) > 0) n += r;
+    close(fd);
+    char *l = strstr(b, line);
+    char *v = l ? strstr(l, key) : NULL;
+    return v ? strtoul(v + strlen(key), NULL, 10) : 0;
+}
+
+static unsigned char pat(size_t i) { return (unsigned char)(i * 131 + (i >> 12) * 7); }
+
+/* Files on the ext2 root: read(), private mappings and writes agree. */
+static void pagecache_checks(void)
+{
+    const long pg = 4096;
+    struct statfs sf;
+    if (statfs("/", &sf) || sf.f_type != 0xEF53) { printf("  skip  page cache: the root is not ext2\n"); return; }
+    const char *path = "/.vmtest-pagecache";
+    const size_t big = 6u << 20;                        /* more than the 4 MiB block cache */
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    unsigned char *w = malloc(big), *rb = malloc(big);
+    if (fd < 0 || !w || !rb) { CHECK(0, "page cache: create a file on the root"); return; }
+    for (size_t i = 0; i < big; i++) w[i] = pat(i);
+    CHECK(write(fd, w, big) == (ssize_t)big && fsync(fd) == 0, "page cache: write 6 MiB to an ext2 file");
+    unsigned long ra0 = kstat_field("pagecache ", "readahead=");
+    lseek(fd, 0, SEEK_SET);
+    size_t got = 0;
+    ssize_t r;
+    while (got < big && (r = read(fd, rb + got, 100000)) > 0) got += (size_t)r;
+    CHECK(got == big && !memcmp(rb, w, big), "...read() returns exactly those bytes");
+    CHECK(kstat_field("pagecache ", "readahead=") > ra0, "...reading it from the disk read ahead");
+
+    unsigned char *m = mmap(NULL, big, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(m != MAP_FAILED && !memcmp(m, w, big), "a private mapping shows the same bytes");
+    unsigned char *m2 = mmap(NULL, 4 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    CHECK(m2 != MAP_FAILED && m2[100] == pat(100), "a second, writable private mapping too");
+    m2[100] = 0xAB;
+    unsigned char c1;
+    pread(fd, &c1, 1, 100);
+    CHECK(c1 == pat(100) && m[100] == pat(100), "...a store to it changes neither the file nor other mappings");
+    pwrite(fd, "PCACHE", 6, 200);
+    CHECK(!memcmp(m + 200, "PCACHE", 6), "...write() shows up in a read-only mapping (it maps the cached page)");
+    CHECK(m2[100] == 0xAB && m2[200] == pat(200), "...but not in a page already copied on write");
+    int st;
+    pid_t c = fork();
+    if (c == 0) _exit(!memcmp(m + 200, "PCACHE", 6) && m[big - 1] == pat(big - 1) ? 0 : 1);
+    waitpid(c, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "...a child sees the same mapping");
+
+    CHECK(ftruncate(fd, 5000) == 0 && m[4999] == pat(4999) && m[6000] == 0, "ftruncate: the cut part of the page reads zeros");
+    CHECK(ftruncate(fd, 20000) == 0 && pread(fd, rb, 20000, 0) == 20000 && rb[4999] == pat(4999) &&
+          rb[5000] == 0 && rb[19999] == 0, "...grown again: zeros after the old end");
+    munmap(m, big);
+    munmap(m2, 4 * pg);
+
+    char mi[2048] = { 0 };
+    int mfd = open("/proc/meminfo", O_RDONLY);
+    read(mfd, mi, sizeof mi - 1);
+    close(mfd);
+    char *cl = strstr(mi, "Cached:");
+    CHECK(cl && atol(cl + 7) > 0 && strstr(mi, "MemAvailable:"), "/proc/meminfo: Cached and MemAvailable");
+    close(fd);
+    unlink(path);
+    free(w);
+    free(rb);
 }
 
 /* ---- vDSO (include/kernel/vdso.h) -------------------------------------------- */
@@ -304,6 +377,7 @@ int main(void)
     readlink("/proc/self/exe", exe, sizeof exe - 1);    /* /boot/bin/vmtest or /bin/vmtest */
     CHECK(strstr(maps, "[stack]") && strstr(maps, "r-xp") && exe[0] && strstr(maps, exe), "/proc/self/maps lists the regions");
     vdso_checks();
+    pagecache_checks();
 
     /* ---- out of memory ----------------------------------------------------- */
     c = fork();

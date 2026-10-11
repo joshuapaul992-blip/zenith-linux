@@ -7,8 +7,8 @@
  *   kstat -d OLD NEW      the change between two saved copies of a kstat file
  *
  * Every line of the kstat files is "key name=value ...", values cumulative;
- * two snapshots are subtracted field by field (max_* and threads are shown
- * as they are). Lines that did not change are left out. */
+ * two snapshots are subtracted field by field (max_*, cached_* and threads
+ * are shown as they are). Lines that did not change are left out. */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +65,7 @@ static long long field(const char *l, const char *name, size_t nlen)
 /* max_* and threads are levels, not totals: shown as they are */
 static bool cumulative(const char *name, size_t nlen)
 {
-    return strncmp(name, "max_", 4) && !(nlen == 7 && !strncmp(name, "threads", 7));
+    return strncmp(name, "max_", 4) && strncmp(name, "cached_", 7) && !(nlen == 7 && !strncmp(name, "threads", 7));
 }
 
 static void print_diff(const char *a, const char *b)

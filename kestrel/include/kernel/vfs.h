@@ -52,6 +52,12 @@ struct vnode_ops {
      * MAP_SHARED mappings and read()/write() see the same bytes (ramfs,
      * memfd). NULL: no shared mappings of this file. */
     struct vm_object *(*vmobject)(struct vnode *vn);
+    /* Optional, regular files of a disk file system: the page cache's
+     * frame holding the file's bytes [idx * 4096, +4096), zero past the
+     * end, with a reference for the caller (page_unref when done). With
+     * `io` false only a page already cached (*phys = 0 if none). Private
+     * mappings map these frames instead of copying (pagecache.h). */
+    int     (*getpage)(struct vnode *vn, uint64_t idx, bool io, uint64_t *phys);
     /* Optional: the time_ms() at which readiness may change on its own
      * (timerfd expiry), so poll/epoll sleep exactly that long. 0: never. */
     uint64_t (*poll_deadline)(struct file *f);

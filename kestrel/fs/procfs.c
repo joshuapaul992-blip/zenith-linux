@@ -7,6 +7,7 @@
 #include <kernel/uvm.h>
 #include <kernel/cpu.h>
 #include <kernel/mm.h>
+#include <kernel/pagecache.h>
 #include <kernel/arch.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
@@ -42,8 +43,14 @@ static size_t gen_uptime(char *buf, size_t cap, void *ctx)
 static size_t gen_meminfo(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
+    struct pcache_stats pc;
+    pcache_stats(&pc);
+    uint64_t cached = pc.pages * PAGE_SIZE;
     P("MemTotal:      %8lu kB\n", pmm_total_bytes() >> 10);
     P("MemFree:       %8lu kB\n", pmm_free_bytes() >> 10);
+    P("MemAvailable:  %8lu kB\n", (pmm_free_bytes() + cached) >> 10);   /* the page cache gives way */
+    P("Buffers:       %8lu kB\n", 0ul);
+    P("Cached:        %8lu kB\n", cached >> 10);
     P("KernelImage:   %8lu kB\n", (uint64_t)(_kernel_end - _kernel_start) >> 10);
     P("HeapTotal:     %8zu kB\n", heap_size() >> 10);
     P("HeapUsed:      %8zu kB\n", heap_used() >> 10);

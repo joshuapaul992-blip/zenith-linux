@@ -170,7 +170,9 @@ int neofetch_main(struct cu_io *io, int argc, char **argv)
     if (cu_read_small("/proc/meminfo", buf, sizeof buf) > 0) {
         uint64_t total = 0, free = 0;
         if (field(buf, "MemTotal", tmp, sizeof tmp)) { char *k = strchr(tmp, ' '); if (k) *k = 0; cu_parse_u64(tmp, 10, &total); }
-        if (field(buf, "MemFree", tmp, sizeof tmp))  { char *k = strchr(tmp, ' '); if (k) *k = 0; cu_parse_u64(tmp, 10, &free); }
+        if (field(buf, "MemAvailable", tmp, sizeof tmp) || field(buf, "MemFree", tmp, sizeof tmp)) {
+            char *k = strchr(tmp, ' '); if (k) *k = 0; cu_parse_u64(tmp, 10, &free);     /* cached files count as free */
+        }
         snprintf(val, sizeof val, "%luMiB / %luMiB", (total - free) >> 10, total >> 10);
         add(lines, &n, "Memory", val, tty);
     }

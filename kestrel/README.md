@@ -541,6 +541,7 @@ mm/           pmm.c          bitmap frame allocator from the MB2 memory map, fra
               vm.c           user address spaces: regions (VMAs), demand paging, copy-on-write,
                              NX, mmap/munmap/mprotect/mremap/madvise/mincore/brk, OOM killer
               vmobj.c        page-backed memory objects (ramfs files, memfd, shared anonymous)
+              pagecache.c    disk files' pages, shared by read() and every private mapping; eviction
               uvm.c          user address-space layout, kernel page-table sharing
 
 proc/task.c                  TCBs, round-robin scheduler on every CPU (10 ms quantum; an idle class for
@@ -623,7 +624,7 @@ The calling convention is the Linux x86_64 one: the call number goes in `rax`, t
 - per CPU: time holding the big kernel lock, waiting for it, halted, and the rest (user code);
 - system calls by number: calls, time on the CPU, wall time and the longest single call;
 - page faults by kind (anonymous, file, shared, copy-on-write), with their time, and the pages read from files;
-- block requests per disk (count, bytes, busy time), and ext2 block cache hits and misses;
+- block requests per disk (count, bytes, busy time), ext2 block cache hits and misses, and the page cache (files and pages cached, hits, misses, pages read ahead, pages evicted);
 - per process and per thread: run time, system calls, lock waits, faults and I/O.
 
 `/proc/kstat` has the totals and a table of processes, and `/proc/PID/kstat` one process and its threads. Every line is `key name=value ...` and cumulative, so `kstat` (in `/bin`) can subtract two snapshots: `kstat 10` shows the last 10 seconds, `kstat CMD ARGS` what happened while a command ran, `kstat -d OLD NEW` the change between two saved copies, and `kstat -p PID` the same for one process. The `report` command of the kernel shell writes the totals into `REPORT.TXT` as well, for machines without a serial port.
@@ -856,7 +857,7 @@ make usbimg
 | Program | What it checks |
 |---|---|
 | `faulttest` | 38 checks: faults to signals with the right `si_code`/`si_addr`, handlers that recover, `-EFAULT` for bad pointers in every kind of call, kernel stays up |
-| `vmtest` | 54 checks (55 with the TSC clock): demand paging, copy-on-write, NX, mprotect, file and shared mappings, memfd and seals, mremap, madvise, mincore, brk, OOM killer, the vDSO (its pages, every clock against the kernel's, `getcpu`, write protection, after fork, and its speed) |
+| `vmtest` | 66 checks (67 with the TSC clock): demand paging, copy-on-write, NX, mprotect, file and shared mappings, memfd and seals, mremap, madvise, mincore, brk, OOM killer, the page cache on an ext2 root (read, mappings and writes agree, read-ahead, truncation), the vDSO (its pages, every clock against the kernel's, `getcpu`, write protection, after fork, and its speed) |
 | `kstat` | not a test: the change in the performance counters over N seconds or while a command runs (`/proc/kstat`) |
 | `dyntest` | a dynamically linked program and shared library through musl's ld.so |
 | `threadtest` | 41 checks: pthreads, TLS, mutex/condvar/semaphore contention, every futex operation and timeout, process-shared futexes, signals and threads, exit/exit_group, fork and execve from threads, robust mutexes, 450 thread lifecycles |
@@ -898,6 +899,7 @@ How it handles everything else:
 How it works:
 - **Inodes:** hard links share one in-memory copy of the raw on-disk inode, so fields Kestrel does not interpret survive a write.
 - **Write-back cache:** metadata and data go through a block cache (4 MiB per volume). A kernel thread writes dirty blocks every 5 seconds; `sync`, `fsync`, `poweroff` and `reboot` write everything.
+- **Page cache** (`mm/pagecache.c`): regular files are read through it, page by page. A page comes from the disk on first use, with up to 31 more when their blocks follow on the disk, all in one request (128 KiB); a block the block cache holds is copied from there, as it may be newer. Private mappings, which is to say every program and library, map the cached frames themselves, read-only: all the processes running Firefox share one copy of `libxul.so`, and only a write to a private mapping makes a copy of a page. A file fault also maps the neighbours already cached in its 64 KiB. Writes update cached pages as they go to the block cache, so the cache never needs writing back, and when memory runs low the least recently used files lose the pages nobody maps; `/proc/meminfo` counts them as `Cached` and in `MemAvailable`.
 - **Clean flag:** the superblock is marked clean only at shutdown, like an unmount on Linux, so `e2fsck` checks a volume that was not shut down cleanly.
 - **Untrusted disk:** nothing on it is trusted. Block numbers are range-checked before any I/O, and directory records are validated. A corrupt structure gives `EIO`, not a kernel fault.
 - **Free blocks:** new blocks come zeroed, so no stale data reaches a file, and an unlinked file that is still open keeps its blocks until the last close.
@@ -1075,7 +1077,7 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 Phase 1 (foundations for real applications) is done: user mode with fault-safe user access, demand-paged copy-on-write memory with W^X and NX, dynamic linking, threads and futexes, epoll and the other event descriptors, descriptor passing, and SMP. Next, in order:
 
 1. **Finer kernel locking:** split the big kernel lock (scheduler run queue, memory manager, VFS, sockets), so system-call-heavy programs scale across CPUs.
-2. **A writable file system**: done for ext2, with symbolic links and the root on disk (see above). Next: ext4 extents, a page cache (shared writable mappings of disk files), `mount(2)`.
+2. **A writable file system**: done for ext2, with symbolic links and the root on disk (see above). A page cache shares file pages between processes (see above). Next: ext4 extents, shared writable mappings of disk files, `mount(2)`.
 3. **Networking:** done (see Networking): IPv4, TCP, UDP, DHCP, and drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168. Next: IPv6, card interrupts and offloads, Intel I219 and Realtek RTL8125.
 4. **Job control** (stop/continue signals, `SIGTSTP`/`SIGCONT` on the terminal).
 5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.

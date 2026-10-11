@@ -8,6 +8,7 @@
 #include <kernel/syscall.h>
 #include <kernel/block.h>
 #include <kernel/ext2.h>
+#include <kernel/pagecache.h>
 #include <kernel/report.h>
 #include <kernel/string.h>
 
@@ -177,6 +178,10 @@ size_t kstat_gen(char *buf, size_t cap)
     uint64_t hits, misses;
     ext2_cache_stats(&hits, &misses);
     P("ext2 cache_hits=%lu cache_misses=%lu\n", hits, misses);
+    struct pcache_stats pc;
+    pcache_stats(&pc);
+    P("pagecache cached_files=%lu cached_pages=%lu hits=%lu misses=%lu readahead=%lu evicted=%lu\n",
+      pc.files, pc.pages, pc.hits, pc.misses, pc.ahead, pc.evicted);
 
     /* system calls by on-CPU time */
     P("# system calls by time on the CPU (wall includes sleeping; max_cpu_us is the longest single call)\n");
