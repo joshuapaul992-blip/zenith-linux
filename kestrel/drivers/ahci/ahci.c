@@ -20,6 +20,7 @@
 #define T_SIG_US         100000u    /* first D2H FIS (signature) to arrive    */
 #define T_IDLE_US       5000000u    /* PxTFD.BSY/DRQ to clear (disk spin-up)  */
 #define T_CMD_US       10000000u    /* single command completion              */
+#define T_FLUSH_US     60000000u    /* FLUSH CACHE: the whole write cache (Linux: 60 s) */
 #define T_HANDOFF_US      25000u    /* BIOS to release ownership (spec 25 ms) */
 #define T_BIOS_BUSY_US  2000000u    /* BIOS busy cleanup (spec 2 s)           */
 
@@ -287,6 +288,7 @@ static int run_cmd(struct port_state *p, uint8_t ata_cmd, uint64_t lba, uint16_t
     REG(r->ci) = 1u << slot;
 
     uint32_t bit = 1u << slot, is = 0, waited = 0;
+    uint32_t limit = ata_cmd == ATA_CMD_FLUSH_CACHE_EXT ? T_FLUSH_US : T_CMD_US;
     int err = AHCI_OK;
     for (uint32_t spin = 0;; spin++) {
         is = REG(r->is);
@@ -294,7 +296,7 @@ static int run_cmd(struct port_state *p, uint8_t ata_cmd, uint64_t lba, uint16_t
         if (is & (AHCI_PxIS_HBFS | AHCI_PxIS_HBDS | AHCI_PxIS_IFS)) { err = AHCI_ERR_HBA; break; }
         if (!(REG(r->ci) & bit)) break;
         if (spin > 2000) {                      /* stop spinning, start sleeping */
-            if (waited >= T_CMD_US) { err = AHCI_ERR_TIMEOUT; break; }
+            if (waited >= limit) { err = AHCI_ERR_TIMEOUT; break; }
             delay_us(p->hba, 10); waited += 10;
         }
     }
