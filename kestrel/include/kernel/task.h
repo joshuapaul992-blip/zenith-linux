@@ -18,7 +18,7 @@ enum task_state {
     TASK_READY,         /* runnable, waiting for the CPU            */
     TASK_RUNNING,       /* currently on the CPU                     */
     TASK_BLOCKED,       /* sleeping on a wait channel (I/O)          */
-    TASK_SLEEPING,      /* timed sleep until wake_tick               */
+    TASK_SLEEPING,      /* timed sleep until wake_ms                 */
     TASK_ZOMBIE,        /* exited, waiting to be reaped              */
 };
 
@@ -100,9 +100,9 @@ struct tcb {
     /* scheduling */
     int       quantum;
     bool      idle_class;       /* runs only when no other task is ready    */
-    uint64_t  wake_tick;
+    uint64_t  wake_ms;          /* uptime_ms() to wake a TASK_SLEEPING task */
     void     *wait_chan;
-    uint64_t  cpu_ticks, switches, start_tick;
+    uint64_t  cpu_ticks, switches, start_tick;   /* start_tick: uptime in PIT_HZ ticks */
     int       exit_code;
     int       waiters;          /* task_wait() callers: not reaped yet   */
 

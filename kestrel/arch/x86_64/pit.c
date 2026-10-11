@@ -4,6 +4,7 @@
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
 #include <kernel/task.h>
+#include <kernel/time.h>
 
 #define PIT_BASE_HZ 1193182u
 
@@ -46,7 +47,14 @@ void pit_init(uint32_t hz)
 }
 
 uint64_t pit_ticks(void) { return ticks; }
-uint64_t uptime_ms(void) { return ticks * 1000 / tick_hz; }
+/* From the clocksource when there is one: a tick that arrives late (the boot
+ * CPU busy with interrupts off) is merged with the next, and counting ticks
+ * then loses time, a quarter of it in a busy QEMU guest. */
+uint64_t uptime_ms(void)
+{
+    uint64_t ns = time_ns();
+    return ns ? ns / 1000000 : ticks * 1000 / tick_hz;
+}
 
 void pit_sleep_ms(uint64_t ms)
 {

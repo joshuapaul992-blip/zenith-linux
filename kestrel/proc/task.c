@@ -274,7 +274,7 @@ void task_block_self(void *chan, uint64_t deadline_ms)
     cur->wait_chan = chan;
     if (deadline_ms) {
         uint64_t now = time_ms();
-        cur->wake_tick = pit_ticks() + (deadline_ms > now ? (deadline_ms - now) * PIT_HZ / 1000 : 0);
+        cur->wake_ms = uptime_ms() + (deadline_ms > now ? deadline_ms - now : 0);
         cur->state = TASK_SLEEPING;
     } else {
         cur->state = TASK_BLOCKED;
@@ -319,7 +319,7 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     strlcpy(t->name, name, sizeof t->name);
     t->cr3 = read_cr3();
     t->quantum = SCHED_QUANTUM;
-    t->start_tick = pit_ticks();
+    t->start_tick = uptime_ms() * PIT_HZ / 1000;
     t->tty = cur ? cur->tty : 0;
     t->bkl_depth = 1;                   /* starts inside schedule(), lock held */
     t->state = TASK_READY;              /* no preemption of the creator: an idle CPU may take it */
@@ -418,10 +418,10 @@ void sched_tick_local(void)
 void sched_tick(void)
 {
     if (!running) return;
-    uint64_t now = pit_ticks();
+    uint64_t now = uptime_ms();
     uint64_t ms = time_ms();
     for (int i = 1; i < MAX_TASKS; i++) {
-        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_tick <= now) make_ready(&tasks[i]);
+        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_ms <= now) make_ready(&tasks[i]);
         struct signal_struct *g = tasks[i].signal;      /* ITIMER_REAL: per process, on its leader */
         if (g && g->alarm_at && ms >= g->alarm_at && tasks[i].pid == tasks[i].tgid &&
             tasks[i].state != TASK_ZOMBIE && tasks[i].state != TASK_UNUSED) {
@@ -515,7 +515,7 @@ void task_sleep_ms(uint64_t ms)
         return;
     }
     cur->wait_chan = NULL;
-    cur->wake_tick = pit_ticks() + ms * PIT_HZ / 1000;
+    cur->wake_ms = uptime_ms() + ms;
     cur->state = TASK_SLEEPING;
     schedule();
     irq_restore(f);

@@ -10,7 +10,8 @@
  * turn out not to be in step (smp.c checks each CPU as it starts), the
  * clock goes back to the HPET.
  * Either works with interrupts disabled, which is what boot-time device
- * settling needs: the 1 kHz PIT tick (uptime_ms) only runs after sti. */
+ * settling needs: the 1 kHz tick only runs after sti. uptime_ms() reads
+ * this clock too, and counts ticks only when there is none. */
 #ifndef KESTREL_TIME_H
 #define KESTREL_TIME_H
 
