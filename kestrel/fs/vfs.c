@@ -3,6 +3,7 @@
  *   ramfs   - regular files backed by a growable heap buffer
  *   pseudo  - read-only files whose content is generated on each read */
 #include <kernel/vfs.h>
+#include <kernel/inotify.h>
 #include <kernel/mm.h>
 #include <kernel/task.h>
 #include <kernel/string.h>
@@ -249,13 +250,16 @@ static int create_node(struct vnode *dir, const char *name, enum vtype t, uint32
     strlcpy(vn->name, name, sizeof vn->name);
     vfs_node_add(dir, vn);
     *out = vn;
+    inotify_event(dir, IN_CREATE | (t == VDIR ? IN_ISDIR : 0), name, 0);
     return 0;
 }
 
 static int setattr(struct vnode *vn)
 {
     vn->ctime = (uint64_t)time_realtime_sec();
-    return vn->ops && vn->ops->setattr ? vn->ops->setattr(vn) : 0;
+    int r = vn->ops && vn->ops->setattr ? vn->ops->setattr(vn) : 0;
+    if (!r) inotify_self(vn, IN_ATTRIB);
+    return r;
 }
 
 int vfs_mkdir_at(struct vnode *base, const char *path, mode_t mode)
@@ -304,6 +308,7 @@ int vfs_mksock(const char *path, mode_t mode, struct vnode **out)
     if (!s) return -ENOMEM;
     vfs_node_add(parent, s);                            /* in memory only, also on a disk */
     *out = s;
+    inotify_event(parent, IN_CREATE, name, 0);
     return 0;
 }
 
@@ -318,6 +323,7 @@ static struct vnode *entry_named(struct vnode *dir, const char *name)
 
 static void node_destroy(struct vnode *vn)
 {
+    inotify_vnode_gone(vn);
     if (vn->ops && vn->ops->evict) vn->ops->evict(vn);
     if (vn->ops == &ramfs_ops && vn->type == VREG && vn->data) vmobj_put(vn->data);
     if (vn->ops == &ramfs_link_ops) kfree(vn->data);
@@ -341,6 +347,8 @@ static int remove_node(struct vnode *dir, struct vnode *vn)
         int r = dir->ops->remove(dir, vn);
         if (r < 0) return r;
     }
+    inotify_event(dir, IN_DELETE | (vn->type == VDIR ? IN_ISDIR : 0), vn->name, 0);
+    inotify_event(vn, IN_DELETE_SELF, NULL, 0);
     node_remove(dir, vn);
     node_free(vn);
     return 0;
@@ -413,10 +421,14 @@ int vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, co
         }
     }
     if (op->ops && op->ops->rename && (r = op->ops->rename(op, vn, np, nname, old)) < 0) return r;
-    if (old) { node_remove(np, old); node_free(old); }
+    if (old) { inotify_event(old, IN_DELETE_SELF, NULL, 0); node_remove(np, old); node_free(old); }
     node_remove(op, vn);
     strlcpy(vn->name, nname, sizeof vn->name);
     vfs_node_add(np, vn);
+    uint32_t cookie = inotify_cookie(), isdir = vn->type == VDIR ? IN_ISDIR : 0;
+    inotify_event(op, IN_MOVED_FROM | isdir, oname, cookie);
+    inotify_event(np, IN_MOVED_TO | isdir, nname, cookie);
+    inotify_event(vn, IN_MOVE_SELF, NULL, 0);
     return 0;
 }
 
@@ -437,6 +449,8 @@ int vfs_link_at(struct vnode *obase, const char *from, bool follow, struct vnode
     if ((r = parent->ops->link(parent, name, vn, &nv)) < 0) return r;
     strlcpy(nv->name, name, sizeof nv->name);
     vfs_node_add(parent, nv);
+    inotify_event(parent, IN_CREATE, name, 0);
+    inotify_self(vn, IN_ATTRIB);
     return 0;
 }
 
@@ -655,7 +669,7 @@ ssize_t vfs_pwrite(struct file *f, const void *buf, size_t len, uint64_t off)
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     if (f->vn->type != VREG || !f->vn->ops || !f->vn->ops->write) return -ESPIPE;
     ssize_t n = f->vn->ops->write(f->vn, buf, len, off);
-    if (n > 0) f->vn->mtime = (uint64_t)time_realtime_sec();
+    if (n > 0) { f->vn->mtime = (uint64_t)time_realtime_sec(); inotify_self(f->vn, IN_MODIFY); }
     return n;
 }
 
@@ -666,7 +680,11 @@ ssize_t vfs_write(struct file *f, const void *buf, size_t len)
     if (!f->vn->ops || !f->vn->ops->write) return -EINVAL;
     if (f->flags & O_APPEND) f->off = node_size(f->vn);
     ssize_t n = f->vn->ops->write(f->vn, buf, len, f->off);
-    if (n > 0) { f->off += (uint64_t)n; f->vn->mtime = (uint64_t)time_realtime_sec(); }
+    if (n > 0) {
+        f->off += (uint64_t)n;
+        f->vn->mtime = (uint64_t)time_realtime_sec();
+        if (f->vn->type == VREG) inotify_self(f->vn, IN_MODIFY);
+    }
     return n;
 }
 
@@ -802,6 +820,8 @@ void vfs_close(struct file *f)
     if (f->ep_links) epoll_file_closing(f);            /* leaves every epoll set */
     flock_drop(f);
     struct vnode *vn = f->vn;
+    if (vn && (vn->type == VREG || vn->type == VDIR))
+        inotify_self(vn, (f->flags & O_ACCMODE) != O_RDONLY ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE);
     bool last = vn && __atomic_sub_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL) == 0 && vn->unlinked;
     if (vn && vn->ops && vn->ops->release) vn->ops->release(f);    /* may free a socket's vnode */
     kfree(f);
@@ -911,7 +931,7 @@ int vfs_truncate(struct vnode *vn, uint64_t size)
     if (vn->fs && (vn->fs->flags & MNT_RDONLY)) return -EROFS;
     if (!vn->ops || !vn->ops->truncate) return -EINVAL;
     int r = vn->ops->truncate(vn, size);
-    if (!r) vn->mtime = (uint64_t)time_realtime_sec();
+    if (!r) { vn->mtime = (uint64_t)time_realtime_sec(); inotify_self(vn, IN_MODIFY); }
     return r;
 }
 

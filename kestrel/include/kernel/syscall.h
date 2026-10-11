@@ -218,6 +218,10 @@ struct int_frame;
 #define SYS_clone3       435
 #define SYS_close_range  436
 #define SYS_faccessat2   439
+#define SYS_inotify_init  253
+#define SYS_inotify_add_watch 254
+#define SYS_inotify_rm_watch 255
+#define SYS_inotify_init1 294
 #define SYS_shmget        29
 #define SYS_shmat         30
 #define SYS_shmctl        31

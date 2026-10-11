@@ -25,6 +25,9 @@
 #include <sys/file.h>
 #include <sys/wait.h>
 #include <sys/xattr.h>
+#include <sys/inotify.h>
+#include <sys/ioctl.h>
+#include <poll.h>
 #include <sys/reboot.h>
 
 static int failures;
@@ -120,6 +123,8 @@ static void rm_rf(const char *path)
 
 static char P[512];
 static const char *in(const char *dir, const char *name) { snprintf(P, sizeof P, "%s/%s", dir, name); return P; }
+
+static void inotify_checks(const char *dir);
 
 static void checks(const char *dir)
 {
@@ -274,12 +279,81 @@ static void checks(const char *dir)
     CHECK(getxattr(a, "user.x", xb, sizeof xb) < 0 && errno == ENODATA, "getxattr: ENODATA");
     CHECK(setxattr(a, "user.x", "1", 1, 0) < 0 && errno == ENOTSUP, "setxattr: ENOTSUP");
 
+    printf("inotify:\n");
+    inotify_checks(dir);
+
     printf("space accounting:\n");
     rm_rf(dir);
     CHECK(access(dir, F_OK) < 0, "rm -r of the whole tree (deleting while reading directories)");
     long free1 = free_blocks("/");
     CHECK(free0 >= 0 && free1 == free0 + 1, "after removing everything, the free count is back (all blocks freed)");
     if (free1 != free0 + 1) printf("  (free before %ld, after %ld; the test directory's own block accounts for 1)\n", free0, free1);
+}
+
+/* inotify: read what is queued into "MASK:name" words, e.g. "100:f 2:f 8:f" */
+static int inotify_drain(int fd, char *out, size_t cap)
+{
+    char buf[4096] __attribute__((aligned(8)));
+    out[0] = 0;
+    int count = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf, sizeof buf);
+        if (n <= 0) break;
+        for (char *p = buf; p < buf + n; ) {
+            struct inotify_event *e = (struct inotify_event *)p;
+            size_t l = strlen(out);
+            snprintf(out + l, cap - l, "%s%x:%s", l ? " " : "", e->mask, e->len ? e->name : "");
+            count++;
+            p += sizeof *e + e->len;
+        }
+    }
+    return count;
+}
+
+static void inotify_checks(const char *dir)
+{
+    char ev[1024], a[256], b[256];
+    int fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    CHECK(fd >= 0, "inotify_init1");
+    char buf[64];
+    CHECK(read(fd, buf, sizeof buf) < 0 && errno == EAGAIN, "inotify: nothing queued, EAGAIN");
+    int wd = inotify_add_watch(fd, dir, IN_ALL_EVENTS);
+    CHECK(wd > 0, "inotify_add_watch on a directory");
+    snprintf(a, sizeof a, "%s/watched", dir);
+    int f = open(a, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    write(f, "x", 1);
+    write(f, "y", 1);                                   /* the same event twice: queued once */
+    close(f);
+    struct pollfd p = { fd, POLLIN, 0 };
+    int avail = 0;
+    CHECK(poll(&p, 1, 0) == 1 && ioctl(fd, FIONREAD, &avail) == 0 && avail > 0, "inotify: readable, FIONREAD counts the bytes");
+    inotify_drain(fd, ev, sizeof ev);
+    CHECK(strstr(ev, "100:watched") && strstr(ev, "2:watched") && strstr(ev, "8:watched") && !strstr(ev, "2:watched 2:watched"),
+          "create, modify (once), close-write of a file in the directory");
+    printf("  (%s)\n", ev);
+    snprintf(b, sizeof b, "%s/renamed", dir);
+    rename(a, b);
+    inotify_drain(fd, ev, sizeof ev);
+    CHECK(strstr(ev, "40:watched") && strstr(ev, "80:renamed"), "rename: moved-from and moved-to");
+    int fw = inotify_add_watch(fd, b, IN_ATTRIB | IN_DELETE_SELF);
+    CHECK(fw > 0 && fw != wd, "a second watch, on the file");
+    chmod(b, 0600);
+    inotify_drain(fd, ev, sizeof ev);
+    CHECK(strstr(ev, "4:") && strstr(ev, "4:renamed"), "chmod: attrib, on the file's watch and the directory's");
+    unlink(b);
+    inotify_drain(fd, ev, sizeof ev);
+    CHECK(strstr(ev, "200:renamed") && strstr(ev, "400:") && strstr(ev, "8000:"), "unlink: delete, delete-self, ignored");
+    snprintf(a, sizeof a, "%s/sub", dir);
+    mkdir(a, 0755);
+    inotify_drain(fd, ev, sizeof ev);
+    CHECK(strstr(ev, "40000100:sub") != NULL, "mkdir: create with IN_ISDIR");
+    rmdir(a);
+    CHECK(inotify_add_watch(fd, "/etc/passwd", IN_MODIFY | IN_ONLYDIR) < 0 && errno == ENOTDIR, "IN_ONLYDIR on a file: ENOTDIR");
+    CHECK(inotify_rm_watch(fd, wd) == 0, "inotify_rm_watch");
+    inotify_drain(fd, ev, sizeof ev);
+    CHECK(strstr(ev, "8000:") != NULL, "...queues IN_IGNORED");
+    CHECK(inotify_rm_watch(fd, wd) < 0 && errno == EINVAL, "...and the watch is gone");
+    close(fd);
 }
 
 #define PERSIST "/var/fstest-persist"

@@ -30,6 +30,7 @@
 #include <kernel/kfb.h>
 #include <kernel/kinput.h>
 #include <kernel/smp.h>
+#include <kernel/inotify.h>
 #include <kernel/vm.h>
 #include <kernel/vmobj.h>
 #include <kernel/futex.h>
@@ -2655,6 +2656,47 @@ static int64_t sys_personality(uint64_t persona, uint64_t a2, uint64_t a3, uint6
 static int64_t sys_absent(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
+/* ---- inotify (fs/inotify.c) ------------------------------------------------- */
+static int64_t sys_inotify_init1(uint64_t flags, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f;
+    int r = inotify_create((int)flags, &f);
+    if (r) return r;
+    return install(f, (flags & O_CLOEXEC) != 0);
+}
+static int64_t sys_inotify_init(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return sys_inotify_init1(0, 0, 0, 0, 0, 0); }
+
+static int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int64_t r;
+    if (!inotify_is(f)) { r = -EINVAL; goto out; }
+    char p[VFS_PATH_MAX];
+    long n = strncpy_from_user(p, (const char *)path, sizeof p);
+    if (n < 0) { r = n == -ENAMETOOLONG ? n : -EFAULT; goto out; }
+    if (!n) { r = -ENOENT; goto out; }
+    struct vnode *vn;
+    r = vfs_lookup_at(NULL, p, !((uint32_t)mask & IN_DONT_FOLLOW), &vn);
+    if (!r) r = inotify_add(f, vn, (uint32_t)mask);
+out:
+    fput(f);
+    return r;
+}
+
+static int64_t sys_inotify_rm_watch(uint64_t fd, uint64_t wd, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int r = inotify_rm(f, (int)wd);
+    fput(f);
+    return r;
+}
+
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -2765,6 +2807,8 @@ void syscall_init(void)
     REG(SYS_fadvise64, sys_fadvise64); REG(SYS_fallocate, sys_fallocate);
     REG(SYS_statx, sys_statx);         REG(SYS_faccessat2, sys_faccessat2);
     REG(SYS_close_range, sys_close_range); REG(SYS_clone3, sys_clone3);
+    REG(SYS_inotify_init, sys_inotify_init); REG(SYS_inotify_init1, sys_inotify_init1);
+    REG(SYS_inotify_add_watch, sys_inotify_add_watch); REG(SYS_inotify_rm_watch, sys_inotify_rm_watch);
     REG(SYS_getcpu, sys_getcpu);       REG(SYS_clock_nanosleep, sys_clock_nanosleep);
     REG(SYS_getpriority, sys_getpriority); REG(SYS_setpriority, sys_setpriority);
     REG(SYS_sched_getscheduler, sys_sched_getscheduler); REG(SYS_sched_setscheduler, sys_sched_setscheduler);
