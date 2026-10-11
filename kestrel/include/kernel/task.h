@@ -117,6 +117,7 @@ struct tcb {
     struct mm *mm;              /* address space (vm.h); shared by vfork    */
     uint64_t  pml4;             /* = mm->pml4, 0 = the kernel's             */
     uint64_t  fs_base;          /* TLS pointer (arch_prctl ARCH_SET_FS)    */
+    uint64_t  gs_base;          /* user GS base (arch_prctl ARCH_SET_GS)   */
     uint64_t  tid_address;      /* set_tid_address()                       */
     uint8_t   fpu[512] __attribute__((aligned(16)));    /* fxsave area     */
 
@@ -141,6 +142,7 @@ struct tcb {
     struct ksig_info siginfo[NSIG];
 
     int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
+    int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */
 };
 
 /* shared process state (proc/task.c) */
@@ -164,7 +166,8 @@ __attribute__((noreturn)) void task_exit(int code);
 void        schedule(void);             /* call with interrupts disabled */
 void        sched_yield(void);
 void        task_set_idle_class(struct tcb *t);  /* background work (kworker/0) */
-void        sched_tick(void);           /* from the timer IRQ            */
+void        sched_tick(void);           /* boot CPU timer: sleepers, alarms, slice */
+void        sched_tick_local(void);     /* other CPUs' timers: slice only          */
 void        sched_idle_loop(void) __attribute__((noreturn));
 
 /* A sleeping, recursive mutex: the owner may lock it again (a page fault

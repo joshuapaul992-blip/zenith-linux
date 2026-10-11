@@ -26,6 +26,7 @@
 #include <kernel/termios.h>
 #include <kernel/kfb.h>
 #include <kernel/kinput.h>
+#include <kernel/smp.h>
 #include <kernel/vm.h>
 #include <kernel/vmobj.h>
 #include <kernel/futex.h>
@@ -788,6 +789,13 @@ static int64_t sys_arch_prctl(uint64_t code, uint64_t addr, uint64_t a3, uint64_
         return 0;
     case ARCH_GET_FS:
         return put_user_u64((void *)addr, t->fs_base);
+    case 0x1001:                                        /* ARCH_SET_GS: lives in KERNEL_GS_BASE */
+        if (addr >= UVM_USER_END) return -EPERM;        /* never a percpu (kernel) address */
+        t->gs_base = addr;
+        wrmsr(0xC0000102, addr);
+        return 0;
+    case 0x1004:                                        /* ARCH_GET_GS */
+        return put_user_u64((void *)addr, rdmsr(0xC0000102));
     default:
         return -EINVAL;
     }
@@ -827,14 +835,15 @@ static int64_t sys_get_robust_list(uint64_t tid, uint64_t uhead, uint64_t ulen, 
     return 0;
 }
 
-/* One CPU (for now): the mask always has bit 0. */
+/* Every task may run on every online CPU (no affinity yet). */
 static int64_t sys_sched_getaffinity(uint64_t pid, uint64_t len, uint64_t umask, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
     if (pid && !task_find((int)pid)) return -ESRCH;
     if (len < 8 || (len & 7)) return -EINVAL;
     if (len > 128) len = 128;
-    uint8_t buf[128] = { 1 };
+    uint8_t buf[128] = { 0 };
+    for (int i = 0; i < ncpus; i++) buf[i / 8] |= (uint8_t)(1u << (i % 8));
     if (copy_to_user((void *)umask, buf, len)) return -EFAULT;
     return (int64_t)len;
 }
@@ -2138,21 +2147,26 @@ void syscall_init(void)
     REG(SYS_truncate, sys_truncate);   REG(SYS_fsync, sys_fsync);
     REG(SYS_fdatasync, sys_fsync);     REG(SYS_memfd_create, sys_memfd_create);
 
-    /* SYSCALL/SYSRET fast path (used once ring-3 processes exist) */
+    syscall_cpu_init();
+    int n = 0;
+    for (int i = 0; i < SYS_MAX; i++) if (table[i] && table[i] != sys_enosys) n++;
+    kprintf("syscall: int 0x80 gate + SYSCALL/LSTAR ready, %d calls implemented\n", n);
+}
+
+/* SYSCALL/SYSRET fast path: per-CPU MSRs (every CPU runs this). */
+void syscall_cpu_init(void)
+{
     wrmsr(MSR_EFER, rdmsr(MSR_EFER) | 1);                       /* EFER.SCE */
     wrmsr(MSR_STAR, ((uint64_t)(GDT_USER_DATA - 8) << 48) | ((uint64_t)GDT_KERNEL_CODE << 32));
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
     /* SFMASK: RFLAGS bits cleared on entry. IF off until the kernel stack is
      * in place; DF, TF, AC and NT never leak from user space into the kernel. */
     wrmsr(MSR_FMASK, 0x200 | 0x400 | 0x100 | 0x40000 | 0x4000);
-
-    int n = 0;
-    for (int i = 0; i < SYS_MAX; i++) if (table[i] && table[i] != sys_enosys) n++;
-    kprintf("syscall: int 0x80 gate + SYSCALL/LSTAR ready, %d calls implemented\n", n);
 }
 
 int syscall_dispatch(struct int_frame *f)
 {
+    bkl_enter();                                        /* kernel code: one CPU at a time */
     uint64_t nr = f->rax;
     struct tcb *t = current_task();
     if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
@@ -2181,6 +2195,8 @@ int syscall_dispatch(struct int_frame *f)
     if (t->user && (f->cs & 3) == 3) signal_deliver(f, nr, true);
     int iret = t->iret_return;
     t->iret_return = false;
+    cli();
+    bkl_exit();
     return iret;
 }
 

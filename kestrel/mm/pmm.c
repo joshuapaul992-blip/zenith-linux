@@ -10,6 +10,9 @@
 static uint8_t  bitmap[MAX_FRAMES / 8];      /* 1 = used */
 static uint64_t total_frames, free_frames, highest;
 static uint64_t search_hint;
+static uint64_t low_page;                    /* usable RAM below 640 KiB (AP start-up) */
+
+uint64_t pmm_low_page(void) { return low_page; }
 
 static inline void set_used(uint64_t f) { bitmap[f >> 3] |=  (uint8_t)(1u << (f & 7)); }
 static inline void set_free(uint64_t f) { bitmap[f >> 3] &= (uint8_t)~(1u << (f & 7)); }
@@ -36,6 +39,12 @@ void pmm_init(uintptr_t mbi)
             if (e->type != 1) continue;
             uint64_t s = (e->addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
             uint64_t end = (e->addr + e->len) & ~(PAGE_SIZE - 1);
+            /* real-mode start-up code for other CPUs: prefer 0x8000, else
+             * the lowest usable page above the BIOS data area */
+            for (uint64_t a = s < 0x1000 ? 0x1000 : s; a + PAGE_SIZE <= end && a < 0x9F000; a += PAGE_SIZE) {
+                if (a == 0x8000) low_page = a;
+                else if (!low_page) low_page = a;
+            }
             if (end > PMM_MAX_PHYS) end = PMM_MAX_PHYS;
             for (uint64_t a = s; a < end; a += PAGE_SIZE) {
                 uint64_t f = a / PAGE_SIZE;

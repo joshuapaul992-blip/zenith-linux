@@ -27,6 +27,7 @@
 #include <kernel/exec.h>
 #include <kernel/task.h>
 #include <kernel/uvm.h>
+#include <kernel/smp.h>
 #include <kernel/vm.h>
 #include <kernel/vfs.h>
 #include <kernel/mm.h>
@@ -396,7 +397,7 @@ static int process_main(void *arg)
     t->mm = mm;
     t->user = false;                                    /* kernel thread until enter_user */
     t->pml4 = t->cr3 = mm->pml4;
-    write_cr3(mm->pml4);
+    cpu_load_cr3(mm->pml4);
     irq_restore(f);
 
     static char *const envp[] = { "PATH=/bin", "HOME=/", "TERM=kestrel", "DISPLAY=:0", "SHELL=/bin/sh" };
@@ -430,7 +431,10 @@ static int process_main(void *arg)
     __asm__ volatile("fxrstor %0" :: "m"(t->fpu));
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
+    t->gs_base = 0;
+    wrmsr(0xC0000102, 0);                               /* user GS base (swapped in by enter_user) */
     t->user = true;
+    bkl_exit();                                         /* ring 3 runs without the kernel lock */
     enter_user(entry, sp);
 }
 

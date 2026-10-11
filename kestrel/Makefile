@@ -64,9 +64,10 @@ LDFLAGS   := -nostdlib -static -no-pie -T linker.ld -z max-page-size=0x1000 \
 # ---- sources
 BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
-           arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm
+           arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm \
+           arch/x86_64/trampoline.asm
 C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kernel/futex.c fs/epoll.c fs/anonfd.c mm/vm.c mm/vmobj.c \
-           arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c \
+           arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
            drivers/ahci/ahci.c drivers/nvme/nvme.c kernel/storage.c kernel/ramdisk.c drivers/usb/xhci.c kernel/usbhost.c \
@@ -193,7 +194,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

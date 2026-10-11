@@ -6,10 +6,12 @@
  * may sleep (reading a file, waiting for the OOM killer), so it is not a
  * spinlock. A uaccess copy made while the lock is held can fault again; the
  * mutex is recursive, so that nests. Page frames are reference counted with
- * locked instructions (mm.h). TLB entries of the current address space are
- * invalidated with invlpg (or a CR3 reload for large ranges) right after a
- * page-table entry loses rights or changes frames. */
+ * locked instructions (mm.h). When a page-table entry loses rights or
+ * changes frames, every CPU that has the address space loaded invalidates
+ * the translation (smp.h: tlb_shootdown) before the call goes on, and
+ * frames that were unmapped are freed only after that. */
 #include <kernel/vm.h>
+#include <kernel/smp.h>
 #include <kernel/vmobj.h>
 #include <kernel/uvm.h>
 #include <kernel/mm.h>
@@ -94,16 +96,18 @@ static void walk_range(uint64_t pml4, uint64_t start, uint64_t end, pte_fn fn, v
     }
 }
 
-static bool mm_active(const struct mm *mm) { return (read_cr3() & ADDR_MASK) == mm->pml4; }
-
-static void tlb_page(struct mm *mm, uint64_t va) { if (mm_active(mm)) invlpg(va); }
-
-static void tlb_range(struct mm *mm, uint64_t start, uint64_t end)
+/* Loaded on some CPU? (Each CPU records its CR3: smp.h.) */
+static bool mm_active(const struct mm *mm)
 {
-    if (!mm_active(mm)) return;                         /* other CR3: nothing cached */
-    if (end - start > 64 * PAGE) { write_cr3(read_cr3()); return; }
-    for (uint64_t va = start; va < end; va += PAGE) invlpg(va);
+    for (int i = 0; i < MAX_CPUS; i++)
+        if (cpus[i].online && cpus[i].loaded_cr3 == mm->pml4) return true;
+    return false;
 }
+
+/* Every CPU that has mm loaded drops these translations before we go on
+ * (and before any frame they pointed to is freed or reused). */
+static void tlb_page(struct mm *mm, uint64_t va) { tlb_shootdown(mm->pml4, va, va + PAGE); }
+static void tlb_range(struct mm *mm, uint64_t start, uint64_t end) { tlb_shootdown(mm->pml4, start, end); }
 
 static uint64_t leaf_flags(const struct vma *v, bool writable)
 {
@@ -183,22 +187,41 @@ static int split_at(struct mm *mm, uint64_t a)
     return 0;
 }
 
-struct zap { struct mm *mm; uint64_t n; };
+/* Unmapping gathers the frames and frees them only after the TLB
+ * shootdown: another CPU running this address space may still reach a
+ * frame through a stale translation until then. */
+#define ZAP_BATCH 128
+struct zap { struct mm *mm; uint64_t n, lo, hi; uint64_t frames[ZAP_BATCH]; };
+
+static void zap_flush(struct zap *z)
+{
+    if (!z->n) return;
+    tlb_range(z->mm, z->lo, z->hi);
+    for (uint64_t i = 0; i < z->n; i++) page_unref(z->frames[i]);
+    z->n = 0;
+}
+
 static void zap_fn(uint64_t *pte, uint64_t va, void *ctx)
 {
-    (void)va;
     struct zap *z = ctx;
     uint64_t e = *pte;
     *pte = 0;
-    if (has_frame(e)) { page_unref(e & ADDR_MASK); z->mm->rss--; z->n++; }
+    if (!has_frame(e)) return;
+    if (!z->n) z->lo = va;
+    z->hi = va + PAGE;
+    z->frames[z->n++] = e & ADDR_MASK;
+    z->mm->rss--;
+    if (z->n == ZAP_BATCH) zap_flush(z);
 }
 
 /* Unmap the pages of [start, end) (regions stay). */
 static void zap_range(struct mm *mm, uint64_t start, uint64_t end)
 {
-    struct zap z = { mm, 0 };
+    struct zap z;                                       /* ~1 KiB of the 16 KiB kernel stack */
+    z.mm = mm;
+    z.n = 0;
     walk_range(mm->pml4, start, end, zap_fn, &z);
-    if (z.n) tlb_range(mm, start, end);
+    zap_flush(&z);
 }
 
 /* Remove [start, end) completely: pages and regions. */
@@ -311,7 +334,7 @@ struct mm *mm_fork(struct mm *src)
         walk_range(src->pml4, v->start, v->end, fork_fn, &c);
         err = c.err;
     }
-    if (mm_active(src)) write_cr3(read_cr3());          /* parent lost write access to private pages */
+    tlb_shootdown(src->pml4, 0, UVM_USER_END);          /* the parent lost write access to private pages */
     kmutex_unlock(&src->lock);
     if (err) { mm_put(dst); return NULL; }
     return dst;

@@ -1,5 +1,12 @@
 /* proc/task.c -- kernel threads and a preemptive round-robin scheduler.
  *
+ * SMP: one run queue (the task table) shared by every CPU; each CPU has its
+ * own current task (percpu.current) and idle thread, and runs schedule()
+ * itself from its local timer. The scheduler runs under the big kernel
+ * lock (smp.h), whose depth each task keeps across a switch: a CPU always
+ * holds the lock while it executes kernel code, so a task taken off one
+ * CPU cannot be picked up by another before the switch has finished.
+ *
  * Every thread owns a 16 KiB kernel stack. A switch saves callee-saved
  * registers on the outgoing stack (context_switch in switch.asm) and
  * resumes the incoming thread wherever it last called schedule() -- which,
@@ -16,17 +23,31 @@
 #include <kernel/process.h>
 #include <kernel/time.h>
 #include <kernel/vm.h>
+#include <kernel/smp.h>
 
 extern void context_switch(uint64_t *save_rsp, uint64_t load_rsp);
 extern void thread_trampoline(void);
-extern uint64_t syscall_kernel_rsp;
 extern uint8_t boot_stack[], boot_stack_top[];
 
+#define MSR_KERNEL_GS_BASE 0xC0000102
+
 static struct tcb tasks[MAX_TASKS];
-static struct tcb *cur;
+static struct tcb idle_tasks[MAX_CPUS];            /* the APs' idle threads */
+#define cur          (this_task())           /* writes: this_cpu()->current, irqs off */
+#define need_resched (this_cpu()->need_resched)
 static int next_pid = 1;
-static bool running, preempt = true, need_resched;
+static bool running, preempt = true;
 static uint64_t nswitches;
+
+/* t can run now: mark it, and get an idle CPU (if any) to look. */
+static void make_ready(struct tcb *t)
+{
+    uint64_t f = irq_save();                            /* need_resched: this CPU's */
+    t->state = TASK_READY;
+    need_resched = true;
+    smp_kick_idle();
+    irq_restore(f);
+}
 
 struct tcb *current_task(void) { return cur; }
 bool sched_running(void) { return running; }
@@ -148,9 +169,11 @@ void sched_init(void)
     t->cr3 = read_cr3();
     t->quantum = SCHED_QUANTUM;
     if (!task_state_new(t, NULL)) panic("sched: out of memory");
-    cur = t;
+    t->bkl_depth = 1;
+    this_cpu()->current = t;
+    this_cpu()->idle = t;
     tss_set_kernel_stack((uint64_t)boot_stack_top);
-    syscall_kernel_rsp = (uint64_t)boot_stack_top;
+    this_cpu()->kernel_rsp = (uint64_t)boot_stack_top;
     running = true;
     kprintf("sched: pid 0 (swapper) adopted boot stack, quantum=%dms\n", SCHED_QUANTUM);
 }
@@ -225,10 +248,23 @@ struct tcb *task_slot(int i) { return (i >= 0 && i < MAX_TASKS) ? &tasks[i] : NU
 
 void task_interrupt(struct tcb *t)
 {
-    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
-        t->state = TASK_READY;
-        need_resched = true;
-    }
+    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) make_ready(t);
+}
+
+/* The idle thread of an application processor, on its start-up stack. */
+struct tcb *sched_cpu_idle_task(int cpu, uint8_t *stack, size_t size)
+{
+    struct tcb *t = &idle_tasks[cpu];
+    memset(t, 0, sizeof *t);
+    snprintf(t->name, sizeof t->name, "idle/%d", cpu);
+    t->state = TASK_RUNNING;
+    t->kstack = stack;
+    t->kstack_size = size;
+    t->cr3 = read_cr3();
+    t->quantum = SCHED_QUANTUM;
+    t->bkl_depth = 1;
+    if (!task_state_new(t, NULL)) return NULL;
+    return t;
 }
 
 void task_block_self(void *chan, uint64_t deadline_ms)
@@ -245,10 +281,7 @@ void task_block_self(void *chan, uint64_t deadline_ms)
 
 void task_wake(struct tcb *t)
 {
-    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) {
-        t->state = TASK_READY;
-        need_resched = true;
-    }
+    if (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) make_ready(t);
 }
 
 struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
@@ -286,7 +319,9 @@ struct tcb *task_create(const char *name, int (*entry)(void *), void *arg)
     t->quantum = SCHED_QUANTUM;
     t->start_tick = pit_ticks();
     t->tty = cur ? cur->tty : 0;
-    t->state = TASK_READY;
+    t->bkl_depth = 1;                   /* starts inside schedule(), lock held */
+    t->state = TASK_READY;              /* no preemption of the creator: an idle CPU may take it */
+    smp_kick_idle();
     kprintf("sched: created pid %d (%s)\n", t->pid, t->name);
     return t;
 }
@@ -304,7 +339,8 @@ static bool normal_ready(void)
  * is ready (they are what the CPU does instead of halting). */
 static struct tcb *pick_next(void)
 {
-    int start = (int)(cur - tasks);
+    static int rr;                                      /* idle threads are not in tasks[] */
+    int start = (cur >= tasks && cur < tasks + MAX_TASKS) ? (int)(cur - tasks) : rr++ % MAX_TASKS;
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 1; i <= MAX_TASKS; i++) {
             struct tcb *t = &tasks[(start + i) % MAX_TASKS];
@@ -315,7 +351,7 @@ static struct tcb *pick_next(void)
     }
     /* nothing else runnable: keep the current thread if it can run, else idle */
     if (cur->state == TASK_RUNNING) return cur;
-    return &tasks[0];
+    return this_cpu()->idle;
 }
 
 void schedule(void)
@@ -331,21 +367,27 @@ void schedule(void)
 
     next->switches++;
     nswitches++;
-    cur = next;
+    struct percpu *c = this_cpu();
+    c->current = next;
+    prev->bkl_depth = c->bkl_depth;                     /* each task its own nesting */
+    c->bkl_depth = next->bkl_depth;
     uint64_t ktop = ((uintptr_t)next->kstack + next->kstack_size) & ~0xFull;
     tss_set_kernel_stack(ktop);
-    syscall_kernel_rsp = ktop;
-    /* user processes own SSE state (the kernel is built without SSE) and a
-     * TLS base; kernel threads never touch either */
+    c->kernel_rsp = ktop;
+    /* user processes own SSE state (the kernel is built without SSE), a TLS
+     * base (FS) and a GS base (in KERNEL_GS_BASE while in the kernel);
+     * kernel threads never touch them */
     if (prev->user) {
         __asm__ volatile("fxsave %0" : "=m"(prev->fpu));
         prev->fs_base = rdmsr(MSR_FS_BASE);
+        prev->gs_base = rdmsr(MSR_KERNEL_GS_BASE);
     }
     if (next->user) {
         __asm__ volatile("fxrstor %0" :: "m"(next->fpu));
         wrmsr(MSR_FS_BASE, next->fs_base);
+        wrmsr(MSR_KERNEL_GS_BASE, next->gs_base);
     }
-    if (next->cr3 != prev->cr3) write_cr3(next->cr3);
+    if (next->cr3 != prev->cr3) cpu_load_cr3(next->cr3);
     context_switch(&prev->rsp, next->rsp);
 }
 
@@ -356,20 +398,27 @@ void sched_yield(void)
     irq_restore(f);
 }
 
-void sched_tick(void)
+/* Every CPU, every tick: time accounting and time slices. */
+void sched_tick_local(void)
 {
     if (!running) return;
-    uint64_t now = pit_ticks();
     cur->cpu_ticks++;
     if (cur->pid == 0) ticks_idle++;
     else if (cur->user) ticks_user++;
     else ticks_system++;
+    if (cur->pid == 0) { if (need_resched) schedule(); return; }
+    if (cur->idle_class && preempt && normal_ready()) { schedule(); return; }   /* yield at once */
+    if (preempt && (--cur->quantum <= 0 || need_resched)) schedule();
+}
+
+/* The boot CPU's tick: timed sleeps and interval timers, then its slice. */
+void sched_tick(void)
+{
+    if (!running) return;
+    uint64_t now = pit_ticks();
     uint64_t ms = time_ms();
     for (int i = 1; i < MAX_TASKS; i++) {
-        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_tick <= now) {
-            tasks[i].state = TASK_READY;
-            need_resched = true;
-        }
+        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_tick <= now) make_ready(&tasks[i]);
         struct signal_struct *g = tasks[i].signal;      /* ITIMER_REAL: per process, on its leader */
         if (g && g->alarm_at && ms >= g->alarm_at && tasks[i].pid == tasks[i].tgid &&
             tasks[i].state != TASK_ZOMBIE && tasks[i].state != TASK_UNUSED) {
@@ -377,9 +426,7 @@ void sched_tick(void)
             signal_send(&tasks[i], SIGALRM);
         }
     }
-    if (cur->pid == 0) { if (need_resched) schedule(); return; }
-    if (cur->idle_class && preempt && normal_ready()) { schedule(); return; }   /* yield at once */
-    if (preempt && (--cur->quantum <= 0 || need_resched)) schedule();
+    sched_tick_local();
 }
 
 void sleep_on(void *chan)
@@ -432,10 +479,8 @@ void wakeup(void *chan)
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = &tasks[i];
         if (((t->state == TASK_BLOCKED || t->state == TASK_SLEEPING) && t->wait_chan == chan) ||
-            (polls && t->wait_chan == &poll_seq && (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING))) {
-            t->state = TASK_READY;
-            need_resched = true;
-        }
+            (polls && t->wait_chan == &poll_seq && (t->state == TASK_BLOCKED || t->state == TASK_SLEEPING)))
+            make_ready(t);
     }
 }
 
@@ -493,7 +538,7 @@ void task_exit(int code)
         cur->mm = NULL;
         cur->pml4 = 0;
         cur->cr3 = uvm_kernel_pml4();
-        write_cr3(cur->cr3);
+        cpu_load_cr3(cur->cr3);
         sti();
         mm_put(mm);
         cli();
@@ -528,15 +573,23 @@ int task_wait(int pid)
     return code;
 }
 
+/* A CPU's idle thread. Entered holding the big kernel lock; it lets go of
+ * it while halted, so the other CPUs can run kernel code meanwhile. */
 void sched_idle_loop(void)
 {
+    struct percpu *c = this_cpu();
     for (;;) {
         cli();
         reap_zombies();
         bool ready = false;
         for (int i = 1; i < MAX_TASKS; i++) if (tasks[i].state == TASK_READY) { ready = true; break; }
-        if (ready) { schedule(); sti(); continue; }
+        if (ready) { schedule(); continue; }
+        __atomic_store_n(&c->in_idle, true, __ATOMIC_RELEASE);
+        bkl_exit();
         __asm__ volatile("sti; hlt" ::: "memory");   /* atomic: no lost wakeup */
+        cli();
+        __atomic_store_n(&c->in_idle, false, __ATOMIC_RELEASE);
+        bkl_enter();
     }
 }
 

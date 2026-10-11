@@ -1,4 +1,5 @@
 /* kernel/klog.c -- kernel message log, serial mirror and panic() */
+#include <kernel/smp.h>
 #include <kernel/klog.h>
 #include <kernel/serial.h>
 #include <kernel/console.h>
@@ -66,6 +67,7 @@ void kprintf(const char *fmt, ...)
 void panic(const char *fmt, ...)
 {
     cli();
+    smp_stop_others();          /* NMI to the other CPUs: they halt where they are */
     char buf[256];
     va_list ap; va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);

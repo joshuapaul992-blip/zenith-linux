@@ -90,6 +90,7 @@ user_return:
     pop     rbx
     pop     rax
     add     rsp, 16                     ; vector + error code
+    swapgs                              ; ring 3: user GS
     iretq
 
 enter_user:
@@ -117,4 +118,5 @@ enter_user:
     xor     r13d, r13d
     xor     r14d, r14d
     xor     r15d, r15d
+    swapgs                              ; ring 3: user GS
     iretq

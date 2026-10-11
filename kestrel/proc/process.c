@@ -15,6 +15,7 @@
 #include <kernel/string.h>
 #include <kernel/posix.h>
 #include <kernel/uaccess.h>
+#include <kernel/smp.h>
 #include <kernel/vm.h>
 #include <kernel/futex.h>
 
@@ -194,6 +195,7 @@ static int fork_child_entry(void *arg)
     if (f.vector) put_user_u32((void *)f.vector, (uint32_t)current_task()->pid);
     f.vector = 0x80;
     cli();
+    bkl_exit();                         /* ring 3 runs without the kernel lock */
     user_return(&f);                    /* FPU, FS base and CR3 set by the scheduler */
 }
 
@@ -257,6 +259,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->mm = mm;
     c->pml4 = c->cr3 = mm->pml4;
     c->fs_base = (flags & CLONE_SETTLS) ? tls : rdmsr(MSR_FS_BASE);   /* each thread: its own TLS block */
+    c->gs_base = rdmsr(0xC0000102);                     /* the parent's user GS (swapped out) */
     c->tid_address = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
     c->robust_list = 0;
     __asm__ volatile("fxsave %0" : "=m"(c->fpu));       /* the parent's live SSE state */
@@ -404,7 +407,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     uint64_t fl = irq_save();
     t->mm = nw;
     t->pml4 = t->cr3 = nw->pml4;
-    write_cr3(nw->pml4);
+    cpu_load_cr3(nw->pml4);
     irq_restore(fl);
     uint64_t entry = 0, sp = 0;
     rc = exec_load_image(t, path, &ea, &entry, &sp);
@@ -413,7 +416,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
         fl = irq_save();
         t->mm = old;
         t->pml4 = t->cr3 = old->pml4;
-        write_cr3(old->pml4);
+        cpu_load_cr3(old->pml4);
         irq_restore(fl);
         mm_put(nw);
         goto out;
@@ -457,6 +460,8 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     __asm__ volatile("fxrstor %0" :: "m"(t->fpu));
     t->fs_base = 0;
     wrmsr(MSR_FS_BASE, 0);
+    t->gs_base = 0;
+    wrmsr(0xC0000102, 0);                               /* KERNEL_GS_BASE: the user GS */
     t->tid_address = 0;
     irq_restore(fl);
 

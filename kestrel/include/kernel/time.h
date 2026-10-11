@@ -16,6 +16,8 @@ void        time_init(uintptr_t mbi);   /* after pmm/heap (maps the HPET) */
 uint64_t    time_ns(void);              /* monotonic since time_init()     */
 uint64_t    time_us(void);
 uint64_t    time_ms(void);
+/* An ACPI table by signature ("APIC", "HPET", ...), checksum verified; NULL if absent. */
+const void *acpi_find_table(const char sig[4]);
 void        udelay(uint32_t us);        /* busy-wait, interrupts may be off */
 void        mdelay(uint32_t ms);
 const char *time_source(void);          /* "HPET 100.000 MHz", "TSC 2.394 GHz (PIT-calibrated)" */

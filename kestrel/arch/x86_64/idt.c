@@ -9,6 +9,7 @@
 #include <kernel/uaccess.h>
 #include <kernel/vm.h>
 #include <kernel/posix.h>
+#include <kernel/smp.h>
 
 struct idt_gate {
     uint16_t offset_lo;
@@ -25,8 +26,9 @@ struct idt_ptr { uint16_t limit; uint64_t base; } __attribute__((packed));
 static struct idt_gate idt[256];
 static irq_handler_t irq_handlers[16];
 static uint64_t irq_counts[16];
+static uint64_t stray_vectors;
 
-extern uint64_t isr_stub_table[48];
+extern uint64_t isr_stub_table[256];
 extern void isr_syscall_stub(void);
 
 static void set_gate(int vec, uint64_t handler, uint8_t ist, uint8_t dpl)
@@ -43,13 +45,17 @@ static void set_gate(int vec, uint64_t handler, uint8_t ist, uint8_t dpl)
 void idt_init(void)
 {
     memset(idt, 0, sizeof idt);
-    for (int v = 0; v < 48; v++) {
+    for (int v = 0; v < 256; v++) {
         uint8_t ist = v == 8 ? IST_DOUBLE_FAULT : v == 2 ? IST_NMI : v == 18 ? IST_MACHINE_CHECK : 0;
         set_gate(v, isr_stub_table[v], ist, v == 3 || v == 4 ? 3 : 0);   /* int3/into allowed from ring 3 */
     }
     /* POSIX syscall gate: DPL 3 so ring-3 code may execute `int $0x80` */
     set_gate(SYSCALL_VECTOR, (uint64_t)isr_syscall_stub, 0, 3);
+    idt_load();
+}
 
+void idt_load(void)
+{
     struct idt_ptr p = { sizeof idt - 1, (uint64_t)idt };
     __asm__ volatile("lidt %0" :: "m"(p));
 }
@@ -233,6 +239,7 @@ static void machine_check_report(void)
 
 __attribute__((noreturn)) static void kernel_exception(struct int_frame *f)
 {
+    smp_stop_others();                                  /* the others stop where they are */
     struct tcb *t = current_task();
     kprintf("\n=== KERNEL EXCEPTION %lu: %s ===\n", f->vector, exc_names[f->vector]);
     if (f->vector == 8 && t && task_stack_guard_hit(t, read_cr2()))
@@ -247,6 +254,7 @@ __attribute__((noreturn)) static void kernel_exception(struct int_frame *f)
 
 static void nmi(struct int_frame *f)
 {
+    if (smp_panicking) cpu_halt_forever();              /* another CPU panicked: stop here */
     uint8_t reason = inb(0x61);                         /* system control port B */
     kprintf("nmi: at RIP=%016lx, port 0x61 = %02x%s%s\n", f->rip, reason,
             (reason & 0x80) ? " (memory parity / SERR)" : "", (reason & 0x40) ? " (I/O channel check)" : "");
@@ -273,29 +281,70 @@ static void exception(struct int_frame *f)
     kernel_exception(f);
 }
 
+extern void timer_interrupt(bool boot_cpu);
+
+/* Vectors that need no kernel lock: they touch only this CPU's state. */
+static bool lockless(struct int_frame *f)
+{
+    switch (f->vector) {
+    case 2:                                             /* NMI */
+        nmi(f);
+        return true;
+    case 8: case 18:                                    /* #DF, #MC: state unknown, stop */
+        kernel_exception(f);
+    case VEC_TLB:
+        tlb_service();
+        lapic_eoi();
+        return true;
+    case VEC_RESCHED:                                   /* the idle loop looks after the hlt */
+        lapic_eoi();
+        return true;
+    case VEC_STOP:
+        cpu_halt_forever();
+    case VEC_SPURIOUS:                                  /* no EOI for a spurious interrupt */
+        return true;
+    }
+    return false;
+}
+
 void isr_dispatch(struct int_frame *f)
 {
+    if (lockless(f)) return;
+    bkl_enter();
+    bool user = (f->cs & 3) == 3;
     if (f->vector < 32) {
         exception(f);
-        if ((f->cs & 3) == 3) signal_deliver(f, 0, false);    /* a handler, or the default action */
-        return;
-    }
-
-    if (f->vector == SYSCALL_VECTOR) { syscall_dispatch(f); return; }
-
-    if (f->vector >= IRQ_BASE && f->vector < IRQ_BASE + 16) {
+    } else if (f->vector == SYSCALL_VECTOR) {
+        syscall_dispatch(f);                            /* delivers signals itself */
+        user = false;
+    } else if (f->vector >= IRQ_BASE && f->vector < IRQ_BASE + 16) {
         int irq = (int)f->vector - IRQ_BASE;
-        /* Spurious IRQ 7/15: the PIC's in-service bit is not set. */
-        if (irq == 7 || irq == 15) {
-            outb(irq == 7 ? 0x20 : 0xA0, 0x0B);
-            uint8_t isr = inb(irq == 7 ? 0x20 : 0xA0);
-            if (!(isr & 0x80)) { if (irq == 15) pic_eoi(2); return; }
+        if (apic_enabled()) {
+            if (irq == 7 || irq == 15) goto out;        /* the masked PICs' spurious lines */
+            lapic_eoi();
+        } else {
+            /* Spurious IRQ 7/15: the PIC's in-service bit is not set. */
+            if (irq == 7 || irq == 15) {
+                outb(irq == 7 ? 0x20 : 0xA0, 0x0B);
+                uint8_t isr = inb(irq == 7 ? 0x20 : 0xA0);
+                if (!(isr & 0x80)) { if (irq == 15) pic_eoi(2); goto out; }
+            }
+            /* EOI first: the timer handler may switch to another thread and
+             * not come back through here for a while. */
+            pic_eoi(irq);
         }
         irq_counts[irq]++;
-        /* EOI first: the timer handler may switch to another thread and
-         * not come back through here for a while. */
-        pic_eoi(irq);
         if (irq_handlers[irq]) irq_handlers[irq](f);
-        if ((f->cs & 3) == 3) signal_deliver(f, 0, false);  /* back to ring 3 */
+    } else if (f->vector == VEC_LAPIC_TIMER) {
+        lapic_eoi();
+        this_cpu()->ticks++;
+        timer_interrupt(this_cpu()->id == 0);
+    } else {
+        stray_vectors++;                                /* nothing installed there */
+        if (apic_enabled()) lapic_eoi();
     }
+    if (user) signal_deliver(f, 0, false);              /* back to ring 3: a handler, or the default */
+out:
+    cli();
+    bkl_exit();
 }

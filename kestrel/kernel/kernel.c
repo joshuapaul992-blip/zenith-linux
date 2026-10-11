@@ -27,6 +27,7 @@
 #include <kernel/task.h>
 #include <kernel/vfs.h>
 #include <kernel/syscall.h>
+#include <kernel/smp.h>
 #include <kernel/usyscall.h>
 #include <kernel/bootmgr.h>
 #include <kernel/bootinfo.h>
@@ -368,6 +369,7 @@ static volatile uint64_t primes_found;
 static int kworker_compute(void *arg)
 {
     (void)arg;
+    bkl_release_all();          /* pure computation: other CPUs keep the kernel meanwhile */
     for (uint64_t n = 3;; n += 2) {
         bool prime = true;
         for (uint64_t d = 3; d * d <= n; d += 2) if (n % d == 0) { prime = false; break; }
@@ -409,6 +411,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     kprintf("cpu: %s / %s\n", g_boot.cpu_vendor, g_boot.cpu_brand);
 
     gdt_init();
+    percpu_init_bsp();          /* GS base: this CPU's percpu block */
+    bkl_enter();                /* boot code is kernel code: hold the big lock (smp.h) */
     idt_init();
     kprintf("arch: GDT+TSS loaded, IDT with 32 exceptions, 16 IRQs, int 0x80 gate\n");
 
@@ -425,13 +429,16 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     usb_init();                 /* xHCI: USB keyboards/mice usable in the boot menu */
 
     pic_init();
-    pit_init(PIT_HZ);
+    bool apic = apic_init();    /* MADT: local APIC + IO APIC replace the 8259s */
+    if (apic) lapic_timer_start();
+    else pit_init(PIT_HZ);
     keyboard_init();
+    if (apic) ioapic_route_isa(IRQ_KEYBOARD, IRQ_BASE + IRQ_KEYBOARD);
     uvm_init();                 /* shared kernel PDPTs, before any address space */
     vm_init();                  /* EFER.NXE: no-execute for data pages */
     sched_init();
     sti();
-    kprintf("arch: interrupts enabled, PIT at %d Hz\n", PIT_HZ);
+    kprintf("arch: interrupts enabled, %s at %d Hz\n", apic ? "local APIC timer" : "PIT", PIT_HZ);
 
     /* ---------------- Phase 2: boot manager ---------------- */
     struct boot_choice ch = bootmgr_run();
@@ -503,7 +510,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
         task_create("kworker/1", kworker_heartbeat, NULL);
     }
     usb_start_thread();
-    kprintf("kernel: services up at t=%lu ms (boot menu included)\n", uptime_ms());
+    smp_boot_aps();             /* the other processors: their idle loops */
+    kprintf("kernel: services up at t=%lu ms (boot menu included), %d CPU(s)\n", uptime_ms(), ncpus);
 
     /* ---------------- Phase 4: become the idle thread ---------------- */
     sched_idle_loop();

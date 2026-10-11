@@ -95,22 +95,42 @@ static const struct sdt_header *map_table(uint64_t phys)
     return h;
 }
 
-static const struct acpi_hpet *find_hpet(uintptr_t mbi)
+/* The RSDT/XSDT, found once at boot (the BIOS search reads page 0, which
+ * becomes a guard page afterwards). */
+static const struct sdt_header *acpi_root;
+static bool acpi_x;
+
+static void acpi_init(uintptr_t mbi)
 {
     const struct rsdp *r = find_rsdp(mbi);
-    if (!r) { kprintf("time: no ACPI RSDP found\n"); return NULL; }
+    if (!r) { kprintf("acpi: no RSDP found\n"); return; }
     bool x = r->revision >= 2 && r->xsdt;
     const struct sdt_header *root = map_table(x ? r->xsdt : r->rsdt);
-    if (!root || !checksum_ok(root, root->length)) { kprintf("time: ACPI root table invalid\n"); return NULL; }
-    size_t n = (root->length - sizeof *root) / (x ? 8 : 4);
-    const uint8_t *entries = (const uint8_t *)root + sizeof *root;
+    if (!root || root->length < sizeof *root || !checksum_ok(root, root->length)) {
+        kprintf("acpi: root table invalid\n");
+        return;
+    }
+    acpi_root = root;
+    acpi_x = x;
+}
+
+const void *acpi_find_table(const char sig[4])
+{
+    if (!acpi_root) return NULL;
+    size_t n = (acpi_root->length - sizeof *acpi_root) / (acpi_x ? 8 : 4);
+    const uint8_t *entries = (const uint8_t *)acpi_root + sizeof *acpi_root;
     for (size_t i = 0; i < n; i++) {
-        uint64_t p = x ? *(const uint64_t *)(entries + i * 8) : *(const uint32_t *)(entries + i * 4);
+        uint64_t p = acpi_x ? *(const uint64_t *)(entries + i * 8) : *(const uint32_t *)(entries + i * 4);
         const struct sdt_header *h = map_table(p);
-        if (h && !memcmp(h->sig, "HPET", 4) && checksum_ok(h, h->length))
-            return (const struct acpi_hpet *)h;
+        if (h && !memcmp(h->sig, sig, 4) && h->length >= sizeof *h && checksum_ok(h, h->length)) return h;
     }
     return NULL;
+}
+
+static const struct acpi_hpet *find_hpet(uintptr_t mbi)
+{
+    acpi_init(mbi);
+    return acpi_find_table("HPET");
 }
 
 /* ======================================================================== */

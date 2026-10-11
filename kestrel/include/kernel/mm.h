@@ -14,6 +14,7 @@ extern char _kernel_start[], _kernel_end[];
 /* ---- physical memory manager (bitmap, 4 KiB frames) --------------------- */
 void     pmm_init(uintptr_t mbi);
 uint64_t pmm_alloc(void);                    /* one zeroed frame, 0 on OOM  */
+uint64_t pmm_low_page(void);         /* a usable page below 640 KiB (0 = none), reserved */
 uint64_t pmm_alloc_contig(size_t frames);    /* physically contiguous run   */
 void     pmm_free(uint64_t phys);
 void     pmm_free_contig(uint64_t phys, size_t frames);

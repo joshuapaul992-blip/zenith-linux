@@ -170,6 +170,7 @@ struct int_frame;
 typedef int64_t (*syscall_fn)(uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6);
 
+void syscall_cpu_init(void);       /* SYSCALL MSRs of the calling CPU */
 void syscall_init(void);
 /* Returns nonzero when the caller must leave through iretq (rt_sigreturn). */
 int  syscall_dispatch(struct int_frame *f);

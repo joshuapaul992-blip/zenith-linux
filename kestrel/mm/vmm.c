@@ -5,6 +5,7 @@
  * BIOS/VBE system. Some UEFI firmware places the GOP frame buffer above
  * 4 GiB; vmm_identity_map() extends the mapping on demand. This is also the
  * hook where per-process address spaces will be built later. */
+#include <kernel/smp.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
 #include <kernel/klog.h>
@@ -43,7 +44,7 @@ bool vmm_set_uncached(uint64_t phys, uint64_t size)
         uint64_t *pde = &pd[(a >> 21) & 511];
         if ((*pde & PTE_HUGE) && (*pde & (VMM_PCD | VMM_PWT)) != (VMM_PCD | VMM_PWT)) {
             *pde |= VMM_PCD | VMM_PWT;
-            invlpg(a);
+            tlb_shootdown_kernel(a, a + PAGE_SIZE);     /* one entry covers the large page */
         }
     }
     return true;
@@ -87,7 +88,7 @@ bool vmm_set_write_combining(uint64_t phys, uint64_t size)
         uint64_t *pde = &pd[(a >> 21) & 511];
         if (!(*pde & PTE_HUGE) || (*pde & VMM_PCD)) continue;   /* MMIO made uncached stays so */
         *pde = (*pde & ~(uint64_t)VMM_PCD) | VMM_PWT;
-        invlpg(a);
+        tlb_shootdown_kernel(a, a + PAGE_SIZE);
         pages++;
     }
     __asm__ volatile("wbinvd" ::: "memory");
@@ -118,9 +119,8 @@ static uint64_t *identity_pte(uint64_t phys)
         if (*pde & PDE_PAT) attr |= 0x80;               /* PAT bit moves to bit 7 in a PTE */
         for (int i = 0; i < 512; i++) pt[i] = (base + (uint64_t)i * 4096) | attr;
         *pde = pt_phys | PTE_PRESENT | PTE_WRITE;
-        /* invlpg on any address of a large page drops its TLB entry */
-        invlpg(base);
-        write_cr3(read_cr3());
+        /* the large page's TLB entries, on every CPU */
+        tlb_shootdown_kernel(base, base + 0x200000);
     }
     uint64_t *pt = (uint64_t *)(*pde & ADDR_MASK);
     return &pt[(phys >> 12) & 511];
@@ -132,7 +132,7 @@ bool vmm_set_guard(uint64_t phys, bool guard)
     uint64_t *pte = identity_pte(phys & ~0xFFFull);
     if (pte) {
         if (guard) *pte &= ~(uint64_t)PTE_PRESENT; else *pte |= PTE_PRESENT;
-        invlpg(phys & ~0xFFFull);
+        tlb_shootdown_kernel(phys & ~0xFFFull, (phys & ~0xFFFull) + PAGE_SIZE);
     }
     irq_restore(f);
     return pte != NULL;

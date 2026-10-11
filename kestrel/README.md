@@ -1,6 +1,6 @@
 # Kestrel
 
-Kestrel (0.2.0, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a small POSIX-style kernel: system calls, a virtual file system with `/dev`, `/proc` and `/sys`, and preemptive kernel threads.
+Kestrel (0.2.0, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, and a virtual file system with `/dev`, `/proc` and `/sys`.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -145,7 +145,7 @@ The kernel's own output (the log, kush) goes through the same parser, except tha
 - Backspace steps left, back across a line wrap if needed, and blanks the cell.
 - Enter hands the line to the parser.
 
-Kestrel runs on one CPU. "Independent" means preemptive threads: while a command runs on one monitor (even `cat /dev/random`), the other shells still respond and every cursor keeps blinking.
+"Independent" means preemptive threads, spread over every CPU (see "Multiprocessor support"): while a command runs on one monitor (even `cat /dev/random`), the other shells still respond and every cursor keeps blinking.
 
 Try it with three monitors in QEMU:
 
@@ -498,12 +498,20 @@ boot/boot.asm                32-bit entry, CPUID/LM checks, 4 GiB identity map (
 boot/grub/*.cfg              GRUB configs (ISO, floppy memdisk, USB stick memdisk)
 linker.ld                    kernel at 2 MiB physical, MB2 header first in .text
 
-arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order) + TSS (RSP0, IST1)
-              idt.c          256-entry IDT, exception dump, IRQ dispatch, int 0x80 gate (DPL3)
-              isr.asm        vector stubs -> struct int_frame -> isr_dispatch()
-              pic.c pit.c    8259A remap to 32-47; 8254 at 1000 Hz
-              switch.asm     context_switch(), thread_trampoline
-              syscall_entry.asm  SYSCALL/LSTAR fast path (for ring 3)
+arch/x86_64/  gdt.c          GDT (kernel/user code+data, SYSRET-compatible order), a TSS per CPU
+                             (RSP0; IST1 #DF, IST2 NMI, IST3 #MC stacks)
+              idt.c          256-entry IDT, faults -> signals, kernel fault dump with symbolized
+                             backtrace, IRQ/IPI/timer dispatch, int 0x80 gate (DPL3)
+              isr.asm        256 vector stubs -> struct int_frame -> isr_dispatch(); SWAPGS on
+                             ring-3 entry/exit, paranoid GS check for NMI/#DF/#MC
+              apic.c         ACPI MADT, local APIC (+ 1 kHz timer calibrated on the HPET/TSC),
+                             IO APIC routing of ISA IRQs, IPIs, INIT/STARTUP
+              smp.c          percpu blocks (GS base), big kernel lock, TLB shootdowns, AP start-up
+              trampoline.asm real mode -> long mode start-up code of the other CPUs (at 0x8000)
+              pic.c pit.c    8259A remap to 32-47; 8254 at 1000 Hz (without an APIC)
+              switch.asm     context_switch(), thread_trampoline, enter_user/user_return
+              syscall_entry.asm  SYSCALL/LSTAR fast path (for ring 3), canonical-RIP SYSRET check
+              uaccess.asm    user-memory copies with exception-table fixups
 
 drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char, draw_string,
                              clipping, scrolling, back buffer + dirty-rect flush (24/32 bpp)
@@ -524,21 +532,31 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
-mm/           pmm.c          bitmap frame allocator from the MB2 memory map
+mm/           pmm.c          bitmap frame allocator from the MB2 memory map, frame reference counts
               heap.c         kmalloc/kfree (first fit, split, coalesce, IRQ-safe)
-              vmm.c          extra identity mappings (e.g. GOP frame buffer above 4 GiB)
+              vmm.c          identity map changes: MMIO uncached, write-combining (PAT), guard pages
+              vm.c           user address spaces: regions (VMAs), demand paging, copy-on-write,
+                             NX, mmap/munmap/mprotect/mremap/madvise/mincore/brk, OOM killer
+              vmobj.c        page-backed memory objects (ramfs files, memfd, shared anonymous)
+              uvm.c          user address-space layout, kernel page-table sharing
 
-proc/task.c                  TCBs, round-robin scheduler (10 ms quantum; an idle class for background
-                             work such as kworker/0, which runs only when nothing else is ready), sleep_on/wakeup,
-                             timed sleep, zombie reaping, idle thread
-proc/exec.c                  ELF64 loader, System V initial stack, kernel-started processes
-proc/process.c               fork/vfork/clone, execve, wait4, sessions, signals
+proc/task.c                  TCBs, round-robin scheduler on every CPU (10 ms quantum; an idle class for
+                             background work such as kworker/0, which runs only when nothing else is
+                             ready), sleep_on/wakeup, poll sleeps, timed sleep, zombie reaping,
+                             a per-CPU idle thread, kernel stacks with guard pages
+proc/exec.c                  hardened ELF64 loader (PT_INTERP, W^X), System V initial stack,
+                             kernel-started processes
+proc/process.c               fork/vfork/clone (threads), execve, wait4, sessions, signals
 fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), file objects,
                              getdents64, ramfs files, generated "pseudo" files
               devfs.c        /dev: null zero random urandom kmsg tty console ttyS0, fbN per monitor,
                              ptmx and pts/ (fs/pty.c)
                              (KFB_GET_INFO, KDSETMODE, KFB_BLIT) (+ block devices)
               tarfs.c        read-only ustar file system on a block device (the /boot volume)
+              pipe.c         pipes
+              unixsock.c     AF_UNIX stream/seqpacket/datagram-pair sockets, SCM_RIGHTS
+              epoll.c        epoll
+              anonfd.c       eventfd, timerfd, signalfd
               pty.c          pseudo-terminals: line discipline, termios, controlling terminals
               procfs.c       /proc: version uptime meminfo stat loadavg cpuinfo mounts filesystems tasks,
                              PID/{stat,status,cmdline,comm}, self/
@@ -546,6 +564,8 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
               sysfs.c        /sys: kernel/ class/graphics/fb0/ firmware/ devices/system/cpu/ power/
 kernel/       kernel.c       initialisation sequence, init and worker threads
               syscall.c      syscall table (Linux x86_64 numbers), handlers, ENOSYS stubs
+              uaccess.c      copy_from_user/copy_to_user and friends (checked, fault-safe)
+              futex.c        futexes: hashed wait queues, requeue, wake-op, robust lists
               klog.c         dmesg ring buffer, panic screen
               report.c       REPORT.TXT / VBIOS.ROM on the stick's FAT report volume
               gpu.c          PCI -> NVIDIA probe glue, 'gpu' command, report section
@@ -591,21 +611,32 @@ Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
 
-**Implemented:** read, write, readv, writev, open, close, poll, pipe, pipe2, dup, dup2, dup3, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL` with `O_NONBLOCK`/`O_APPEND`), select, pselect6 (no signal mask), sendfile, access, readlink/readlinkat (no symbolic links; `/proc/self/exe` and `/proc/self/fd/N` resolve), umask, getrandom, socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg, recvmsg (data only), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes), stat, fstat, lstat (same as stat: no symbolic links), lseek, ioctl, brk, mmap (anonymous only), munmap, mprotect (accepted, not enforced), madvise, arch_prctl (`ARCH_SET_FS`/`ARCH_GET_FS`), set_tid_address, gettid, sched_yield, nanosleep, getpid, getppid, fork, vfork, clone (`fork`/`vfork`-style only: no threads), execve, wait4, setsid, setpgid, getpgid, getpgrp, getsid, kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; only root may change them), getrlimit, setrlimit, prlimit64 (fixed limits), alarm, getitimer, setitimer (`ITIMER_REAL`), times, getrusage, sysinfo, prctl (`PR_SET_NAME`/`PR_GET_NAME`), exit, exit_group, uname, getcwd, chdir, mkdir, rmdir, unlink, rename, chmod, fchmod (accepted), chown, utimensat, getdents64, clock_gettime and clock_getres (`CLOCK_REALTIME`/`_COARSE` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET), reboot.
+Every pointer a call receives is checked to lie in the user half and copied through `copy_from_user`/`copy_to_user` (`kernel/uaccess.c`): a bad or unmapped pointer gives `-EFAULT`, never a kernel fault. Structures with pointers inside (`msghdr`, iovecs, `epoll_event`, control messages) are copied into the kernel once and only that copy is used, so another thread cannot change them between the check and the use.
 
-**Stubs returning `-ENOSYS`:** gettimeofday (musl uses clock_gettime).
+**Implemented** (by area):
+- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, close, lseek, stat, lstat (as stat: no symbolic links), fstat, newfstatat, access, faccessat, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`), dup, dup2, dup3, ftruncate, truncate, fsync, fdatasync, sendfile, readlink/readlinkat (`/proc/self/exe`, `/proc/self/fd/N`), mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), chown, utimensat, chdir, getcwd, umask.
+- **Waiting for events:** poll, ppoll, select, pselect6 (with signal masks), epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait, eventfd, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd, signalfd4, pipe, pipe2.
+- **Sockets (`AF_UNIX`):** socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg and recvmsg (with `SCM_RIGHTS`), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes).
+- **Memory:** brk, mmap (anonymous, private and shared file mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, `MAP_POPULATE`), munmap, mprotect, mremap, madvise (`MADV_DONTNEED`), mincore, msync, memfd_create (with seals).
+- **Processes and threads:** fork, vfork, clone (processes and threads), execve, exit (the thread), exit_group (the process), wait4, getpid, gettid, getppid, set_tid_address, set_robust_list, get_robust_list, futex, arch_prctl (`ARCH_SET_FS`/`GET_FS`/`SET_GS`/`GET_GS`), sched_yield, sched_getaffinity, sched_setaffinity, setsid, setpgid, getpgid, getpgrp, getsid, prctl (`PR_SET_NAME`/`PR_GET_NAME`).
+- **Signals:** kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, alarm, getitimer, setitimer (`ITIMER_REAL`).
+- **Identity and limits:** getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; only root may change them), getrlimit, setrlimit, prlimit64 (fixed limits; 1024 descriptors).
+- **Time and system:** nanosleep, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET/TSC), gettimeofday, times, getrusage, sysinfo, uname, getrandom, reboot.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
 ## User programs (ring 3)
 
-Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm/uvm.c`):
-- **Address spaces:** each process has its own PML4. The kernel half (`PML4[0..127]`, 0–64 TiB, which holds the identity map and all MMIO) shares its page tables with every process and is supervisor-only. The user half is `0x4000_0000_0000`–`0x7fff_ffff_ffff`: static-PIE images load at its start, anonymous `mmap` grows from `0x6000_0000_0000`, and a 1 MiB stack ends at `0x7fff_ff00_0000`.
-- **Programs:** ET_EXEC linked inside the user half, or ET_DYN (static-PIE) loaded at the image base. Programs that need a dynamic linker are refused.
+Kestrel runs x86_64 ELF programs in ring 3, statically or dynamically linked (`proc/exec.c`, `mm/vm.c`, `mm/uvm.c`):
+- **Address spaces:** each process has its own PML4. The kernel half (`PML4[0..127]`, 0–64 TiB, which holds the identity map and all MMIO) shares its page tables with every process and is supervisor-only. The user half is `0x4000_0000_0000`–`0x7fff_ffff_f000`: programs load at its start, the ELF interpreter at `0x5000_0000_0000`, `mmap` grows from `0x6000_0000_0000`, and an 8 MiB stack ends at `0x7fff_ff00_0000`. (The top page stays unmapped: SYSRET to a non-canonical address would fault in ring 0 on Intel CPUs, CVE-2012-0217, and the syscall exit path also checks the return address.)
+- **Memory** is a sorted list of regions (`struct vma`) and nothing is mapped until it is touched: page faults fill pages in (zeroed, from a file, or from a shared memory object). `fork` shares every page copy-on-write: private writable pages become read-only in both processes (PTE bit 9 marks them), frames are reference counted, and the first write copies the page, or simply takes it back when nobody else has it. Page-table entries mirror the region's protection exactly: user/supervisor, writable only when not shared copy-on-write, and NX (`EFER.NXE`) on everything not executable.
+- **Out of memory:** a fault that cannot get a frame asks the OOM killer to end the largest process, waits until its memory is back, and retries; only if nothing helps does the faulting process get SIGKILL. The kernel never dereferences a failed allocation.
+- **Programs:** ET_EXEC linked inside the user half, ET_DYN (PIE) at the image base, or with `PT_INTERP` through musl's dynamic linker (`/lib/ld-musl-x86_64.so.1`), which then loads shared libraries with `mmap`. The ELF loader trusts nothing in the file: header sizes, segment counts, offsets inside the file, address ranges inside the user half, alignment and overlaps are all checked. Text is mapped read/execute, data read/write; a segment that is both writable and executable is refused (boot with `kestrel.allow_wx=1` to allow it), and the stack is not executable unless `PT_GNU_STACK` asks for it.
 - **Scripts:** a file starting with `#!interpreter [arg]` runs that interpreter with the script's path, as on Linux (`/boot/bin/startx` is one).
 - **Start-up:** the initial stack follows the System V / Linux layout (argc, argv, envp, and auxv with `AT_PHDR`, `AT_PAGESZ`, `AT_ENTRY`, `AT_RANDOM` and more), so a musl `crt1` starts unchanged.
-- **Per-process state:** SSE state (`fxsave`) and the TLS base (`FS_BASE`) are switched with the process. Faults in ring 3 kill the process with status 128 + signal; the kernel keeps running.
-- **Pointers:** user pointers passed to `read`/`write`/`readv`/`writev` and the memory calls must lie in mapped user memory, otherwise the call returns `-EFAULT`.
+- **Per-thread state:** SSE state (`fxsave`), the TLS base (`FS_BASE`) and the GS base are switched with the thread.
+- **Faults** in ring 3 become the signal Linux sends (SIGSEGV with `SEGV_MAPERR`/`SEGV_ACCERR`, SIGBUS, SIGILL, SIGFPE with its `FPE_*` code, SIGTRAP) with `si_addr` and the faulting registers, so a handler can run (a JIT or a garbage collector relies on that); without one the process ends with status 128 + signal. The kernel keeps running either way.
+- **Pointers:** every user pointer goes through the checked, fault-safe copy routines (see "System calls"); a bad one gives `-EFAULT`.
 
 `user/hello.c` is a freestanding self-test of all of this, installed as `/boot/bin/hello` on the USB stick:
 - From the shell: `run hello` (bare names are looked up in `/boot/bin`).
@@ -616,21 +647,25 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 
 **musl libc:** programs linked with the stock x86_64 musl (`musl-gcc -static-pie`) run unchanged, because Kestrel uses the Linux syscall numbers and ABI. `user/libctest.c` (installed as `/boot/bin/libctest`) checks 35 things a ported program relies on: stdio, malloc (brk and mmap paths), floating-point formatting, files and directories, time, pipes, `poll` timeouts, `select`, `O_NONBLOCK`, `dup`, EOF/`POLLHUP` and `getrandom`. Exit status 0 means every check passed. A ring-3 program that calls an unimplemented syscall is named in the kernel log (first three calls per number).
 
-**Pipes and poll:** pipes have a 16 KiB buffer and follow POSIX blocking rules; with no signals, a write to a pipe without readers returns `-EPIPE`. `poll` re-checks readiness every millisecond until something is ready or the timeout expires. Files and devices without their own poll hook are always ready.
+**Pipes and poll:** pipes have a 16 KiB buffer and follow POSIX blocking rules; a write to a pipe without readers raises SIGPIPE and returns `-EPIPE`. `poll`, `select` and `epoll_wait` sleep until something changes: every wake-up in the kernel advances a sequence number and wakes the pollers, and a poller sleeps only if the number has not moved since it looked, so no event slips through between checking and sleeping. A watched timerfd ends the sleep exactly at its expiry. Files and devices without their own poll hook are always ready.
 
-**Unix-domain sockets** (`fs/unixsock.c`): `AF_UNIX` / `SOCK_STREAM`, the way X11 connects clients locally.
+**Unix-domain sockets** (`fs/unixsock.c`): `AF_UNIX` / `SOCK_STREAM`, the way X11 connects clients locally, plus `SOCK_SEQPACKET` and `SOCK_DGRAM` socket pairs.
 - **Names:** a path in the file system (a socket node, e.g. `/tmp/.X11-unix/X0`) or Linux's abstract namespace (`sun_path[0] == 0`), which xtrans tries first.
 - **Connecting:** `connect` completes at once by queueing a socket on the listener, and `accept` hands it out.
 - **Data:** each direction has a 64 KiB buffer, with blocking, `O_NONBLOCK`/`MSG_DONTWAIT`, `MSG_PEEK`, EOF, `EPIPE`, `FIONREAD` and `poll` readiness as on Linux.
 - **Credentials:** `SO_PEERCRED` reports the pid/uid/gid of the process that created the peer.
-- **Not yet:** descriptor passing (`SCM_RIGHTS`; a `sendmsg` with control data is refused, not dropped), and `SOCK_DGRAM`/`SOCK_SEQPACKET`.
+- **Messages:** `SOCK_SEQPACKET` (sockets and pairs) and `SOCK_DGRAM` (pairs) keep record boundaries; a short buffer truncates the record and sets `MSG_TRUNC`.
+- **Descriptor passing:** `SCM_RIGHTS` on every type. The descriptors in flight are counted references to the open files; they arrive with the bytes they were sent with (a stream read never runs past them), `MSG_CMSG_CLOEXEC` works, and without room for them they are closed and `MSG_CTRUNC` is set. Up to 253 per message.
+- **Not yet:** unconnected datagram sockets (`sendto` with an address), and a garbage collector for sockets sent through themselves (in-flight descriptors are bounded per socket instead).
 
 `user/socktest.c` (`/boot/bin/socktest`) checks all of this, in one process or as two:
 - `socktest`: 20 checks in one process.
 - `socktest server` with `socktest client`: a real server and client, started together with `kestrel.exec=/boot/bin/socktest,server+/boot/bin/socktest,client` (`+` separates programs).
 
 **Processes** (`proc/process.c`, `include/kernel/process.h`):
-- **fork:** gives the child a private copy of every user page. The copy is eager; copy-on-write comes later. Descriptors, the working directory, signal handlers and the signal mask are inherited.
+- **fork:** the child shares every page copy-on-write. Descriptors, the working directory, signal handlers and the signal mask are inherited.
+- **Threads:** `clone` shares what its flags say: memory (`CLONE_VM`), the descriptor table (`CLONE_FILES`), cwd and umask (`CLONE_FS`), signal actions (`CLONE_SIGHAND`), and with `CLONE_THREAD` the process itself, which is how musl's `pthread_create` works. Every thread has its own tid, kernel stack, TLS base (`CLONE_SETTLS`), signal mask and pending set. `getpid` is the process, `gettid` the thread; `exit` ends a thread, `exit_group` and fatal signals end the process, and `execve` from any thread first ends the others (a non-leader takes over the process id). `CLONE_CHILD_CLEARTID` and robust futex lists are handled at thread exit, so `pthread_join` and robust mutexes work.
+- **Futexes** (`kernel/futex.c`): wait queues in 256 hashed buckets, keyed by address space and address (private) or memory object and offset (shared mappings, across processes). The futex word is read again under the bucket lock before sleeping, so a wake-up cannot be lost. WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET/WAKE_BITSET with relative or absolute timeouts; priority-inheritance futexes return `ENOSYS`.
 - **vfork and `clone(CLONE_VM | CLONE_VFORK)`** (musl's `posix_spawn`): the child borrows the parent's address space, and the parent sleeps until the child calls `execve` or exits.
 - **execve:** builds the new image in a fresh address space. If loading fails, the old image is untouched and the call returns an error. On success, `O_CLOEXEC` descriptors close, caught signals revert to their defaults, and the FPU state and TLS base are reset.
 - **wait4:** a parent waits for a child, a process group or any child, with `WNOHANG`. A process's exited children stay zombies until it collects them, unless SIGCHLD is ignored or has `SA_NOCLDWAIT`. Orphans are reaped by the kernel.
@@ -644,11 +679,12 @@ Kestrel runs statically linked x86_64 ELF programs in ring 3 (`proc/exec.c`, `mm
 - **When delivery happens:** on every return to ring 3 (after a system call or an interrupt), so a process spinning in user mode can also be killed.
 - **Blocking calls:** pipe and socket I/O, `accept`, tty reads, `/dev/kinput`, `wait4`, `poll`, `select`, `nanosleep` and `sigsuspend` stop waiting when a signal arrives. They return EINTR to a handler, or restart under `SA_RESTART`, as on Linux.
 - **Default actions:** terminate, or ignore for SIGCHLD, SIGCONT, SIGURG and SIGWINCH. There is no job control: stop signals are ignored.
-- **CPU faults** in ring 3 still end the process immediately, without calling a SIGSEGV handler.
+- **Threads:** the mask and a pending set are per thread; `kill`, the terminal, SIGCHLD and SIGALRM go to the process and are taken by a thread that does not block them; `tgkill` and CPU faults go to one thread.
+- **CPU faults** call the handler if there is one (see "User programs"); a blocked or ignored fault signal still kills.
 
 `user/proctest.c` (`/boot/bin/proctest`) checks all of this in 31 tests: fork isolation, pipes across fork, 16 concurrent children, execve (also of a missing file), posix_spawn, vfork, setsid, handlers, blocked and ignored signals, FPU state across a handler, SIGCHLD, SIGTERM/SIGKILL (also against a child spinning in user mode), EINTR versus `SA_RESTART`, sigsuspend, interrupted nanosleep, SIGPIPE, `alarm` and periodic `setitimer`, `readlink("/proc/self/exe")`, and abort.
 
-Not done yet: W^X page permissions, copy-on-write, file-backed `mmap`, threads, job control (stop/continue), and `SCM_RIGHTS`.
+Not done yet: job control (stop/continue).
 
 `cat /proc/syscalls` lists every call with its status and call count.
 
@@ -772,6 +808,35 @@ make usbimg
 
 **Not yet:** fonts other than `fixed`, job control (Ctrl+Z, `fg`/`bg`), and a writable disk to keep files across reboots; `/tmp` and the root file system are in RAM.
 
+## Multiprocessor support and robustness
+
+**Processors** (`arch/x86_64/apic.c`, `smp.c`, `trampoline.asm`). The ACPI MADT lists the CPUs and IO APICs. The 8259 PICs are masked; the PS/2 keyboard comes through the IO APIC (honouring the MADT's interrupt source overrides), and every CPU runs its own local APIC timer at 1 kHz, calibrated against the HPET/TSC clock. The other CPUs are started with INIT and STARTUP IPIs into a real-mode trampoline at `0x8000`, which switches to long mode on the kernel's page tables; each gets its GDT/TSS, IST stacks, SYSCALL MSRs, the boot CPU's CR0/CR4/PAT, and an idle thread. Up to 16 CPUs. Boot options: `kestrel.smp=0` (or `maxcpus=1`) keeps one CPU, `kestrel.noapic` stays on the PIC and PIT. Without an MADT the kernel does the same by itself.
+
+**Per-CPU data.** In the kernel, the GS base points at the CPU's `struct percpu` (`include/kernel/smp.h`); entries from ring 3 run `SWAPGS`, and NMI, #DF and #MC (which can arrive between `SYSCALL` and its `SWAPGS`) decide from the GS base itself. The running task is read with a single GS-relative load, so a thread that is preempted and moved to another CPU never reads the wrong one.
+
+**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
+
+**TLB shootdowns.** When a mapping loses rights or goes away, every CPU that has that address space loaded drops the translation (`invlpg`, or a CR3 reload for large ranges) through an IPI, and the call waits for each to acknowledge before a frame is freed or reused. Waiting for the kernel lock services pending requests, so a shootdown can always complete. Changes to the kernel's identity map (guard pages, cache types) go to every CPU.
+
+**Faults and crashes.**
+- **User memory:** every copy to or from user memory goes through routines with exception-table fixups: a bad pointer is `-EFAULT`, even in the middle of a copy.
+- **Exception isolation:** #PF, #GP, #DE, #AC and the rest are separate IDT entries. In ring 3 they become signals. #DF, NMI and #MC run on their own IST stacks, so a kernel stack overflow (which hits a guard page below every kernel stack) is still reported.
+- **Kernel faults:** the report has the registers, CR0–CR4, the code bytes and a symbolized backtrace. It goes to the serial port, the kernel log and the panic screen, and other CPUs are stopped with an NMI.
+- **Crash test:** `kestrel.crashtest=stack|null|ud` exercises this at boot.
+
+**Tests** (each a musl program in `/boot/bin`, exit status 0 = all passed; `kestrel.exec=` runs them at boot):
+
+| Program | What it checks |
+|---|---|
+| `faulttest` | 38 checks: faults to signals with the right `si_code`/`si_addr`, handlers that recover, `-EFAULT` for bad pointers in every kind of call, kernel stays up |
+| `vmtest` | 43 checks: demand paging, copy-on-write, NX, mprotect, file and shared mappings, memfd and seals, mremap, madvise, mincore, brk, OOM killer |
+| `dyntest` | a dynamically linked program and shared library through musl's ld.so |
+| `threadtest` | 41 checks: pthreads, TLS, mutex/condvar/semaphore contention, every futex operation and timeout, process-shared futexes, signals and threads, exit/exit_group, fork and execve from threads, robust mutexes, 450 thread lifecycles |
+| `eventtest` | 71 checks: epoll (level, edge, one-shot, nesting, fairness), eventfd, timerfd, signalfd, poll/select sleeps, ppoll masks, `SCM_RIGHTS`, record sockets, POSIX shared memory |
+| `smptest` | CPU count, real parallel speed-up, TLB shootdown (a thread on another CPU loses an unmapped page at once), thread churn across processes, concurrent system calls |
+
+Together with `libctest`, `proctest`, `ptytest`, `socktest` and the shell script test they pass on 1 and on 4 CPUs (QEMU, `-smp 4 -accel tcg,thread=multi`).
+
 ## Memory map at boot
 
 | Range | Use |
@@ -783,16 +848,15 @@ make usbimg
 
 ## Next steps
 
-The structure is laid out for these, in order:
+Phase 1 (foundations for real applications) is done: user mode with fault-safe user access, demand-paged copy-on-write memory with W^X and NX, dynamic linking, threads and futexes, epoll and the other event descriptors, descriptor passing, and SMP. Next, in order:
 
-1. **User mode:** done (see "User programs"). Still missing: W^X and a fault-safe `copy_from_user`.
-2. **fork/execve/wait4:** done (see "Processes"); copy-on-write next.
-3. **Signals:** done, apart from job control and handlers for CPU faults.
-4. **libc:** done for musl (static-PIE, unmodified). The XLibre X server runs on it (see "X11").
-5. **A writable file system** (FAT or ext2) on the block layer, next to the read-only tarfs.
-6. **ACPI parsing** for power-off on real hardware. The emulator ports are used today.
-7. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
-8. **Hardware support:** HPET/APIC interrupts (the HPET is only used as a clocksource today), SMP, USB hubs, an EHCI driver for machines without xHCI.
+1. **Finer kernel locking:** split the big kernel lock (scheduler run queue, memory manager, VFS, sockets), so system-call-heavy programs scale across CPUs.
+2. **A writable file system** (ext2 or FAT) on the block layer, next to the read-only tarfs, and symbolic links.
+3. **Networking:** a TCP/IP stack and a NIC driver (virtio-net, Intel e1000), which a browser needs.
+4. **Job control** (stop/continue signals, `SIGTSTP`/`SIGCONT` on the terminal).
+5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.
+6. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
+7. **Hardware support:** MSI/MSI-X interrupts for storage and USB (they are polled today), USB hubs, an EHCI driver for machines without xHCI.
 
 ## Licenses
 

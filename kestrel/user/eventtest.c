@@ -188,10 +188,13 @@ static void test_timerfd(void)
     CHECK(dt >= 45 && dt < 1000, "...after ~50 ms");
     its.it_interval.tv_nsec = 20 * 1000000;
     its.it_value.tv_nsec = 20 * 1000000;
+    t0 = ms_now();
     timerfd_settime(t, 0, &its, NULL);
-    sleep_ms(110);
+    sleep_ms(110);                                      /* may oversleep on a busy system */
     read(t, &n, 8);
-    CHECK(n >= 4 && n <= 6, "periodic 20 ms over 110 ms: ~5 expirations in one read");
+    long el = ms_now() - t0;
+    CHECK(n >= 4 && (long)n >= el / 20 - 1 && (long)n <= el / 20 + 1,
+          "periodic 20 ms: expirations in one read match the time passed (~5 in 110 ms)");
 
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);

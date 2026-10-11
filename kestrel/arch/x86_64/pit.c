@@ -1,4 +1,6 @@
-/* arch/x86_64/pit.c -- 8254 programmable interval timer: system tick source */
+/* arch/x86_64/pit.c -- the system tick: the 8254 PIT on IRQ 0, or (with an
+ * APIC) the boot CPU's local APIC timer; every other CPU's local timer only
+ * drives its own time slices. */
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
 #include <kernel/task.h>
@@ -17,13 +19,19 @@ bool pit_add_tick_hook(void (*fn)(void))
     return false;
 }
 
-static void pit_irq(struct int_frame *f)
+void timer_interrupt(bool boot_cpu)
 {
-    (void)f;
+    if (!boot_cpu) { sched_tick_local(); return; }
     ticks++;
     for (int i = 0; i < MAX_TICK_HOOKS && tick_hooks[i]; i++)
         tick_hooks[i]();            /* xhci_poll(), terminal cursor blink, ... */
     sched_tick();               /* wakes sleepers, may preempt the current thread */
+}
+
+static void pit_irq(struct int_frame *f)
+{
+    (void)f;
+    timer_interrupt(true);
 }
 
 void pit_init(uint32_t hz)

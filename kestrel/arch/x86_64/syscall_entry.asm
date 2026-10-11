@@ -6,10 +6,13 @@
 ;      RAX = syscall number, RDI RSI RDX R10 R8 R9 = arguments (Linux ABI)
 ;  IA32_FMASK clears IF/DF/TF on entry.
 ;
-;  We switch to the current thread's kernel stack, build a struct int_frame
-;  identical to the one isr_common builds (vector 0x80), and reuse the same
-;  C dispatcher as the `int 0x80` gate. Single-CPU kernel: the user RSP is
-;  parked in a global instead of a per-CPU (GS-based) area.
+;  SWAPGS makes GS this CPU's percpu block (smp.h): the user RSP is parked
+;  at gs:16 and the current thread's kernel stack top read from gs:8. We
+;  build a struct int_frame identical to the one isr_common builds (vector
+;  0x80) and reuse the same C dispatcher as the `int 0x80` gate. On the way
+;  out nothing is read through GS (the thread may have moved to another CPU
+;  meanwhile); SWAPGS is the last instruction before SYSRET/IRETQ, with
+;  interrupts off. An NMI in between is handled by the paranoid entry.
 ;
 ;  NOTE: SYSRET always returns to ring 3, so this path is only exercised by
 ;  user-mode code. Kernel threads use `int 0x80` (see usyscall.h).
@@ -19,16 +22,15 @@ bits 64
 section .text
 
 global syscall_entry
-global syscall_kernel_rsp
-global syscall_user_rsp
 extern syscall_dispatch
 
 syscall_entry:
-    mov     [rel syscall_user_rsp], rsp
-    mov     rsp, [rel syscall_kernel_rsp]
+    swapgs
+    mov     [gs:16], rsp                ; percpu.user_rsp
+    mov     rsp, [gs:8]                 ; percpu.kernel_rsp
 
     push    0x1B                        ; ss  (user data | RPL3)
-    push    qword [rel syscall_user_rsp]; rsp
+    push    qword [gs:16]               ; rsp
     push    r11                         ; rflags
     push    0x23                        ; cs  (user code | RPL3)
     push    rcx                         ; rip
@@ -83,6 +85,7 @@ syscall_entry:
     add     rsp, 8                      ; cs
     pop     r11                         ; user RFLAGS -> R11 for SYSRET
     pop     rsp                         ; user RSP
+    swapgs
     o64 sysret
 
     ; rt_sigreturn restores a full context, rcx and r11 included, which
@@ -105,9 +108,5 @@ syscall_entry:
     pop     rbx
     pop     rax
     add     rsp, 16                     ; vector + error code
+    swapgs
     iretq
-
-section .data
-align 8
-syscall_kernel_rsp: dq 0                ; updated on every context switch
-syscall_user_rsp:   dq 0
