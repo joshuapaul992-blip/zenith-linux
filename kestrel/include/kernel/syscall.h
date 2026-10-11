@@ -193,7 +193,36 @@ struct int_frame;
 #define SYS_symlinkat     266
 #define SYS_fchmodat      268
 #define SYS_renameat2     316
-#define SYS_MAX           336
+#define SYS_personality  135
+#define SYS_sigaltstack  131
+#define SYS_getpriority  140
+#define SYS_setpriority  141
+#define SYS_sched_setparam 142
+#define SYS_sched_getparam 143
+#define SYS_sched_setscheduler 144
+#define SYS_sched_getscheduler 145
+#define SYS_sched_get_priority_max 146
+#define SYS_sched_get_priority_min 147
+#define SYS_mlock        149
+#define SYS_munlock      150
+#define SYS_mlockall     151
+#define SYS_munlockall   152
+#define SYS_time         201
+#define SYS_fadvise64    221
+#define SYS_ioprio_set   251
+#define SYS_ioprio_get   252
+#define SYS_fallocate    285
+#define SYS_getcpu       309
+#define SYS_statx        332
+#define SYS_pidfd_open   434
+#define SYS_clone3       435
+#define SYS_close_range  436
+#define SYS_faccessat2   439
+#define SYS_shmget        29
+#define SYS_shmat         30
+#define SYS_shmctl        31
+#define SYS_shmdt         67
+#define SYS_MAX           450
 
 typedef int64_t (*syscall_fn)(uint64_t a1, uint64_t a2, uint64_t a3,
                               uint64_t a4, uint64_t a5, uint64_t a6);

@@ -16,6 +16,8 @@
 #include <kernel/usbhost.h>
 #include <kernel/block.h>
 #include <kernel/bootvol.h>
+#include <kernel/time.h>
+#include <kernel/sound.h>
 
 #define P(...) (n += (size_t)snprintf(buf + n, n < cap ? cap - n : 0, __VA_ARGS__))
 
@@ -30,8 +32,10 @@ static size_t gen_version(char *buf, size_t cap, void *ctx)
 static size_t gen_uptime(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
-    uint64_t ms = uptime_ms();
-    P("%lu.%02lu\n", ms / 1000, (ms % 1000) / 10);
+    uint64_t ms = uptime_ms(), u, sy, idle;
+    sched_cpu_times(&u, &sy, &idle);
+    idle = idle * 1000 / PIT_HZ;
+    P("%lu.%02lu %lu.%02lu\n", ms / 1000, (ms % 1000) / 10, idle / 1000, (idle % 1000) / 10);
     return n;
 }
 
@@ -65,10 +69,24 @@ static size_t gen_mounts(char *buf, size_t cap, void *ctx)
     return n;
 }
 
+/* /proc/PID/mountinfo: id parent major:minor root mountpoint options - type source superoptions */
+static size_t gen_mountinfo(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    int id = 20;
+    for (struct mount *m = vfs_mounts(); m; m = m->next, id++) {
+        const char *ro = (m->flags & MNT_RDONLY) ? "ro" : "rw";
+        P("%d %d %u:%u / %s %s,relatime - %s %s %s\n", id, m->path[1] ? 20 : 1, (m->dev >> 8) & 0xfff,
+          (m->dev & 0xff) | ((m->dev >> 12) & 0xfff00),
+          m->path, ro, m->fstype, m->fstype, ro);
+    }
+    return n;
+}
+
 static size_t gen_filesystems(char *buf, size_t cap, void *ctx)
 {
     (void)ctx; size_t n = 0;
-    P("\tramfs\nnodev\tdevfs\nnodev\tprocfs\nnodev\tsysfs\n");
+    P("nodev\tramfs\nnodev\ttmpfs\nnodev\tdevfs\nnodev\tprocfs\nnodev\tsysfs\n\text2\n");
     return n;
 }
 
@@ -106,8 +124,13 @@ static size_t gen_stat(char *buf, size_t cap, void *ctx)
     sched_cpu_times(&u, &s, &i);
     u = u * 100 / PIT_HZ; s = s * 100 / PIT_HZ; i = i * 100 / PIT_HZ;
     P("cpu  %lu 0 %lu %lu 0 0 0 0 0 0\n", u, s, i);
-    P("cpu0 %lu 0 %lu %lu 0 0 0 0 0 0\n", u, s, i);
-    P("ctxt %lu\nbtime 0\nprocs_running 1\nprocs_blocked 0\n", sched_context_switches());
+    for (int c = 0; c < ncpus; c++)                     /* the totals, shared out evenly */
+        P("cpu%d %lu 0 %lu %lu 0 0 0 0 0 0\n", c, u / (uint64_t)ncpus, s / (uint64_t)ncpus, i / (uint64_t)ncpus);
+    int last = 0;
+    for (int k = 0; k < MAX_TASKS; k++) if (task_slot(k)->state != TASK_UNUSED && task_slot(k)->pid > last) last = task_slot(k)->pid;
+    int64_t btime = time_realtime_sec() - (int64_t)(uptime_ms() / 1000);
+    P("ctxt %lu\nbtime %ld\nprocesses %d\nprocs_running 1\nprocs_blocked 0\n", sched_context_switches(),
+      btime, last);
     return n;
 }
 
@@ -159,6 +182,7 @@ static size_t gen_pci(char *buf, size_t cap, void *ctx)
 static size_t gen_usb(char *buf, size_t cap, void *ctx) { (void)ctx; return usb_proc(buf, cap); }
 static size_t gen_partitions(char *buf, size_t cap, void *ctx) { (void)ctx; return blk_proc(buf, cap); }
 static size_t gen_bootvol(char *buf, size_t cap, void *ctx) { (void)ctx; return bootvol_proc(buf, cap); }
+static size_t gen_sound(char *buf, size_t cap, void *ctx) { (void)ctx; return hda_proc(buf, cap); }
 
 /* NVIDIA: probe results and the modeset outcome (also the "gpu" command). */
 static size_t gen_gpu(char *buf, size_t cap, void *ctx)
@@ -182,6 +206,48 @@ static size_t gen_loadavg(char *buf, size_t cap, void *ctx)
         if (t->pid > last) last = t->pid;
     }
     P("0.00 0.00 0.00 %d/%d %d\n", running, total, last);
+    return n;
+}
+
+/* ---- /proc/sys: read-only kernel settings ---------------------------------- */
+#define SYSVAL(fn, ...) \
+    static size_t fn(char *buf, size_t cap, void *ctx) { (void)ctx; size_t n = 0; P(__VA_ARGS__); return n; }
+SYSVAL(gen_sys_ostype, "%s\n", KESTREL_NAME)
+SYSVAL(gen_sys_osrelease, "%s\n", KESTREL_VERSION)
+SYSVAL(gen_sys_hostname, "%s\n", KESTREL_HOSTNAME)
+SYSVAL(gen_sys_pid_max, "%d\n", 32768)
+SYSVAL(gen_sys_zero, "0\n")
+SYSVAL(gen_sys_map_count, "65530\n")
+SYSVAL(gen_sys_file_max, "%d\n", 65536)
+SYSVAL(gen_sys_inotify_watches, "%d\n", 8192)
+SYSVAL(gen_sys_inotify_inst, "%d\n", 128)
+SYSVAL(gen_sys_inotify_queue, "%d\n", 16384)
+
+/* A random UUID: boot_id is fixed for the boot, uuid differs on every read. */
+static void make_uuid(char *out, uint64_t a, uint64_t b)
+{
+    uint8_t u[16];
+    for (int i = 0; i < 8; i++) { u[i] = (uint8_t)(a >> (i * 8)); u[8 + i] = (uint8_t)(b >> (i * 8)); }
+    u[6] = (u[6] & 0x0f) | 0x40;
+    u[8] = (u[8] & 0x3f) | 0x80;
+    snprintf(out, 37, "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+}
+static uint64_t mix(uint64_t x) { x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ull; return x ^ (x >> 33); }
+static size_t gen_sys_boot_id(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    static uint64_t a, b;
+    if (!a) { a = mix(rdtsc() ^ (uint64_t)time_realtime_sec()); b = mix(a ^ time_ns()); }
+    char u[37]; make_uuid(u, a, b);
+    P("%s\n", u);
+    return n;
+}
+static size_t gen_sys_uuid(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    char u[37]; make_uuid(u, mix(rdtsc()), mix(time_ns() ^ 0x9e3779b97f4a7c15ull));
+    P("%s\n", u);
     return n;
 }
 
@@ -277,8 +343,77 @@ static size_t gen_pid_maps(char *buf, size_t cap, void *ctx)
     return t && t->mm ? vm_maps(t->mm, buf, cap) : 0;
 }
 
+/* /proc/PID/statm: size resident shared text lib data dt, in pages */
+static size_t gen_pid_statm(char *buf, size_t cap, void *ctx)
+{
+    size_t n = 0;
+    struct tcb *t = pid_task(ctx);
+    uint64_t pages = t && t->mm ? t->mm->rss : 0;
+    P("%lu %lu 0 0 0 %lu 0\n", pages, pages, pages);
+    return n;
+}
+
+static size_t gen_empty(char *buf, size_t cap, void *ctx) { (void)buf; (void)cap; (void)ctx; return 0; }
+
+static size_t gen_pid_limits(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx; size_t n = 0;
+    P("Limit                     Soft Limit           Hard Limit           Units     \n");
+    P("Max stack size            %-20lu %-20s bytes     \n", (uint64_t)UVM_STACK_SIZE, "unlimited");
+    P("Max open files            %-20d %-20d files     \n", MAX_FDS, MAX_FDS);
+    P("Max processes             %-20d %-20d processes \n", MAX_TASKS, MAX_TASKS);
+    return n;
+}
+
+static size_t gen_oom_adj(char *buf, size_t cap, void *ctx) { (void)ctx; size_t n = 0; P("0\n"); return n; }
+
+/* symbolic links whose target is computed: /proc/PID/exe, cwd, root */
+static int link_exe(struct vnode *vn, char *buf, size_t size)
+{
+    struct tcb *t = pid_task(vn->ctx);
+    if (!t || !t->exe[0]) return -ENOENT;
+    size_t n = strlen(t->exe);
+    if (n > size) n = size;
+    memcpy(buf, t->exe, n);
+    return (int)n;
+}
+static int link_cwd(struct vnode *vn, char *buf, size_t size)
+{
+    struct tcb *t = pid_task(vn->ctx);
+    if (!t || !t->fs || !t->fs->cwd) return -ENOENT;
+    char tmp[VFS_PATH_MAX];
+    int r = vfs_path_of(t->fs->cwd, tmp, sizeof tmp);
+    if (r < 0) return r;
+    size_t n = strlen(tmp);
+    if (n > size) n = size;
+    memcpy(buf, tmp, n);
+    return (int)n;
+}
+static int link_root(struct vnode *vn, char *buf, size_t size) { (void)vn; if (!size) return 0; buf[0] = '/'; return 1; }
+static const struct vnode_ops exe_ops = { .readlink = link_exe };
+static const struct vnode_ops cwd_ops = { .readlink = link_cwd };
+static const struct vnode_ops root_ops = { .readlink = link_root };
+
+static void proc_link(struct vnode *dir, const char *name, const struct vnode_ops *ops, void *ctx)
+{
+    struct vnode *l = vfs_node_new(dir->fs, name, VLNK, 0777, ops);
+    if (!l) return;
+    l->ctx = ctx;
+    vfs_node_add(dir, l);
+}
+
 static void pid_files(struct vnode *dir, void *ctx)
 {
+    pseudo_file(dir, "statm", gen_pid_statm, ctx);
+    pseudo_file(dir, "mounts", gen_mounts, ctx);
+    pseudo_file(dir, "mountinfo", gen_mountinfo, ctx);
+    pseudo_file(dir, "environ", gen_empty, ctx);
+    pseudo_file(dir, "limits", gen_pid_limits, ctx);
+    pseudo_file(dir, "oom_score_adj", gen_oom_adj, ctx);
+    pseudo_file(dir, "cgroup", gen_empty, ctx);
+    proc_link(dir, "exe", &exe_ops, ctx);
+    proc_link(dir, "cwd", &cwd_ops, ctx);
+    proc_link(dir, "root", &root_ops, ctx);
     pseudo_file(dir, "stat", gen_pid_stat, ctx);
     pseudo_file(dir, "status", gen_pid_status, ctx);
     pseudo_file(dir, "cmdline", gen_pid_cmdline, ctx);
@@ -351,6 +486,27 @@ void procfs_init(const char *mountpoint)
     pseudo_file(r, "usb",         gen_usb, NULL);
     pseudo_file(r, "partitions",  gen_partitions, NULL);
     pseudo_file(r, "bootvol",     gen_bootvol, NULL);
+    pseudo_file(r, "sound",       gen_sound, NULL);
+    struct vnode *sys = pseudo_dir(r, "sys");
+    struct vnode *sk = pseudo_dir(sys, "kernel");
+    pseudo_file(sk, "ostype",    gen_sys_ostype, NULL);
+    pseudo_file(sk, "osrelease", gen_sys_osrelease, NULL);
+    pseudo_file(sk, "hostname",  gen_sys_hostname, NULL);
+    pseudo_file(sk, "pid_max",   gen_sys_pid_max, NULL);
+    pseudo_file(sk, "threads-max", gen_sys_pid_max, NULL);
+    pseudo_file(sk, "yama_ptrace_scope", gen_sys_zero, NULL);
+    struct vnode *rnd = pseudo_dir(sk, "random");
+    pseudo_file(rnd, "boot_id", gen_sys_boot_id, NULL);
+    pseudo_file(rnd, "uuid",    gen_sys_uuid, NULL);
+    struct vnode *svm = pseudo_dir(sys, "vm");
+    pseudo_file(svm, "overcommit_memory", gen_sys_zero, NULL);
+    pseudo_file(svm, "max_map_count", gen_sys_map_count, NULL);
+    struct vnode *sfs = pseudo_dir(sys, "fs");
+    pseudo_file(sfs, "file-max", gen_sys_file_max, NULL);
+    struct vnode *ino = pseudo_dir(sfs, "inotify");
+    pseudo_file(ino, "max_user_watches",   gen_sys_inotify_watches, NULL);
+    pseudo_file(ino, "max_user_instances", gen_sys_inotify_inst, NULL);
+    pseudo_file(ino, "max_queued_events",  gen_sys_inotify_queue, NULL);
     struct vnode *self = vfs_node_new(m, "self", VDIR, 0555, NULL);   /* the calling process */
     if (self) { vfs_node_add(r, self); pid_files(self, NULL); }
     proc_root = r;

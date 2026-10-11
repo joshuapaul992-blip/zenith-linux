@@ -273,6 +273,8 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     c->cmdline_len = p->cmdline_len;
     c->sig_mask = p->sig_mask;
     c->sig_pending = 0;
+    if ((flags & (CLONE_VM | CLONE_VFORK)) == CLONE_VM) c->alt_sp = c->alt_size = 0;   /* as Linux */
+    else { c->alt_sp = p->alt_sp; c->alt_size = p->alt_size; }
     if (flags & CLONE_VFORK) c->vfork_parent = p->pid;
     int pid = c->pid;
     if (flags & CLONE_PARENT_SETTID) put_user_u32((void *)ptid, (uint32_t)pid);
@@ -453,6 +455,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     }
     t->saved_mask_valid = false;
     t->robust_list = 0;
+    t->alt_sp = t->alt_size = 0;
     strlcpy(t->exe, path, sizeof t->exe);
     const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
     strlcpy(t->name, base, sizeof t->name);
@@ -774,9 +777,12 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_si
 {
     if (!(k->flags & SA_RESTORER) || !user_code(k->handler) || !user_code(k->restorer)) return false;
     uint64_t sp = f->rsp - 128;                         /* skip the red zone */
+    if ((k->flags & SA_ONSTACK) && t->alt_size && !sig_on_altstack(t, f->rsp))
+        sp = t->alt_sp + t->alt_size;                   /* sigaltstack(): a fresh stack */
+    uint64_t top = sp + 128 > f->rsp ? sp : f->rsp;
     uint64_t fpu = (sp - 512) & ~63ull;
     uint64_t frame = ((fpu - sizeof(struct rt_sigframe)) & ~15ull) - 8;   /* rsp+8 16-aligned */
-    if (frame < UVM_USER_START || f->rsp > UVM_USER_END || !user_range_ok(frame, f->rsp - frame)) return false;
+    if (frame < UVM_USER_START || top > UVM_USER_END || !user_range_ok(frame, top - frame)) return false;
 
     static uint8_t fxbuf[512] __attribute__((aligned(16)));
     struct rt_sigframe fr;
@@ -802,6 +808,9 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_si
     m->oldmask = oldmask;
     m->fpstate = fpu;
     fr.uc.sigmask = oldmask;
+    fr.uc.ss_sp = t->alt_sp;
+    fr.uc.ss_size = t->alt_size;
+    fr.uc.ss_flags = !t->alt_size ? 2 /* SS_DISABLE */ : sig_on_altstack(t, f->rsp) ? 1 /* SS_ONSTACK */ : 0;
     fr.info.si_signo = sig;
     fr.info.si_code = si->code;
     if (fault_signal(sig) && si->trapno) {
@@ -827,6 +836,37 @@ static bool setup_frame(struct tcb *t, struct int_frame *f, int sig, struct k_si
     if (k->flags & SA_RESETHAND) { k->handler = SIG_DFL; k->flags &= ~(uint64_t)SA_SIGINFO; }
     __asm__ volatile("fxrstor %0" :: "m"(*(const uint8_t (*)[512])clean_fpu()));
     return true;
+}
+
+bool sig_on_altstack(const struct tcb *t, uint64_t sp)
+{
+    return t->alt_size && sp > t->alt_sp && sp <= t->alt_sp + t->alt_size;
+}
+
+/* sigaltstack(ss, old): stack_t is { void *ss_sp; int ss_flags; size_t ss_size; } */
+int64_t sig_altstack(uint64_t uss, uint64_t uold)
+{
+    struct tcb *t = current_task();
+    uint64_t sp = t->uframe ? t->uframe->rsp : 0;
+    bool on = sig_on_altstack(t, sp);
+    if (uold) {
+        struct { uint64_t sp; int32_t flags, pad; uint64_t size; } o = {
+            t->alt_sp, t->alt_size ? (on ? 1 : 0) : 2, 0, t->alt_size };
+        if (copy_to_user((void *)uold, &o, sizeof o)) return -EFAULT;
+    }
+    if (uss) {
+        struct { uint64_t sp; int32_t flags, pad; uint64_t size; } n;
+        if (copy_from_user(&n, (const void *)uss, sizeof n)) return -EFAULT;
+        if (on) return -EPERM;
+        uint32_t fl = (uint32_t)n.flags & ~(1u << 31);     /* SS_AUTODISARM: accepted, not honoured */
+        if (fl == 2) { t->alt_sp = t->alt_size = 0; return 0; }    /* SS_DISABLE */
+        if (fl != 0 && fl != 1) return -EINVAL;
+        if (n.size < 2048) return -ENOMEM;                 /* MINSIGSTKSZ */
+        if (!uvm_range_ok(n.sp, n.size)) return -EFAULT;
+        t->alt_sp = n.sp;
+        t->alt_size = n.size;
+    }
+    return 0;
 }
 
 static void restart(struct int_frame *f, uint64_t nr)

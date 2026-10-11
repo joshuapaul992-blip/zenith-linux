@@ -86,7 +86,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kerne
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
            net/core.c net/arp.c net/ipv4.c net/udp.c net/tcp.c net/socket.c net/dhcp.c net/proc.c \
-           drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/net/rtl8169.c \
+           drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/sound/hda.c drivers/net/rtl8169.c \
            lib/string.c lib/printf.c
 
 OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC))
@@ -214,7 +214,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest sndtest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c
@@ -321,24 +321,32 @@ USBIMG_ROOT  := $(if $(MKE2FS),$(ROOTDISK))
 USBIMG_SIZE  ?= $(if $(MKE2FS),$(shell echo $$(($(ROOTDISK_MB) + 64))),64)
 $(USBIMG): $(STRIPPED) boot/grub/grub-usb.cfg tools/mkusbimg.py $(ROOTFS_STAGE).stamp $(BUILD)/cmdline.stamp $(USBIMG_ROOT)
 	@test -n "$(GRUB_MKIMAGE)" || { echo "error: grub-mkimage not found"; exit 1; }
-	@rm -rf $(BUILD)/usbdir
+	@rm -rf $(BUILD)/usbdir $(BUILD)/usb-esp.img
 	@mkdir -p $(BUILD)/usbdir/boot/grub
-	@cp $(STRIPPED) $(BUILD)/usbdir/boot/kernel.elf
-	@sed 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' boot/grub/grub-usb.cfg > $(BUILD)/usbdir/boot/grub/grub.cfg
+	@# The kernel goes on the EFI System Partition, where GRUB finds it by the
+	@# FAT serial number: a BIOS core.img must stay under 480 KiB, too small
+	@# for the kernel. Without mtools it goes into the memdisk instead.
+	@serial=$$(od -An -N4 -tx4 /dev/urandom | tr -d ' '); \
+	if [ -d "$(GRUB_LIB)/x86_64-efi" ] && command -v mformat >/dev/null; then \
+	    truncate -s 8M $(BUILD)/usb-esp.img && \
+	    MTOOLS_SKIP_CHECK=1 mformat -i $(BUILD)/usb-esp.img -T 16384 -h 64 -s 32 -v KESTREL_EFI -N $$serial :: && \
+	    MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD)/usb-esp.img ::/EFI ::/EFI/BOOT ::/boot && \
+	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(STRIPPED) ::/boot/kernel.elf; \
+	else cp $(STRIPPED) $(BUILD)/usbdir/boot/kernel.elf; fi; \
+	sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e "s|@ESP_UUID@|$$(echo $$serial | cut -c1-4)-$$(echo $$serial | cut -c5-8)|" \
+	    boot/grub/grub-usb.cfg > $(BUILD)/usbdir/boot/grub/grub.cfg
 	@tar --format=ustar -C $(BUILD)/usbdir -cf $(BUILD)/usb-memdisk.tar boot
 	@echo "  GRUB    core.img (USB, memdisk)"
 	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(BUILD)/usb-core.img \
 	    -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
-	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb test
-	@rm -f $(BUILD)/usb-esp.img
-	@if [ -d "$(GRUB_LIB)/x86_64-efi" ] && command -v mformat >/dev/null; then \
+	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb test \
+	    part_msdos part_gpt fat search
+	@if [ -f $(BUILD)/usb-esp.img ]; then \
 	    echo "  GRUB    BOOTX64.EFI (USB, memdisk)"; \
 	    $(GRUB_MKIMAGE) -O x86_64-efi -d $(GRUB_LIB)/x86_64-efi -o $(BUILD)/usb-bootx64.efi \
 	        -p '(memdisk)/boot/grub' -m $(BUILD)/usb-memdisk.tar \
-	        memdisk tar normal configfile multiboot2 efi_gop efi_uga video video_fb test && \
-	    truncate -s 8M $(BUILD)/usb-esp.img && \
-	    MTOOLS_SKIP_CHECK=1 mformat -i $(BUILD)/usb-esp.img -T 16384 -h 64 -s 32 -v KESTREL_EFI :: && \
-	    MTOOLS_SKIP_CHECK=1 mmd -i $(BUILD)/usb-esp.img ::/EFI ::/EFI/BOOT && \
+	        memdisk tar normal configfile multiboot2 efi_gop efi_uga video video_fb test \
+	        part_msdos part_gpt fat search && \
 	    MTOOLS_SKIP_CHECK=1 mcopy -i $(BUILD)/usb-esp.img $(BUILD)/usb-bootx64.efi ::/EFI/BOOT/BOOTX64.EFI; \
 	else echo "  (no GRUB x86_64-efi files or mtools: BIOS-only stick)"; fi
 	@echo "  USBIMG  $@"

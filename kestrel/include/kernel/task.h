@@ -140,6 +140,7 @@ struct tcb {
     uint64_t  saved_mask;       /* rt_sigsuspend: mask to restore           */
     bool      saved_mask_valid;
     struct ksig_info siginfo[NSIG];
+    uint64_t  alt_sp, alt_size; /* sigaltstack(); alt_size 0 = none          */
 
     int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
     int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */

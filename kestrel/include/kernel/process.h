@@ -89,6 +89,8 @@ __attribute__((noreturn)) void proc_exit_group(int code);
 
 /* ---- signals --------------------------------------------------------------- */
 /* To t's process (any thread of it may take the signal): */
+bool sig_on_altstack(const struct tcb *t, uint64_t sp);
+int64_t sig_altstack(uint64_t ss, uint64_t old);
 int  signal_send(struct tcb *t, int sig);       /* 0, or -ESRCH (sent by the kernel) */
 struct ksig_info;
 int  signal_send_info(struct tcb *t, int sig, const struct ksig_info *info);

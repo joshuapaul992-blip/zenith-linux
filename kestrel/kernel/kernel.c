@@ -32,6 +32,7 @@
 #include <kernel/bootmgr.h>
 #include <kernel/bootinfo.h>
 #include <kernel/net.h>
+#include <kernel/sound.h>
 #include <kernel/string.h>
 #include "pci.h"
 #include <kernel/storage.h>
@@ -487,6 +488,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     rootfs_mount();
     /* Network cards, the IPv4 stack and its thread; DHCP runs in the background. */
     net_init();
+    /* HD Audio: /dev/dsp and /dev/mixer */
+    hda_init();
 
     /* No serial port on many machines: write REPORT.TXT (and the video BIOS)
      * to the stick's "KESTREL RPT" volume, if there is one. */

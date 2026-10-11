@@ -744,6 +744,42 @@ static int64_t sys_clock_getres(uint64_t clk, uint64_t tsp, uint64_t a3, uint64_
     return copy_to_user((void *)tsp, &ts, sizeof ts) ? -EFAULT : 0;
 }
 
+/* clock_nanosleep(clk, flags, req, rem): TIMER_ABSTIME (1) sleeps until the
+ * clock reads req; otherwise for req (rem only then, as Linux). */
+static int64_t sys_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req, uint64_t rem, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    int kind = clock_kind(clk);
+    if (kind < 0 || clk == 3) return -EINVAL;
+    if (kind == 2) return -EOPNOTSUPP;
+    struct timespec ts;
+    if (copy_from_user(&ts, (const void *)req, sizeof ts)) return -EFAULT;
+    if (!timespec_ok(&ts)) return -EINVAL;
+    if (flags & 1) {
+        struct timespec now;
+        clock_read(kind, &now);
+        int64_t ds = ts.tv_sec - now.tv_sec, dn = ts.tv_nsec - now.tv_nsec;
+        if (dn < 0) { dn += 1000000000; ds--; }
+        if (ds < 0) return 0;
+        ts.tv_sec = ds; ts.tv_nsec = dn;
+        rem = 0;
+    }
+    uint64_t ms = (uint64_t)ts.tv_sec > (1ull << 40) ? (1ull << 50)
+                : (uint64_t)ts.tv_sec * 1000 + ((uint64_t)ts.tv_nsec + 999999) / 1000000;
+    uint64_t deadline = time_ms() + ms;
+    for (uint64_t now; (now = time_ms()) < deadline; ) {
+        if (signal_pending()) {
+            if (rem) {
+                struct timespec r = { (int64_t)((deadline - now) / 1000), (int64_t)((deadline - now) % 1000) * 1000000 };
+                if (copy_to_user((void *)rem, &r, sizeof r)) return -EFAULT;
+            }
+            return -EINTR;
+        }
+        task_sleep_ms(deadline - now);
+    }
+    return 0;
+}
+
 static int64_t sys_gettimeofday(uint64_t tvp, uint64_t tzp, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
@@ -2412,6 +2448,213 @@ static int64_t sys_tkill(uint64_t tid, uint64_t sig, uint64_t a3, uint64_t a4, u
 static int64_t sys_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a4; (void)a5; (void)a6; return sig_tgkill((int64_t)(int32_t)tgid, (int64_t)(int32_t)tid, (int64_t)(int32_t)sig); }
 
+/* ---- what glibc programs (and Firefox) ask for beyond the basics ----------- */
+static int64_t sys_sigaltstack(uint64_t ss, uint64_t old, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return sig_altstack(ss, old); }
+
+static int64_t sys_time(uint64_t tp, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
+    struct timespec ts;
+    clock_read(0, &ts);
+    int64_t v = ts.tv_sec;
+    if (tp && copy_to_user((void *)tp, &v, sizeof v)) return -EFAULT;
+    return v;
+}
+
+/* Advice only: the file must be open, nothing else happens. */
+static int64_t sys_fadvise64(uint64_t fd, uint64_t off, uint64_t len, uint64_t advice, uint64_t a5, uint64_t a6)
+{
+    (void)off; (void)len; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    fput(f);
+    return advice > 5 ? -EINVAL : 0;
+}
+
+/* glibc falls back to ftruncate + writes (posix_fallocate) */
+static int64_t sys_fallocate(uint64_t fd, uint64_t mode, uint64_t off, uint64_t len, uint64_t a5, uint64_t a6)
+{ (void)fd; (void)mode; (void)off; (void)len; (void)a5; (void)a6; return -EOPNOTSUPP; }
+
+struct statx_ts { int64_t sec; uint32_t nsec; int32_t pad; };
+struct kstatx {
+    uint32_t mask, blksize;
+    uint64_t attributes;
+    uint32_t nlink, uid, gid;
+    uint16_t mode, pad1;
+    uint64_t ino, size, blocks, attributes_mask;
+    struct statx_ts atime, btime, ctime, mtime;
+    uint32_t rdev_major, rdev_minor, dev_major, dev_minor;
+    uint64_t mnt_id;
+    uint32_t dio_mem_align, dio_offset_align;
+    uint64_t spare[12];
+};
+_Static_assert(sizeof(struct kstatx) == 256, "statx layout");
+
+static int64_t put_statx(uint64_t ubuf, struct vnode *vn)
+{
+    struct stat st;
+    vfs_fill_stat(vn, &st);
+    struct kstatx x;
+    memset(&x, 0, sizeof x);
+    x.mask = 0x7ff;                                     /* STATX_BASIC_STATS: no birth time */
+    x.blksize = (uint32_t)st.st_blksize;
+    x.nlink = (uint32_t)st.st_nlink;
+    x.uid = st.st_uid; x.gid = st.st_gid;
+    x.mode = (uint16_t)st.st_mode;
+    x.ino = st.st_ino;
+    x.size = (uint64_t)st.st_size;
+    x.blocks = (uint64_t)st.st_blocks;
+    x.atime = (struct statx_ts){ st.st_atim.tv_sec, (uint32_t)st.st_atim.tv_nsec, 0 };
+    x.mtime = (struct statx_ts){ st.st_mtim.tv_sec, (uint32_t)st.st_mtim.tv_nsec, 0 };
+    x.ctime = (struct statx_ts){ st.st_ctim.tv_sec, (uint32_t)st.st_ctim.tv_nsec, 0 };
+    x.rdev_major = (uint32_t)((st.st_rdev >> 8) & 0xfff); x.rdev_minor = (uint32_t)((st.st_rdev & 0xff) | ((st.st_rdev >> 12) & ~0xffull));
+    x.dev_major = (uint32_t)((st.st_dev >> 8) & 0xfff);   x.dev_minor = (uint32_t)((st.st_dev & 0xff) | ((st.st_dev >> 12) & ~0xffull));
+    return copy_to_user((void *)ubuf, &x, sizeof x) ? -EFAULT : 0;
+}
+
+/* statx(dirfd, path, flags, mask, buf): every basic field, whatever the mask */
+static int64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mask, uint64_t buf, uint64_t a6)
+{
+    (void)mask; (void)a6;
+    char p[VFS_PATH_MAX];
+    long n = strncpy_from_user(p, (const char *)path, sizeof p);
+    if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
+    if (n == 0) {
+        if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
+        if ((int)dirfd == AT_FDCWD) { struct vnode *vn; int r = vfs_lookup(".", &vn); return r ? r : put_statx(buf, vn); }
+        struct file *f = fget((int)dirfd);
+        if (!f) return -EBADF;
+        int64_t r = put_statx(buf, f->vn);
+        fput(f);
+        return r;
+    }
+    struct vnode *base, *vn; struct file *hold;
+    int r = at_dir((int64_t)dirfd, p, &base, &hold);
+    if (r) return r;
+    r = vfs_lookup_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), &vn);
+    int64_t ret = r ? r : put_statx(buf, vn);
+    fput(hold);
+    return ret;
+}
+
+static int64_t sys_faccessat2(uint64_t dirfd, uint64_t path, uint64_t mode, uint64_t flags, uint64_t a5, uint64_t a6)
+{
+    (void)a5; (void)a6;
+    if (mode & ~7ull) return -EINVAL;
+    if (flags & ~(uint64_t)(0x200 /* AT_EACCESS */ | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) return -EINVAL;
+    char p[VFS_PATH_MAX];
+    long n = strncpy_from_user(p, (const char *)path, sizeof p);
+    if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
+    if (n == 0) {
+        if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
+        if ((int)dirfd == AT_FDCWD) return 0;
+        struct file *f = fget((int)dirfd);
+        if (!f) return -EBADF;
+        fput(f);
+        return 0;
+    }
+    struct vnode *base, *vn; struct file *hold;
+    int r = at_dir((int64_t)dirfd, p, &base, &hold);
+    if (r) return r;
+    r = vfs_lookup_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), &vn);
+    if (!r && (mode & 2) && vn->fs && (vn->fs->flags & MNT_RDONLY)) r = -EROFS;
+    fput(hold);
+    return r;
+}
+
+/* close_range(first, last, flags): CLOSE_RANGE_CLOEXEC marks instead of closing */
+static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a4; (void)a5; (void)a6;
+    if (flags & ~6ull) return -EINVAL;
+    if ((uint32_t)first > (uint32_t)last) return -EINVAL;
+    struct tcb *t = current_task();
+    uint64_t hi = (uint32_t)last < MAX_FDS ? (uint32_t)last : MAX_FDS - 1;
+    for (uint64_t fd = (uint32_t)first; fd <= hi; fd++) {
+        if (flags & 4) { if (t->files->fd[fd]) t->files->cloexec[fd] = 1; continue; }
+        struct file *f = fd_take(t, (int)fd);
+        if (f) vfs_close(f);
+    }
+    return 0;
+}
+
+/* clone3(args, size): struct clone_args, mapped onto clone() */
+static int64_t sys_clone3(uint64_t uargs, uint64_t size, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    struct { uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls,
+                      set_tid, set_tid_size, cgroup; } ca;
+    if (size < 64 || size > 4096) return -EINVAL;
+    memset(&ca, 0, sizeof ca);
+    if (copy_from_user(&ca, (const void *)uargs, size < sizeof ca ? size : sizeof ca)) return -EFAULT;
+    if ((ca.flags & 0xff) || ca.exit_signal > 64 || ca.set_tid || ca.set_tid_size) return -EINVAL;
+    if (ca.flags & 0x1000 /* CLONE_PIDFD */) return -EINVAL;
+    if ((ca.stack == 0) != (ca.stack_size == 0)) return -EINVAL;
+    uint64_t sp = ca.stack ? ca.stack + ca.stack_size : 0;
+    return proc_clone(ca.flags | ca.exit_signal, sp, ca.parent_tid, ca.child_tid, ca.tls);
+}
+
+static int64_t sys_getcpu(uint64_t cpu, uint64_t node, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    uint32_t c = (uint32_t)(this_cpu() - cpus), z = 0;
+    if (cpu && copy_to_user((void *)cpu, &c, 4)) return -EFAULT;
+    if (node && copy_to_user((void *)node, &z, 4)) return -EFAULT;
+    return 0;
+}
+
+/* One scheduling class (SCHED_OTHER, nice 0): queries answer that, requests
+ * for it succeed, real-time ones are refused as for an unprivileged user. */
+static int64_t sys_getpriority(uint64_t which, uint64_t who, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a3; (void)a4; (void)a5; (void)a6; return which > 2 ? -EINVAL : (who && which == 0 && !task_find((int)who)) ? -ESRCH : 20; }
+static int64_t sys_setpriority(uint64_t which, uint64_t who, uint64_t prio, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a4; (void)a5; (void)a6; (void)prio; return which > 2 ? -EINVAL : (who && which == 0 && !task_find((int)who)) ? -ESRCH : 0; }
+static int64_t sys_sched_getscheduler(uint64_t pid, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return pid && !task_find((int)pid) ? -ESRCH : 0; }
+static int64_t sys_sched_setscheduler(uint64_t pid, uint64_t policy, uint64_t param, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)param; (void)a4; (void)a5; (void)a6;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    policy &= ~0x40000000ull;                           /* SCHED_RESET_ON_FORK */
+    if (policy == 1 || policy == 2) return -EPERM;      /* SCHED_FIFO, SCHED_RR */
+    return policy == 0 || policy == 3 || policy == 5 ? 0 : -EINVAL;
+}
+static int64_t sys_sched_getparam(uint64_t pid, uint64_t param, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    int32_t z = 0;
+    return copy_to_user((void *)param, &z, 4) ? -EFAULT : 0;
+}
+static int64_t sys_sched_setparam(uint64_t pid, uint64_t param, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    if (pid && !task_find((int)pid)) return -ESRCH;
+    int32_t prio;
+    if (copy_from_user(&prio, (const void *)param, 4)) return -EFAULT;
+    return prio ? -EINVAL : 0;
+}
+static int64_t sys_sched_prio_range(uint64_t policy, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return policy > 6 ? -EINVAL : (policy == 1 || policy == 2) ? 99 : 0; }
+static int64_t sys_sched_prio_min(uint64_t policy, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return policy > 6 ? -EINVAL : (policy == 1 || policy == 2) ? 1 : 0; }
+static int64_t sys_ioprio(uint64_t which, uint64_t who, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)who; (void)a3; (void)a4; (void)a5; (void)a6; return which < 1 || which > 3 ? -EINVAL : 0; }
+
+/* Memory is never swapped out: locking always succeeds. */
+static int64_t sys_mlock_ok(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return 0; }
+
+/* personality(0xffffffff) queries; PER_LINUX is the only one */
+static int64_t sys_personality(uint64_t persona, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return (uint32_t)persona == 0xffffffffu || !(uint32_t)persona ? 0 : -EINVAL; }
+
+/* Known absent on purpose (callers fall back): rseq, pidfds, System V
+ * shared memory. ENOSYS without the "unimplemented" log line. */
+static int64_t sys_absent(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{ (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
+
 static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return -ENOSYS; }
 
@@ -2518,10 +2761,26 @@ void syscall_init(void)
     REG(SYS_removexattr, sys_removexattr); REG(SYS_lremovexattr, sys_lremovexattr);
     REG(SYS_fremovexattr, sys_fremovexattr);
     REG(SYS_fdatasync, sys_fsync);     REG(SYS_memfd_create, sys_memfd_create);
+    REG(SYS_sigaltstack, sys_sigaltstack); REG(SYS_time, sys_time);
+    REG(SYS_fadvise64, sys_fadvise64); REG(SYS_fallocate, sys_fallocate);
+    REG(SYS_statx, sys_statx);         REG(SYS_faccessat2, sys_faccessat2);
+    REG(SYS_close_range, sys_close_range); REG(SYS_clone3, sys_clone3);
+    REG(SYS_getcpu, sys_getcpu);       REG(SYS_clock_nanosleep, sys_clock_nanosleep);
+    REG(SYS_getpriority, sys_getpriority); REG(SYS_setpriority, sys_setpriority);
+    REG(SYS_sched_getscheduler, sys_sched_getscheduler); REG(SYS_sched_setscheduler, sys_sched_setscheduler);
+    REG(SYS_sched_getparam, sys_sched_getparam); REG(SYS_sched_setparam, sys_sched_setparam);
+    REG(SYS_sched_get_priority_max, sys_sched_prio_range); REG(SYS_sched_get_priority_min, sys_sched_prio_min);
+    REG(SYS_ioprio_get, sys_ioprio);   REG(SYS_ioprio_set, sys_ioprio);
+    REG(SYS_mlock, sys_mlock_ok);      REG(SYS_munlock, sys_mlock_ok);
+    REG(SYS_mlockall, sys_mlock_ok);   REG(SYS_munlockall, sys_mlock_ok);
+    REG(SYS_personality, sys_personality);
+    REG(SYS_rseq, sys_absent);         REG(SYS_pidfd_open, sys_absent);
+    REG(SYS_shmget, sys_absent);       REG(SYS_shmat, sys_absent);
+    REG(SYS_shmctl, sys_absent);       REG(SYS_shmdt, sys_absent);
 
     syscall_cpu_init();
     int n = 0;
-    for (int i = 0; i < SYS_MAX; i++) if (table[i] && table[i] != sys_enosys) n++;
+    for (int i = 0; i < SYS_MAX; i++) if (table[i] && table[i] != sys_enosys && table[i] != sys_absent) n++;
     kprintf("syscall: int 0x80 gate + SYSCALL/LSTAR ready, %d calls implemented\n", n);
 }
 
@@ -2573,5 +2832,5 @@ int syscall_dispatch(struct int_frame *f)
 }
 
 const char *syscall_name(int nr) { return (nr >= 0 && nr < SYS_MAX && names[nr]) ? names[nr] : NULL; }
-int syscall_implemented(int nr) { return nr >= 0 && nr < SYS_MAX && table[nr] && table[nr] != sys_enosys; }
+int syscall_implemented(int nr) { return nr >= 0 && nr < SYS_MAX && table[nr] && table[nr] != sys_enosys && table[nr] != sys_absent; }
 uint64_t syscall_count(int nr) { return (nr >= 0 && nr < SYS_MAX) ? counts[nr] : 0; }

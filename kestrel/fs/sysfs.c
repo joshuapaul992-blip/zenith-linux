@@ -5,6 +5,7 @@
 #include <kernel/arch.h>
 #include <kernel/string.h>
 #include <kernel/bootinfo.h>
+#include <kernel/smp.h>
 
 /* A tiny attribute macro: each generator prints one value + newline. */
 #define ATTR(fn, ...) \
@@ -30,6 +31,15 @@ ATTR(a_quantum,    "%d\n", SCHED_QUANTUM)
 ATTR(a_ctxsw,      "%lu\n", sched_context_switches())
 ATTR(a_hz,         "%d\n", PIT_HZ)
 ATTR(a_pwr_state,  "freeze mem disk\n")
+
+/* /sys/devices/system/cpu/{online,possible,present}: "0" or "0-N"
+ * (sysconf(_SC_NPROCESSORS_ONLN) in glibc reads "online") */
+static size_t a_cpu_range(char *buf, size_t cap, void *ctx)
+{
+    (void)ctx;
+    return ncpus > 1 ? (size_t)snprintf(buf, cap, "0-%d\n", ncpus - 1) : (size_t)snprintf(buf, cap, "0\n");
+}
+ATTR(a_one, "1\n")
 
 void sysfs_init(const char *mountpoint)
 {
@@ -65,9 +75,19 @@ void sysfs_init(const char *mountpoint)
     struct vnode *dev = pseudo_dir(r, "devices");
     struct vnode *sys = pseudo_dir(dev, "system");
     struct vnode *cpu = pseudo_dir(sys, "cpu");
-    struct vnode *cpu0 = pseudo_dir(cpu, "cpu0");
-    pseudo_file(cpu0, "vendor",     a_cpu_vendor, NULL);
-    pseudo_file(cpu0, "model_name", a_cpu_model, NULL);
+    pseudo_file(cpu, "online",   a_cpu_range, NULL);
+    pseudo_file(cpu, "possible", a_cpu_range, NULL);
+    pseudo_file(cpu, "present",  a_cpu_range, NULL);
+    int listed = apic_enabled() ? apic_cpu_count() : 1;   /* the APs are not up yet */
+    if (listed > MAX_CPUS) listed = MAX_CPUS;
+    for (int i = 0; i < listed; i++) {
+        char nm[16];
+        snprintf(nm, sizeof nm, "cpu%d", i);
+        struct vnode *c = pseudo_dir(cpu, nm);
+        pseudo_file(c, "vendor",     a_cpu_vendor, NULL);
+        pseudo_file(c, "model_name", a_cpu_model, NULL);
+        pseudo_file(c, "online",     a_one, NULL);
+    }
 
     struct vnode *pwr = pseudo_dir(r, "power");
     pseudo_file(pwr, "state", a_pwr_state, NULL);
