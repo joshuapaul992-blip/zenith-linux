@@ -57,6 +57,7 @@ done
 
 echo "mkfirefoxroot: configuring"
 [ -e "$ROOT/usr/bin/sh" ] || ln -s dash "$ROOT/usr/bin/sh"            # dpkg would make it
+[ -e "$ROOT/usr/bin/awk" ] || ln -s gawk "$ROOT/usr/bin/awk"           # so would update-alternatives
 cat > "$ROOT/etc/asound.conf" <<'EOF'
 # ALSA programs (aplay, speaker-test) play through Kestrel's OSS devices
 pcm.!default { type oss device /dev/dsp }
