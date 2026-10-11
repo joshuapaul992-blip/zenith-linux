@@ -18,7 +18,8 @@ sudo apt install build-essential nasm grub-pc-bin grub-efi-amd64-bin grub-common
 make            # build/kernel.elf
 make iso        # build/kestrel.iso          hybrid BIOS + UEFI (grub-mkrescue); carries the boot
                 #                            volume as a Multiboot2 module (build/kestrel.vol)
-make floppy     # build/kestrel-floppy.img   1.44 MB, BIOS (grub-mkimage + memdisk)
+make floppy     # build/kestrel-floppy.img   1.44 MB, BIOS (grub-mkimage + memdisk; the kernel follows
+                #                            core.img as raw sectors, loaded by block list)
 make usbimg     # build/kestrel-usb.img      64 MiB USB stick, BIOS + UEFI: GRUB, Kestrel boot volume
                 #                            (rootfs/) and a FAT report volume (REPORT.TXT, VBIOS.ROM)
 make run-usb    # QEMU q35, boot from the stick on xHCI (kernel runs with kestrel.root=usb)
@@ -459,9 +460,9 @@ The shell's `recovery` command opens the same console at any time. `bootvol` and
 | Location | Contents |
 |---|---|
 | LBA 0 | GRUB `boot.img` plus the option-B marker |
-| From LBA 1 | `core.img`, carrying the stripped kernel and a `grub.cfg` with `kestrel.root=usb` in its memdisk |
+| From LBA 1 | `core.img`, carrying a `grub.cfg` with `kestrel.root=usb` in its memdisk; the BIOS limits `core.img` to 480 KiB, which the kernel outgrew, so `grub.cfg` finds the EFI System Partition by its volume serial (`search --fs-uuid`) and loads the kernel from there (without `mtools` on the build host the kernel stays in the memdisk) |
 | LBA 2048 | the `0x4B` partition with the header and a ustar of `rootfs/` |
-| then | an EFI System Partition (`0xEF`, 8 MiB) with `EFI/BOOT/BOOTX64.EFI`: GRUB x86_64-efi with the same memdisk, so the stick also boots on UEFI machines |
+| then | an EFI System Partition (`0xEF`, 8 MiB) with `EFI/BOOT/BOOTX64.EFI` (GRUB x86_64-efi with the same memdisk, so the stick also boots on UEFI machines) and `boot/kernel.elf` |
 | last 24 MiB | the FAT16 report volume `KESTREL RPT` (`0x0E`, first table entry so that every OS mounts it) |
 
 **Report volume.** Many machines have no serial port, so Kestrel writes its diagnostics to the stick it booted from (`kernel/report.c`):
@@ -614,6 +615,8 @@ include/kernel/usyscall.h    int 0x80 wrappers used by init
 
 The calling convention is the Linux x86_64 one: the call number goes in `rax`, the arguments in `rdi rsi rdx r10 r8 r9`, and the result (a negative errno on failure) comes back in `rax`.
 
+**Tracing.** `kestrel.strace=<text>` on the kernel command line logs every system call of the programs whose path contains `<text>`: the call, its first four arguments and the result, plus a line when a call that may block starts. `kestrel.strace=firefox` is how the gaps Firefox hit were found. Calls nobody implemented are logged anyway, three times per call number.
+
 Calls can enter through two paths:
 - `int $0x80`, used by the in-kernel shell and tools.
 - `syscall`, used by ring-3 programs.
@@ -621,15 +624,15 @@ Calls can enter through two paths:
 Every pointer a call receives is checked to lie in the user half and copied through `copy_from_user`/`copy_to_user` (`kernel/uaccess.c`): a bad or unmapped pointer gives `-EFAULT`, never a kernel fault. Structures with pointers inside (`msghdr`, iovecs, `epoll_event`, control messages) are copied into the kernel once and only that copy is used, so another thread cannot change them between the check and the use.
 
 **Implemented** (by area):
-- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, close, lseek, stat, lstat (as stat: no symbolic links), fstat, newfstatat, access, faccessat, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`), dup, dup2, dup3, ftruncate, truncate, fsync, fdatasync, flock (advisory, per open file description), the twelve `*xattr` calls (no file system stores extended attributes: lists are empty, reads give `ENODATA`, writes `ENOTSUP`), sendfile, readlink/readlinkat (`/proc/self/exe`, `/proc/self/fd/N`), mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), chown, utimensat, chdir, getcwd, umask.
-- **Waiting for events:** poll, ppoll, select, pselect6 (with signal masks), epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait, eventfd, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd, signalfd4, pipe, pipe2.
+- **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, close, lseek, stat, lstat, fstat, newfstatat, statx, access, faccessat, faccessat2, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`, and byte-range locks: `F_GETLK`/`F_SETLK`/`F_SETLKW` and the `F_OFD_*` forms, in `fs/lockf.c`), dup, dup2, dup3, close_range, fadvise64 and readahead (hints), fallocate (`EOPNOTSUPP`, so glibc's `posix_fallocate` writes instead), ftruncate, truncate, fsync, fdatasync, flock (advisory, per open file description), the twelve `*xattr` calls (no file system stores extended attributes: lists are empty, reads give `ENODATA`, writes `ENOTSUP`), sendfile, readlink/readlinkat (`/proc/self/exe`, `/proc/self/fd/N`; opening `/proc/self/fd/N` or `/dev/fd/N` opens the same file again with the new access mode, which is how Firefox makes read-only copies of a memfd), mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), chown, utimensat, chdir, getcwd, umask.
+- **Waiting for events:** poll, ppoll, select, pselect6 (with signal masks), epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait, eventfd, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd, signalfd4, pipe, pipe2, inotify_init, inotify_init1, inotify_add_watch, inotify_rm_watch (`fs/inotify.c`).
 - **Sockets (`AF_UNIX`):** socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg and recvmsg (with `SCM_RIGHTS`), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes).
 - **Sockets (`AF_INET`):** the same calls for TCP, UDP, raw ICMP and ping sockets, with `MSG_PEEK`/`MSG_DONTWAIT`/`MSG_TRUNC`/`MSG_NOSIGNAL`, and the `SOL_SOCKET`, `IPPROTO_IP` and `IPPROTO_TCP` options programs use (see Networking). `ioctl` handles `FIONREAD` and the `SIOCGIF*`/`SIOCSIF*`/`SIOCADDRT`/`SIOCDELRT` interface calls.
-- **Memory:** brk, mmap (anonymous, private and shared file mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, `MAP_POPULATE`), munmap, mprotect, mremap, madvise (`MADV_DONTNEED`), mincore, msync, memfd_create (with seals).
-- **Processes and threads:** fork, vfork, clone (processes and threads), execve, exit (the thread), exit_group (the process), wait4, getpid, gettid, getppid, set_tid_address, set_robust_list, get_robust_list, futex, arch_prctl (`ARCH_SET_FS`/`GET_FS`/`SET_GS`/`GET_GS`), sched_yield, sched_getaffinity, sched_setaffinity, setsid, setpgid, getpgid, getpgrp, getsid, prctl (`PR_SET_NAME`/`PR_GET_NAME`).
-- **Signals:** kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, alarm, getitimer, setitimer (`ITIMER_REAL`).
+- **Memory:** brk, mmap (anonymous, private and shared file mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, `MAP_POPULATE`), munmap, mprotect, mremap, madvise (`MADV_DONTNEED`), mincore, msync, mlock and friends (accepted: nothing is swapped), memfd_create (with seals, `MFD_NOEXEC_SEAL`). System V shared memory (`shmget` and the rest) answers `ENOSYS` quietly, so the X server's MIT-SHM and its clients pass memfds over the socket instead.
+- **Processes and threads:** fork, vfork, clone (processes and threads), clone3 (including `CLONE_CLEAR_SIGHAND`, which glibc's `posix_spawn` uses), execve, exit (the thread), exit_group (the process), wait4, waitid (`P_ALL`, `P_PID`, `P_PGID`, `WNOHANG`, `WNOWAIT`), getpid, gettid, getppid, set_tid_address, set_robust_list, get_robust_list, futex, arch_prctl (`ARCH_SET_FS`/`GET_FS`/`SET_GS`/`GET_GS`), sched_yield, sched_getaffinity, sched_setaffinity, the `sched_*` scheduler and priority calls (one class, `SCHED_OTHER`), getpriority, setpriority, ioprio_get/set, getcpu, personality, setsid, setpgid, getpgid, getpgrp, getsid, prctl (`PR_SET_NAME`/`PR_GET_NAME`, dumpable, capability bounding set, no-new-privs), capget and capset (root holds every capability). rseq, pidfd_open, quotactl and the NUMA policy calls (mbind, set_mempolicy, get_mempolicy) answer `ENOSYS` quietly; glibc and Firefox carry on without them.
+- **Signals:** kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, sigaltstack (`SA_ONSTACK` handlers run on it), pause, alarm, getitimer, setitimer (`ITIMER_REAL`).
 - **Identity and limits:** getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; only root may change them), getrlimit, setrlimit, prlimit64 (fixed limits; 1024 descriptors).
-- **Time and system:** nanosleep, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET/TSC), gettimeofday, times, getrusage, sysinfo, uname, getrandom, sync, syncfs, reboot.
+- **Time and system:** nanosleep, clock_nanosleep (with `TIMER_ABSTIME`), time, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET/TSC), gettimeofday, times, getrusage, sysinfo, uname, getrandom, sync, syncfs, reboot.
 
 **Power:** `poweroff`, `reboot` and `halt` work from any shell (as root). BusyBox asks init with a signal to pid 1, and the kernel plays that part; `reboot(2)` and the `-f` forms go straight to `kernel/power.c`. Power-off uses ACPI S5 (PM1 control ports from the FADT, the `\_S5_` sleep type from the DSDT), so it works on real machines, with the QEMU/Bochs/VirtualBox ports as a fallback. Restart tries the FADT reset register, port `0xCF9`, the keyboard controller, then a triple fault. Storage is flushed and the other CPUs are stopped first.
 
@@ -728,7 +731,8 @@ Host packages: `musl-tools meson ninja-build pkg-config x11-xkb-utils xkb-data`.
 | Running `xkbcomp` for each keymap | the precompiled `/boot/share/X11/xkb/compiled/kestrel-default.xkm` (us layout, pc105 model), copied into place by patch 0001 |
 | `SIGALRM` smart scheduler, `link()` lock file | configured out (patch 0002); the scheduler falls back to time checks in the dispatch loop |
 | Fonts | the built-in `fixed` and `cursor` fonts |
-| MIT-SHM, GLX/DRI, XDMCP, udev, input thread | disabled |
+| MIT-SHM | on: clients pass a memfd with `SCM_RIGHTS` (`ShmAttachFd`); there is no System V shared memory |
+| GLX/DRI, XDMCP, udev, input thread | disabled |
 
 **The DDX** (`hw-kestrel/kestrel.c`) has two halves:
 - **Screens:** one X screen per monitor (`-screens N` limits the count), each a 24-bit TrueColor fb screen with RENDER. A damage listener on each root window collects changes, and a wrapped screen BlockHandler pushes them to the monitor before the server sleeps, after the software cursor has been drawn back.
@@ -743,7 +747,7 @@ Exiting the server returns its monitors to their text terminals.
 
 As the X protocol requires, the pointer stays hidden until some client defines a cursor; normally that is the window manager's job, and xdemo does it for its test.
 
-**Not yet:** more clients, MIT-SHM (needs shared memory), keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
+**Not yet:** GLX in the server (OpenGL programs use EGL with Mesa's llvmpipe instead), keymap choice beyond the precompiled one, PS/2 mice, hardware cursors and acceleration.
 
 ## IceWM (`ports/icewm/`)
 
@@ -890,13 +894,17 @@ How it works:
 - **Operations:** `O_NOFOLLOW`, `O_PATH`, hard links, `statfs`, and `chown`/`chmod`/`utimensat` on every kind of path.
 - **File system interface:** a disk file system plugs in through `create`/`link`/`remove`/`rename`/`setattr`/`readlink`/`evict` hooks and a per-mount `sync` and `statfs`.
 - **Directory offsets:** `getdents` offsets are stable per entry, so a program that deletes entries while reading a directory (`rm -r`) sees each of them once.
+- **inotify** (`fs/inotify.c`): watches on files and directories. The VFS reports creation, deletion, renames (both halves, with a shared cookie), writes, truncation, attribute changes and closes; a watch on a directory hears about its entries by name, and the watch on a file or directory itself gets the `*_SELF` events. The same event twice in a row is queued once, a full queue (16 KiB) gets one `IN_Q_OVERFLOW`, and `IN_ONESHOT`, `IN_MASK_ADD`, `IN_MASK_CREATE`, `IN_ONLYDIR`, `IN_DONT_FOLLOW` and `FIONREAD` work. GLib's file monitors (GTK, Firefox) use it.
+- **Record locks** (`fs/lockf.c`): `fcntl` read and write locks on byte ranges, POSIX (owned by the process, dropped when it closes any descriptor of the file) and open-file-description (`F_OFD_*`, dropped with the open file). SQLite, and with it Firefox's profile, depends on them.
 
 **Tests:**
-- `fstest` (in `/bin` on the root volume) runs 53 checks:
+- `fstest` (in `/bin` on the root volume) runs 83 checks:
   - files in every block-map class, sparse files, truncation, `O_APPEND`;
   - fast and slow symbolic links, link loops, `O_NOFOLLOW`;
   - hard links, renames of files and directories (and `..`), 400-entry directories;
   - unlinked open files, `chmod`/`chown`, `flock` and the extended-attribute calls;
+  - inotify: create, modify (queued once), attribute, close, move with a shared cookie, delete, delete-self, `IN_IGNORED`, `IN_ONLYDIR`, `FIONREAD`;
+  - `fcntl` record locks between two processes (conflicts, `F_GETLK` reporting the holder, `F_SETLKW` waiting, release on any close), `waitid` with `WNOWAIT`, reopening a descriptor through `/proc/self/fd`, memfd seals;
   - free space returning exactly to where it started.
 - `fstest -r` writes files, restarts the machine, and checks them after the reboot.
 - After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
@@ -966,6 +974,79 @@ In QEMU (TCG, no KVM) on loopback: 200 one-byte TCP round trips take about 60 ms
 
 **Not yet:** IPv6, TCP selective acknowledgement (SACK) and timestamps, IP forwarding, card interrupts, checksum and segmentation offload, `SO_REUSEPORT` load balancing, netlink and packet sockets, and reacting to the cable being unplugged (DHCP keeps asking until it gets an answer, so a cable plugged in after boot does work).
 
+## Sound: HD Audio (`drivers/sound/hda.c`)
+
+Intel High Definition Audio, the sound hardware of nearly every PC since 2004, with the codecs behind it (Realtek ALC parts on most boards).
+
+**Controller.** Every PCI device of class 04.03 is tried: Intel's ICH and PCH controllers, and AMD's, NVIDIA's and VIA's, which use the same register set (only the Intel ones QEMU emulates, ICH6 and ICH9, have been tested). On Intel parts the traffic-class select register is cleared first, as Intel's drivers do. Commands go through the CORB/RIRB rings, or the immediate command registers when the rings do not answer.
+
+**Codecs.** Each codec's audio function group is reset and powered up, then every widget is read: capabilities, connection lists (short and long form, ranges), pin capabilities and configuration defaults, amplifier capabilities and supported rates. Outputs are chosen from the pin configuration in this order: speaker, headphones, line out; jacks the firmware marks as unconnected are skipped. From each pin a path to a DAC is found through mixers and selectors; the path is selected, its input amplifiers unmuted and its output amplifiers set to 0 dB. Pins get their output and headphone enables and EAPD (the external amplifier switch Realtek codecs need on laptops). Realtek codecs are named in the log as `Realtek ALCxxx`.
+
+**Playback.** One output stream with a 64 KiB ring in 8 buffer descriptors, polled every 4 ms by the `hdad` thread through the DMA position buffer (or the link position register when the buffer stays still). Played parts of the ring are cleared, so an underrun plays silence, and the stream stops a second after the last writer closes and the ring runs dry.
+
+**`/dev/dsp`** (OSS, `14,3`): unsigned 8-bit, signed 16-bit and 32-bit little-endian samples, mono or stereo (mono is doubled), any rate from 4 kHz to 192 kHz. Rates the codec lacks are converted (linear interpolation) and the hardware runs at 48 kHz. Writes block until there is room, or return `EAGAIN` with `O_NONBLOCK`; `poll` works. The usual ioctls: `SNDCTL_DSP_RESET`, `SYNC`, `POST`, `SPEED`, `SETFMT`, `CHANNELS`, `STEREO`, `GETBLKSIZE`, `SETFRAGMENT`, `SUBDIVIDE`, `GETFMTS`, `GETOSPACE`, `GETODELAY`, `GETOPTR`, `GETCAPS`, `GET/SETTRIGGER`, `NONBLOCK`, `OSS_GETVERSION`. One writer at a time (`EBUSY`); there is no capture yet (`ENODEV` for reading).
+
+**`/dev/mixer`** (`14,0`): master and PCM volume (0 to 100, mapped onto the output amplifiers' steps up to 0 dB), plus the device masks and `SOUND_MIXER_INFO`. `/proc/sound` shows the controller, codecs, chosen outputs and the stream's state.
+
+**ALSA programs** (`aplay`, `speaker-test`) use the ALSA library's OSS plugin from `libasound2-plugins`, with this `/etc/asound.conf`:
+
+```
+pcm.!default { type oss device /dev/dsp }
+ctl.!default { type oss device /dev/mixer }
+```
+
+**PulseAudio programs**, Firefox among them (Mozilla's builds have no ALSA backend), go through PulseAudio 16 with its OSS module on `/dev/dsp`. `tools/mkfirefoxroot.sh` writes this as `/etc/pulse/kestrel.pa`:
+
+```
+load-module module-oss device=/dev/dsp sink_name=kestrel playback=1 record=0 mmap=0
+load-module module-native-protocol-unix auth-anonymous=1
+load-module module-always-sink
+set-default-sink kestrel
+```
+
+`pulseaudio -n -F /etc/pulse/kestrel.pa --exit-idle-time=-1` starts it; `paplay`, `pactl` and Firefox's Web Audio then play, at 44.1 kHz converted to the codec's 48 kHz.
+
+**Test:** `sndtest` (in `/boot/bin`) checks the mixer, exclusive open, every format, 1.5 s of 440 Hz at 48 kHz with `SYNC` timing, the delay and pointer ioctls, non-blocking writes and `poll`, `RESET`, 8 kHz mono through the rate converter, and 44.1 kHz 32-bit audio written in odd-sized pieces. `sndtest file.wav` plays a WAV file. In QEMU (`-device intel-hda -device hda-output` or `ich9-intel-hda` with `hda-duplex`, recording to a WAV file) the recording holds the expected tones at the expected lengths.
+
+**Not yet:** capture, several streams at once (mixing), HDMI/DisplayPort audio, jack detection (plugging headphones in does not switch outputs), and the per-board fixups Linux keeps for particular Realtek laptops.
+
+## glibc programs, GTK and Firefox
+
+Programs built for Ubuntu 24.04 run unmodified: the glibc dynamic loader, GLib and GTK 3, Mesa, D-Bus's library, PulseAudio, and Firefox 157 (Mozilla's official build, multi-process).
+
+**Building a root with Firefox** (on an Ubuntu 24.04 host, as root, with an unpacked Linux x86_64 Firefox):
+
+```sh
+tools/mkfirefoxroot.sh ffroot.tar firefox/          # Mozilla's tarball, unpacked
+make usbimg ROOTFS_BASE=ffroot.tar ROOTDISK_MB=2400
+```
+
+The script resolves the dependencies of a short package list (bash and the usual tools, GTK 3 and gtk3-demo, Mesa, the X client tools, fonts, icons, D-Bus, ALSA and PulseAudio), downloads them with `apt-get download`, unpacks them into a merged-`/usr` tree and builds the font, schema, pixbuf, MIME and icon caches. Firefox goes into `/opt/firefox` with a policy file that skips the first-run and terms-of-use pages, and `/usr/local/bin/firefox` starts PulseAudio if needed, then Firefox. IceWM's menu and toolbar get Firefox, XTerm, the GTK demo and xeyes. `tools/mergeroot.py` then adds Kestrel's X server, IceWM, xterm and test programs.
+
+Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the desktop and, a minute later, Firefox.
+
+**What it uses from Kestrel:**
+
+| Need | Kestrel provides |
+|---|---|
+| Drawing | the X server with MIT-SHM (memfd over `SCM_RIGHTS`), RENDER, Composite; fonts through fontconfig and FreeType on the client side |
+| OpenGL | Mesa's llvmpipe through EGL (`eglinfo`: OpenGL 4.5, OpenGL ES 3.2); there is no GLX in the server, so `glxinfo` and GLX-only programs fail |
+| Shared memory between Firefox's processes | memfd with seals, read-only copies made by reopening `/proc/self/fd/N` |
+| Starting child processes | `clone3` with `CLONE_CLEAR_SIGHAND` (glibc's `posix_spawn`), `waitid` |
+| Profile databases (SQLite) | `fcntl` record locks |
+| File monitors (GLib) | inotify |
+| `/proc` and `/sys` that GTK and Firefox read | `/proc/self/{exe,fd,maps,stat,status,cmdline,mountinfo}`, `/proc/{cpuinfo,meminfo,stat}`, `/sys/devices/system/cpu` |
+| Sound | PulseAudio on `/dev/dsp` (above) |
+| D-Bus | the library only; there is no session or system bus, and programs carry on without one |
+
+**Checked in QEMU** (no KVM, 4 CPUs, 3 GiB): `xdpyinfo` lists MIT-SHM, RENDER and Composite; xeyes and gtk3-demo draw; Firefox opens a local page with HTML, CSS gradients, a canvas and JavaScript, and a Web Audio oscillator on that page is heard in the QEMU HD Audio recording at the right pitch.
+
+**Limits:**
+- Firefox's sandboxes are off (`MOZ_DISABLE_CONTENT_SANDBOX` and the others): they need seccomp-bpf and namespaces.
+- Slow under emulation: in QEMU without KVM, Firefox's window appears after about 90 seconds and a page after two to three minutes. Much of that is the big kernel lock; `clock_gettime`, `getpid` and `gettid` already skip it.
+- Non-PIE programs (linked at a fixed address, such as Ubuntu's `python3.12`) do not load yet.
+- No GLX, no D-Bus daemon, no recording.
+
 ## Memory map at boot
 
 | Range | Use |
@@ -986,6 +1067,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.
 6. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
 7. **Hardware support:** MSI/MSI-X interrupts for storage and USB (they are polled today), USB hubs, an EHCI driver for machines without xHCI.
+8. **Firefox, properly:** seccomp-bpf and namespaces so its sandboxes can stay on, GLX in the X server, non-PIE executables, and finer locking so it starts quickly.
 
 ## Licenses
 
