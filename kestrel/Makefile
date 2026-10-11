@@ -179,14 +179,18 @@ STRIPPED := $(BUILD)/kernel-stripped.elf
 $(STRIPPED): $(KERNEL)
 	@$(OBJCOPY) --strip-debug $< $@
 
-# ---- 1.44 MB floppy: boot.img + core.img with the kernel inside a memdisk
+# ---- 1.44 MB floppy: boot.img + core.img (grub.cfg in a memdisk), then the
+# kernel as raw sectors from FLOPPY_KSECT on, which grub.cfg loads by block
+# list: the kernel no longer fits inside core.img (BIOS limit 480 KiB).
+FLOPPY_KSECT := 512
 $(FLOPPY): $(STRIPPED) boot/grub/grub-floppy.cfg $(BUILD)/cmdline.stamp
 	@test -n "$(GRUB_MKIMAGE)" || { echo "error: grub-mkimage not found"; exit 1; }
 	@test -f "$(GRUB_LIB)/i386-pc/boot.img" || { echo "error: GRUB i386-pc files not found in GRUB_LIB=$(GRUB_LIB)"; exit 1; }
 	@rm -rf $(BUILD)/floppydir
 	@mkdir -p $(BUILD)/floppydir/boot/grub
-	@cp $(STRIPPED) $(BUILD)/floppydir/boot/kernel.elf
-	@sed 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' boot/grub/grub-floppy.cfg > $(BUILD)/floppydir/boot/grub/grub.cfg
+	@ksect=$$(( ($$(stat -c %s $(STRIPPED)) + 511) / 512 )); \
+	 sed -e 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' -e "s|@KERNEL_BLOCKS@|$(FLOPPY_KSECT)+$$ksect|" \
+	    boot/grub/grub-floppy.cfg > $(BUILD)/floppydir/boot/grub/grub.cfg
 	@tar --format=ustar -C $(BUILD)/floppydir -cf $(BUILD)/memdisk.tar boot
 	@echo "  GRUB    core.img (memdisk)"
 	@$(GRUB_MKIMAGE) -O i386-pc -d $(GRUB_LIB)/i386-pc -o $(BUILD)/core.img \
@@ -194,6 +198,8 @@ $(FLOPPY): $(STRIPPED) boot/grub/grub-floppy.cfg $(BUILD)/cmdline.stamp
 	    biosdisk memdisk tar normal configfile multiboot2 vbe video video_fb
 	@echo "  FLOPPY  $@"
 	@cat $(GRUB_LIB)/i386-pc/boot.img $(BUILD)/core.img > $@
+	@test $$(stat -c %s $@) -le $$(( $(FLOPPY_KSECT) * 512 )) || { echo "error: core.img reaches the kernel's sectors"; exit 1; }
+	@dd if=$(STRIPPED) of=$@ bs=512 seek=$(FLOPPY_KSECT) conv=notrunc status=none
 	@test $$(stat -c %s $@) -le 1474560 || { echo "error: image exceeds 1.44 MB"; exit 1; }
 	@truncate -s 1474560 $@
 
