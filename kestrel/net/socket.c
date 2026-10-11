@@ -592,9 +592,9 @@ int net_ioctl(unsigned long req, void *arg)
         uint32_t nf = (uint16_t)r->u.flags;
         if (n == netif_loopback()) nf |= IFF_LOOPBACK;
         bool was_up = n->flags & IFF_UP;
-        n->flags = (n->flags & ~(uint32_t)(IFF_UP)) | (nf & IFF_UP);
+        n->flags = (n->flags & ~(uint32_t)(IFF_UP | IFF_RUNNING)) | (nf & IFF_UP);
         if (!(nf & IFF_UP) && was_up) arp_flush_if(n);
-        if ((nf & IFF_UP) && n->link_up && n->link_up(n)) n->flags |= IFF_RUNNING;
+        if ((nf & IFF_UP) && (!n->link_up || n->link_up(n))) n->flags |= IFF_RUNNING;   /* lo has no link to lose */
         break;
     }
     case SIOCGIFADDR:    if (!n->ip) { rc = -EADDRNOTAVAIL; break; } set_sin(&r->u.addr, n->ip); break;

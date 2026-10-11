@@ -75,8 +75,6 @@ struct vnet {
 enum { DFSEL = 0, DF = 4, GFSEL = 8, GF = 12, MSIX = 16, NUMQ = 18, STATUS = 20, QSEL = 22, QSIZE = 24,
        QMSIX = 26, QENABLE = 28, QNOFF = 30, QDESC = 32, QDRIVER = 40, QDEVICE = 48 };
 
-static int nvnet;
-
 static void barrier(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 
 static volatile uint8_t *map_cap(struct pci_device *d, uint8_t bar, uint32_t off, uint32_t len)
@@ -275,7 +273,6 @@ static bool vnet_init(struct pci_device *d)
     vq_kick(&v->rx);
 
     struct netif *n = &v->nif;
-    snprintf(n->name, sizeof n->name, "eth%d", nvnet++);
     n->driver = "virtio-net";
     n->mtu = ETH_MTU;
     if (v->features & F_NET_MAC) for (int i = 0; i < 6; i++) n->mac[i] = v->devcfg[i];

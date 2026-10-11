@@ -172,7 +172,8 @@ static void bind_lease(struct client *c, const struct dhcp_msg *m, size_t len)
     if (c->t2 > c->lease || c->t2 < c->t1) c->t2 = c->lease / 8 * 7;
     bool changed = n->ip != ip || n->mask != mask;
     netif_set_addr(n, ip, mask);
-    if (router) route_add(0, 0, router, n);
+    struct netif *via = route_default_if();
+    if (router && (!via || via == n)) route_add(0, 0, router, n);   /* the first card to get a lease keeps the default route */
     uint8_t l;
     const uint8_t *dns = find_opt(m, len, 6, &l);
     if (dns) {

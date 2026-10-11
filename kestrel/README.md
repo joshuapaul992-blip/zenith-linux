@@ -1,6 +1,6 @@
 # Kestrel
 
-Kestrel (0.2.0, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, and a virtual file system with `/dev`, `/proc` and `/sys`.
+Kestrel (0.3.0, "Stable Storage Engine") is a freestanding x86_64 kernel that boots through GRUB 2 (Multiboot2). It draws its own boot manager on a 1024×768 linear frame buffer, styled after the classic BIOS-based Windows Boot Manager. After a choice is made it brings up a POSIX-style kernel that runs unmodified Linux/musl programs: processes and threads on every CPU, demand-paged copy-on-write memory, signals, futexes, epoll, Unix sockets with descriptor passing, a virtual file system with `/dev`, `/proc` and `/sys`, ext2 on disk, and TCP/IP networking with drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168 cards.
 
 Tested in QEMU 9.2 with three boot paths:
 - legacy BIOS from the ISO, using a VBE frame buffer
@@ -193,7 +193,7 @@ Each utility is a separate `int name_main(struct cu_io *io, int argc, char **arg
 | `echo [-n] [-e\|-E]` | Escapes `\n \t \\ \a \b \e \f \r \v \0NNN \c` |
 | `chmod MODE`, `chown USER[:GROUP]` | Octal (`755`) or symbolic (`u+x,go-w`) modes. Names come from `/etc/passwd` and `/etc/group`, or numbers. |
 | `date [+FORMAT]` | The CMOS RTC is read at boot and advanced by the HPET. Kestrel has no time zones, so the time is UTC. |
-| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.2.0-release`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
+| `uname [-asnrvm]` | Without options it prints `Sysname: Kestrel`, `Nodename: kestrel-pc`, `Release: 0.3.0-release`, `Version: Stable Storage Engine`, `Machine: x86_64`. |
 | `neofetch` | A falcon in columns 2–28 (silver) and live system information from column 32, never past column 127 (no wrapping). Below it, the 16-colour strip. |
 
 `neofetch` reads every value at run time from these sources:
@@ -529,6 +529,8 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               video/         EDID parser (edid.c), Bochs/QEMU DISPI mode setter (bochs_dispi.c)
               gpu/nvidia/    NVIDIA stage 1: VBIOS parser (nvbios.c), probe (nvidia.c): chip, VBIOS,
                              DP AUX/DPCD/EDID, firmware display state; host tests in test/
+              net/           Ethernet cards: virtio_net.c, e1000.c (Intel 8254x/8257x), rtl8139.c,
+                             rtl8169.c (RTL8169/8168/8111/8101), nic.h (shared helpers)
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
@@ -562,6 +564,11 @@ fs/           vfs.c          vnodes, mounts, path walk (., .., mount crossing), 
                              PID/{stat,status,cmdline,comm}, self/
                              interrupts cmdline kmsg syscalls
               sysfs.c        /sys: kernel/ class/graphics/fb0/ firmware/ devices/system/cpu/ power/
+net/          core.c         packets, interfaces, routes, loopback, the netd thread, boot options
+              arp.c ipv4.c   Ethernet and ARP, IPv4 (fragments, reassembly), ICMP
+              udp.c tcp.c    UDP, raw and ping sockets; TCP
+              socket.c       AF_INET socket calls and SIOC* interface ioctls
+              dhcp.c proc.c  DHCP client; /proc/net
 kernel/       kernel.c       initialisation sequence, init and worker threads
               syscall.c      syscall table (Linux x86_64 numbers), handlers, ENOSYS stubs
               uaccess.c      copy_from_user/copy_to_user and friends (checked, fault-safe)
@@ -617,6 +624,7 @@ Every pointer a call receives is checked to lie in the user half and copied thro
 - **Files:** read, write, readv, writev, pread64, pwrite64, open, openat, close, lseek, stat, lstat (as stat: no symbolic links), fstat, newfstatat, access, faccessat, getdents64, ioctl, fcntl (`F_DUPFD`, `F_GETFD`/`F_SETFD`, `F_GETFL`/`F_SETFL`, `F_ADD_SEALS`/`F_GET_SEALS`), dup, dup2, dup3, ftruncate, truncate, fsync, fdatasync, sendfile, readlink/readlinkat (`/proc/self/exe`, `/proc/self/fd/N`), mkdir, mkdirat, rmdir, unlink, unlinkat, rename, chmod, fchmod (accepted), chown, utimensat, chdir, getcwd, umask.
 - **Waiting for events:** poll, ppoll, select, pselect6 (with signal masks), epoll_create, epoll_create1, epoll_ctl, epoll_wait, epoll_pwait, eventfd, eventfd2, timerfd_create, timerfd_settime, timerfd_gettime, signalfd, signalfd4, pipe, pipe2.
 - **Sockets (`AF_UNIX`):** socket, socketpair, bind, listen, connect, accept, accept4, sendto, recvfrom, sendmsg and recvmsg (with `SCM_RIGHTS`), shutdown, getsockname, getpeername, setsockopt (accepted, ignored), getsockopt (`SO_PEERCRED`, `SO_TYPE`, `SO_ERROR`, buffer sizes).
+- **Sockets (`AF_INET`):** the same calls for TCP, UDP, raw ICMP and ping sockets, with `MSG_PEEK`/`MSG_DONTWAIT`/`MSG_TRUNC`/`MSG_NOSIGNAL`, and the `SOL_SOCKET`, `IPPROTO_IP` and `IPPROTO_TCP` options programs use (see Networking). `ioctl` handles `FIONREAD` and the `SIOCGIF*`/`SIOCSIF*`/`SIOCADDRT`/`SIOCDELRT` interface calls.
 - **Memory:** brk, mmap (anonymous, private and shared file mappings, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`, `MAP_POPULATE`), munmap, mprotect, mremap, madvise (`MADV_DONTNEED`), mincore, msync, memfd_create (with seals).
 - **Processes and threads:** fork, vfork, clone (processes and threads), execve, exit (the thread), exit_group (the process), wait4, getpid, gettid, getppid, set_tid_address, set_robust_list, get_robust_list, futex, arch_prctl (`ARCH_SET_FS`/`GET_FS`/`SET_GS`/`GET_GS`), sched_yield, sched_getaffinity, sched_setaffinity, setsid, setpgid, getpgid, getpgrp, getsid, prctl (`PR_SET_NAME`/`PR_GET_NAME`).
 - **Signals:** kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, alarm, getitimer, setitimer (`ITIMER_REAL`).
@@ -899,6 +907,48 @@ How it works:
 - Device nodes, FIFOs and sockets on disk (`/dev` is devfs).
 - `mount(2)` for other volumes.
 
+## Networking
+
+**Stack** (`net/`). One IPv4 stack for every card:
+- **Ethernet and ARP:** a 64-entry cache (5-minute lifetime) that holds up to 4 packets per address while it asks, 3 tries one second apart, then ICMP host unreachable.
+- **IPv4:** routes by longest prefix; fragments what does not fit the card's MTU and reassembles what arrives in pieces (64 KiB datagrams); ICMP echo replies, and port, protocol and host unreachable errors in both directions.
+- **UDP:** broadcast (with `SO_BROADCAST`), multicast delivery to every matching socket, `connect` for a fixed peer, ICMP errors reported to connected sockets.
+- **TCP:** window scaling and the MSS option, RTO per RFC 6298 with Karn's rule, slow start, congestion avoidance and NewReno fast recovery, delayed ACKs, Nagle (`TCP_NODELAY`), zero-window probes, keepalive, `SO_LINGER`, half-close, `TIME_WAIT`, RST on close with unread data, and RFC 5961 challenge ACKs. 128 KiB send and receive buffers per connection.
+- **Sockets:** blocking and non-blocking (`connect` returns `EINPROGRESS`), with `poll`/`select`/`epoll`, `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_REUSEADDR`, `SO_ERROR`, ephemeral ports 32768–60999. Raw ICMP sockets and unprivileged ping sockets (`SOCK_DGRAM`, `IPPROTO_ICMP`) are there for `ping`.
+- **Loopback:** `lo` (127.0.0.1/8, MTU 16436).
+
+**How it runs.** A kernel thread, `netd`, receives frames, runs the ARP, TCP and DHCP timers and sleeps until the next deadline. Cards are polled, not interrupt-driven: on every 1 kHz tick the boot CPU checks one descriptor bit per card and wakes `netd` when a frame has arrived, so an idle network costs one memory read per millisecond. System calls send directly.
+
+**Configuration.** A DHCP client (RFC 2131) runs on every Ethernet card it finds at boot. It applies the address, netmask, default route (the first card to get a lease keeps it), name servers, domain and MTU, and renews the lease at T1 and T2. `/etc/resolv.conf` is a symbolic link to `/proc/net/pnp`, which lists the name servers, so musl's resolver (and BusyBox `nslookup`, `wget`) find them. Boot options:
+- `kestrel.net=dhcp` (default) or `kestrel.net=off`.
+- `kestrel.ip=ADDR/PREFIX[,GATEWAY[,DNS]]`, e.g. `kestrel.ip=192.168.1.50/24,192.168.1.1,1.1.1.1`: a fixed address on the first card instead of DHCP.
+
+BusyBox `ifconfig`, `route`, `netstat`, `arp`, `ping`, `nc`, `wget`, `httpd` and `nslookup` work through the usual ioctls and `/proc/net/{dev,route,arp,tcp,udp,snmp}`, which use Linux's formats. `ip` needs netlink sockets and `udhcpc` needs packet sockets, which Kestrel does not have yet; the kernel's own DHCP client does `udhcpc`'s job.
+
+**Cards** (`drivers/net/`):
+
+| Driver | Chips | PCI IDs | Tested |
+|---|---|---|---|
+| `virtio-net` | virtio 1.0 network device (QEMU, KVM, most hypervisors) | 1af4:1000, 1af4:1041 | QEMU `virtio-net-pci` |
+| `e1000` | Intel 82540/541/543/544/545/546/547, 82571/572/573/574, 82583 | 8086:100e and 47 others | QEMU `e1000` (82540EM) and `e1000e` (82574L) |
+| `rtl8139` | Realtek RTL8139/8139A/B/C/C+/D, 8100, 8130, and boards built on them | 10ec:8139 and 19 others | QEMU `rtl8139`, through I/O ports and through the memory BAR |
+| `r8169` | Realtek RTL8169/8110, RTL8168/8111 B through H, 8168EP, 8117; RTL8101E/8102E/8103E/8105E/8106E, 8402, 8411 (Fast Ethernet) | 10ec:8161/8167/8168/8169/8136 and 6 others | not run: QEMU has no model of these chips |
+
+- **e1000:** the integrated Intel LAN of recent chipsets (I217, I218, I219) is a different design and is not claimed.
+- **r8169:** the chip version is read from `TxConfig` as Linux does; it decides the receive configuration, the transmit FIFO mode, and whether the PHY is reached through `PHYAR` or (8168G on) the GPHY OCP window. The PLL, the PHY and the RXDV gate are powered back up in case a previous driver shut them down. Linux also loads per-version PHY tuning tables, which this driver does not. The 2.5 and 5 gigabit RTL8125/8126 are a different design and are refused with a message.
+- Each card gets a ring of receive and transmit descriptors with 2 KiB buffers (RTL8139: an 8 KiB receive ring and four transmit slots, below 4 GiB). Cards are named `eth0`, `eth1`, ... in the order they are found: virtio-net, e1000, r8169, rtl8139.
+
+**Tests:** `nettest` (in `/boot/bin`) runs 58 checks:
+- interfaces, `SIOC*` ioctls and `if_nametoindex`;
+- UDP on loopback, including 40 KB fragmented datagrams, `MSG_TRUNC` and ICMP port unreachable (`ECONNREFUSED`);
+- TCP: half-close, RST on unread data, `ECONNREFUSED`, `EADDRINUSE`, non-blocking connect with `epoll`, `/proc/net/tcp`, and 8 MiB echoed through loopback with a checksum;
+- `nettest HOST:PORT` also waits for DHCP, pings the gateway, echoes 8 MiB of TCP and 20 UDP datagrams through the card with a server on the host, and checks `/etc/resolv.conf`;
+- `nettest serve PORT` takes a connection from the host (QEMU `hostfwd`) and answers with the byte count and checksum.
+
+In QEMU (TCG, no KVM) on loopback: 200 one-byte TCP round trips take about 60 ms and bulk TCP runs at about 11 MiB/s each way; through the card, ping to the host is 2–4 ms and TCP 5–7 MiB/s each way.
+
+**Not yet:** IPv6, TCP selective acknowledgement (SACK) and timestamps, IP forwarding, card interrupts, checksum and segmentation offload, `SO_REUSEPORT` load balancing, netlink and packet sockets, and reacting to the cable being unplugged (DHCP keeps asking until it gets an answer, so a cable plugged in after boot does work).
+
 ## Memory map at boot
 
 | Range | Use |
@@ -914,7 +964,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 
 1. **Finer kernel locking:** split the big kernel lock (scheduler run queue, memory manager, VFS, sockets), so system-call-heavy programs scale across CPUs.
 2. **A writable file system**: done for ext2, with symbolic links and the root on disk (see above). Next: ext4 extents, a page cache (shared writable mappings of disk files), `mount(2)`.
-3. **Networking:** a TCP/IP stack and a NIC driver (virtio-net, Intel e1000), which a browser needs.
+3. **Networking:** done (see Networking): IPv4, TCP, UDP, DHCP, and drivers for virtio-net, Intel e1000 and Realtek RTL8139/RTL8169/RTL8168. Next: IPv6, card interrupts and offloads, Intel I219 and Realtek RTL8125.
 4. **Job control** (stop/continue signals, `SIGTSTP`/`SIGCONT` on the terminal).
 5. **ACPI** beyond the MADT and HPET (power-off, PCI interrupt routing) on real hardware.
 6. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.

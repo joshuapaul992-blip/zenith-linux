@@ -86,7 +86,7 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kerne
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
            net/core.c net/arp.c net/ipv4.c net/udp.c net/tcp.c net/socket.c net/dhcp.c net/proc.c \
-           drivers/net/virtio_net.c drivers/net/e1000.c \
+           drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/net/rtl8169.c \
            lib/string.c lib/printf.c
 
 OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC))

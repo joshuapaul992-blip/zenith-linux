@@ -1,5 +1,6 @@
 /* net/proc.c -- /proc/net: dev, route, arp, tcp, udp, pnp (Linux formats)
  *
+ * tcp6, udp6, raw, raw6 and unix exist with only their header line.
  * /proc/net/pnp lists the name servers the way Linux's kernel DHCP client
  * does, so /etc/resolv.conf can be a symbolic link to it. */
 #include <kernel/net.h>
@@ -78,6 +79,12 @@ static size_t gen_pnp(char *buf, size_t cap, void *ctx)
     return n < cap ? n : cap;
 }
 
+/* Present but empty, as on a Linux without IPv6, so netstat and ss find them. */
+static size_t gen_header(char *buf, size_t cap, void *ctx)
+{
+    return (size_t)snprintf(buf, cap, "%s", (const char *)ctx);
+}
+
 static size_t gen_snmp(char *buf, size_t cap, void *ctx)
 {
     (void)ctx;
@@ -97,4 +104,13 @@ void net_proc_init(void)
     pseudo_file(d, "udp", gen_udp, NULL);
     pseudo_file(d, "pnp", gen_pnp, NULL);
     pseudo_file(d, "snmp", gen_snmp, NULL);
+    static const char tcp6[] = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n";
+    static const char udp6[] = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+    static const char raw[] = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n";
+    static const char unx[] = "Num       RefCount Protocol Flags    Type St Inode Path\n";
+    pseudo_file(d, "tcp6", gen_header, (void *)tcp6);
+    pseudo_file(d, "udp6", gen_header, (void *)udp6);
+    pseudo_file(d, "raw", gen_header, (void *)raw);
+    pseudo_file(d, "raw6", gen_header, (void *)udp6);
+    pseudo_file(d, "unix", gen_header, (void *)unx);
 }

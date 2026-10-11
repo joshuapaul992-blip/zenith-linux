@@ -109,6 +109,8 @@ void          net_set_timer(uint64_t when_ms);  /* netd wakes no later than this
 /* drivers (drivers/net/) */
 void virtio_net_probe(void);
 void e1000_probe(void);
+void rtl8139_probe(void);
+void rtl8169_probe(void);
 
 /* ---- routing ---------------------------------------------------------------- */
 struct route { uint32_t dst, mask, gw; struct netif *nif; bool used; };
@@ -117,6 +119,7 @@ extern struct route routes[MAX_ROUTES];
 struct netif *route_lookup(uint32_t dst, uint32_t *nexthop);    /* NULL: unreachable */
 int  route_add(uint32_t dst, uint32_t mask, uint32_t gw, struct netif *nif);
 int  route_del(uint32_t dst, uint32_t mask);
+struct netif *route_default_if(void);   /* where the default route goes, or NULL */
 void route_flush_if(struct netif *nif);
 void netif_set_addr(struct netif *nif, uint32_t ip, uint32_t mask);   /* also the subnet route */
 bool ip_is_local(uint32_t ip);          /* one of ours (any interface)   */

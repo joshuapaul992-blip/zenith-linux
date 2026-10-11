@@ -9,8 +9,8 @@
  *   row  0   [######### Kestrel Boot Manager #########]   title bar
  *   row  2   Choose an operating system to start, or press TAB to select a tool:
  *   row  3   (Use the arrow keys to highlight your choice, then press ENTER.)
- *   row  5   [ Kestrel 0.1 (x86_64)                    > ] highlight bar
- *   row  6     Kestrel 0.1 (x86_64) [Safe Mode]
+ *   row  5   [ Kestrel 0.3.0 (x86_64)                  > ] highlight bar
+ *   row  6     Kestrel 0.3.0 (x86_64) [Safe Mode]
  *   row  9   Seconds until the highlighted choice will be started automatically: 10
  *   row 11   To specify an advanced option for this choice, press F8.
  *   row 21   Tools:
@@ -53,9 +53,9 @@
 /* ------------------------------------------------------------------------- */
 
 static const char *const os_items[] = {
-    "Kestrel 0.1 (x86_64)",
-    "Kestrel 0.1 (x86_64) [Safe Mode]",
-    "Kestrel 0.1 (x86_64) [Debugging Mode]",
+    "Kestrel " KESTREL_VERSION " (x86_64)",
+    "Kestrel " KESTREL_VERSION " (x86_64) [Safe Mode]",
+    "Kestrel " KESTREL_VERSION " (x86_64) [Debugging Mode]",
 };
 static const uint32_t os_flags[] = { 0, BOOTOPT_SAFE_MODE, BOOTOPT_DEBUG };
 #define N_OS ((int)(sizeof os_items / sizeof *os_items))

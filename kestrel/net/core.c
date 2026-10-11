@@ -128,6 +128,8 @@ struct netif *netif_by_index(int index)
 void netif_register(struct netif *nif)
 {
     uint64_t f = irq_save();
+    static int neth;
+    if (!nif->name[0]) snprintf(nif->name, sizeof nif->name, "eth%d", neth++);   /* drivers leave it empty */
     nif->index = next_index++;
     nif->next = NULL;
     struct netif **pp = &ifaces;
@@ -171,6 +173,14 @@ int route_add(uint32_t dst, uint32_t mask, uint32_t gw, struct netif *nif)
     routes[free] = (struct route){ dst & mask, mask, gw, nif, true };
     irq_restore(f);
     return 0;
+}
+
+/* The interface the default route leaves through, or NULL. */
+struct netif *route_default_if(void)
+{
+    for (int i = 0; i < MAX_ROUTES; i++)
+        if (routes[i].used && !routes[i].mask) return routes[i].nif;
+    return NULL;
 }
 
 int route_del(uint32_t dst, uint32_t mask)
@@ -402,6 +412,8 @@ void net_init(void)
 
     virtio_net_probe();
     e1000_probe();
+    rtl8169_probe();
+    rtl8139_probe();
 
     char mode[16] = "dhcp";
     cmdline_get("kestrel.net", mode, sizeof mode);

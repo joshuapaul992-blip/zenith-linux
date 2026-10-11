@@ -70,10 +70,9 @@ void pmm_init(uintptr_t mbi)
             _kernel_start, _kernel_end);
 }
 
-uint64_t pmm_alloc_contig(size_t n)
+static uint64_t alloc_run(size_t n, uint64_t limit)
 {
     uint64_t flags = irq_save();
-    uint64_t limit = highest / PAGE_SIZE;
     for (int pass = 0; pass < 2; pass++) {
         uint64_t run = 0, start = pass ? 0x100 : search_hint;
         for (uint64_t f = start; f < limit; f++) {
@@ -93,7 +92,15 @@ uint64_t pmm_alloc_contig(size_t n)
     return 0;
 }
 
-uint64_t pmm_alloc(void) { return pmm_alloc_contig(1); }
+uint64_t pmm_alloc_contig(size_t n) { return alloc_run(n, highest / PAGE_SIZE); }
+uint64_t pmm_alloc(void) { return alloc_run(1, highest / PAGE_SIZE); }
+
+/* Below 4 GiB, for devices that take 32-bit bus addresses (RTL8139). */
+uint64_t pmm_alloc_dma32(size_t n)
+{
+    uint64_t limit = highest / PAGE_SIZE, max = 0x100000000ull / PAGE_SIZE;
+    return alloc_run(n, limit < max ? limit : max);
+}
 
 void pmm_free_contig(uint64_t phys, size_t n)
 {

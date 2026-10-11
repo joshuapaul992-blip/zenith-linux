@@ -421,7 +421,10 @@ static void test_remote(const char *hostport)
     int fd = open("/proc/net/route", O_RDONLY);
     ssize_t n = fd >= 0 ? read(fd, rbuf, sizeof rbuf - 1) : -1;
     if (n > 0) rbuf[n] = 0;
-    CHECK(n > 0 && strstr(rbuf, "eth0\t00000000\t"), "/proc/net/route has a default route");
+    int dflt = 0;                                       /* a line "ethN<TAB>00000000<TAB>..." */
+    for (char *l = n > 0 ? rbuf : NULL; l && *l; l = strchr(l, '\n') ? strchr(l, '\n') + 1 : NULL)
+        if (!strncmp(l, "eth", 3) && strstr(l, "\t00000000\t") == strchr(l, '\t')) dflt = 1;
+    CHECK(dflt, "/proc/net/route has a default route");
     if (fd >= 0) close(fd);
     test_ping(host);
     double dt = bulk_echo(host, port, -1);
