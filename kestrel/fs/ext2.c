@@ -1194,7 +1194,9 @@ int ext2_mount(struct blkdev *dev, bool rdonly, struct mount **out)
         kprintf("ext2: %s: unsupported features %x\n", dev->name, fs->incompat & ~INCOMPAT_SUPPORTED);
         goto fail;
     }
-    fs->rdonly = rdonly || !dev->parent || !blk_disk_of(dev)->ops->write;
+    /* Whole disks are left alone (a partition is where a root belongs);
+     * RAM disks are the exception: the ISO's root lives on one. */
+    fs->rdonly = rdonly || (!dev->parent && dev->kind != BLK_DISK_RAM) || !blk_disk_of(dev)->ops->write;
     if (!fs->rdonly && (ro & ~RO_SUPPORTED)) {
         kprintf("ext2: %s: features %x need support we lack: mounted read-only\n", dev->name, ro & ~RO_SUPPORTED);
         fs->rdonly = true;

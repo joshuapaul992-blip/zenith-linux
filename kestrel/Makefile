@@ -100,6 +100,14 @@ QEMU_FLAGS ?= -m 256M -vga std -serial stdio -no-reboot
 #   make iso KERNEL_CMDLINE="ahci.selftest=rw ahci.verify=5"
 KERNEL_CMDLINE ?=
 
+# A distribution's root file system to build the root volume on, e.g.
+#   make usbimg iso ROOTFS_BASE=alpine-minirootfs-3.24.2-x86_64.tar.gz
+# Its files come first; Kestrel's programs, X server and desktop are added
+# where it has nothing (tools/mergeroot.py). The USB stick gets it as its
+# ext2 root partition, the ISO as a RAM disk.
+ROOTFS_BASE ?=
+ROOTDISK    := $(BUILD)/rootdisk.ext2
+
 .PHONY: FORCE xlibre icewm busybox xterm all iso floppy usbimg run-usb run run-uefi run-floppy run-pci debug check test test-pci test-nvbios test-nvidia fonts images clean distclean
 
 all: $(KERNEL)
@@ -142,13 +150,23 @@ $(BUILD)/cmdline.stamp: FORCE
 	@mkdir -p $(BUILD)
 	@echo '$(KERNEL_CMDLINE)' | cmp -s - $@ || echo '$(KERNEL_CMDLINE)' > $@
 
-$(ISO): $(KERNEL) boot/grub/grub.cfg $(BUILD)/cmdline.stamp $(BUILD)/kestrel.vol
+$(BUILD)/rootbase.stamp: FORCE
+	@mkdir -p $(BUILD)
+	@echo '$(abspath $(ROOTFS_BASE))' | cmp -s - $@ || echo '$(abspath $(ROOTFS_BASE))' > $@
+
+# With ROOTFS_BASE set, the ISO also carries the ext2 root (a third module
+# next to the kernel and the boot volume): it becomes a writable RAM disk
+# and "/", like a live CD.
+ISO_ROOT := $(if $(ROOTFS_BASE),$(ROOTDISK))
+$(ISO): $(KERNEL) boot/grub/grub.cfg $(BUILD)/cmdline.stamp $(BUILD)/kestrel.vol $(BUILD)/rootbase.stamp $(ISO_ROOT)
 	@test -n "$(GRUB_MKRESCUE)" || { echo "error: grub-mkrescue not found"; exit 1; }
 	@rm -rf $(BUILD)/isodir
 	@mkdir -p $(BUILD)/isodir/boot/grub
 	@cp $(KERNEL) $(BUILD)/isodir/boot/kernel.elf
 	@cp $(BUILD)/kestrel.vol $(BUILD)/isodir/boot/kestrel.vol
 	@sed 's|@KERNEL_CMDLINE@|$(KERNEL_CMDLINE)|' boot/grub/grub.cfg > $(BUILD)/isodir/boot/grub/grub.cfg
+	@if [ -n "$(ISO_ROOT)" ]; then cp $(ISO_ROOT) $(BUILD)/isodir/boot/root.ext2 && \
+	    sed -i '/module2 \/boot\/kestrel.vol/a\    module2 /boot/root.ext2 kestrel-root' $(BUILD)/isodir/boot/grub/grub.cfg; fi
 	@echo "  ISO     $@"
 	@$(GRUB_MKRESCUE) -o $@ $(BUILD)/isodir 2> $(BUILD)/grub-mkrescue.log || \
 	    { cat $(BUILD)/grub-mkrescue.log; exit 1; }
@@ -285,13 +303,14 @@ $(BUILD)/kestrel.vol: $(ROOTFS_STAGE).stamp tools/mkusbimg.py
 # label and makes it "/" (fs/rootfs.c); without mke2fs the stick has none
 # and "/" stays in memory. ROOTDISK_MB sets its size.
 MKE2FS      ?= $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null)
-ROOTDISK    := $(BUILD)/rootdisk.ext2
 ROOTDISK_MB ?= 96
 ROOTDISK_FLAGS ?=
-$(ROOTDISK): $(ROOTFS_STAGE).stamp
-	@echo "  EXT2    $@ ($(ROOTDISK_MB) MiB)"
+$(ROOTDISK): $(ROOTFS_STAGE).stamp $(BUILD)/rootbase.stamp $(ROOTFS_BASE) tools/mergeroot.py
+	@echo "  EXT2    $@ ($(ROOTDISK_MB) MiB$(if $(ROOTFS_BASE), on $(notdir $(ROOTFS_BASE))))"
 	@rm -rf $(BUILD)/rootdisk $@
-	@cp -a $(ROOTFS_STAGE) $(BUILD)/rootdisk
+	@if [ -n "$(ROOTFS_BASE)" ]; then mkdir -p $(BUILD)/rootdisk && tar -xpf $(ROOTFS_BASE) -C $(BUILD)/rootdisk && \
+	    $(PYTHON) tools/mergeroot.py $(ROOTFS_STAGE) $(BUILD)/rootdisk; \
+	else cp -a $(ROOTFS_STAGE) $(BUILD)/rootdisk; fi
 	@cd $(BUILD)/rootdisk && mkdir -p boot dev etc home/user mnt proc root sys tmp usr/bin var/log var/tmp && \
 	    chmod 1777 tmp var/tmp && chmod 700 root && chown 1000:1000 home/user 2>/dev/null || true
 	@$(MKE2FS) -q -F -t ext2 -O ^dir_index -L kestrel-root -E root_owner=0:0 $(ROOTDISK_FLAGS) -d $(BUILD)/rootdisk $@ $(ROOTDISK_MB)M

@@ -901,7 +901,17 @@ How it works:
 - `fstest -r` writes files, restarts the machine, and checks them after the reboot.
 - After each run, `e2fsck -fn` on the image finds no errors. This holds with 4 KiB blocks and 256-byte inodes, and with 1 KiB blocks and 128-byte inodes.
 
-**Alpine Linux as the root.** Alpine's own minirootfs (3.24.2, from the official `alpinelinux/docker-alpine` repository) runs unmodified on Kestrel. Put it on an ext2 partition, label it, and boot with `kestrel.rootfs=LABEL=<label>`:
+**Alpine Linux as the root.** Alpine's own minirootfs (3.24.2, from the official `alpinelinux/docker-alpine` repository) runs unmodified on Kestrel. The images can be built on it:
+
+```sh
+make usbimg iso ROOTFS_BASE=alpine-minirootfs-3.24.2-x86_64.tar.gz
+```
+
+- The root volume starts as Alpine's tree; `tools/mergeroot.py` then adds every Kestrel file it lacks (the test programs, the X server, IceWM, xterm, their data), leaving Alpine's C library, loader, BusyBox and `/etc` as they are. The desktop and the text console work as on the plain images.
+- The USB stick gets it as its ext2 root partition.
+- The ISO carries it as a third GRUB module, which becomes a writable RAM disk and `/`, like a live CD: changes last until power-off.
+
+Alpine on another disk works too: put it on an ext2 partition, label it, and boot with `kestrel.rootfs=LABEL=<label>`.
 - Alpine's `/bin/sh`, BusyBox and musl dynamic loader start, and its tools (`ps`, `df`, `free`, `ping`, `wget`, `sha256sum`, ...) work.
 - `apk` 3.0.8 works on the installed system: `info`, `list`, `policy`, `stats`, `audit`, and `del`, which locks the database with `flock`, rewrites it and removes files; `e2fsck -fn` finds the volume clean afterwards.
 - `apk add` and `apk update` need Alpine's package servers, which the test environment cannot reach, so installing packages from the network has not been tried.
