@@ -24,6 +24,7 @@
 #include <kernel/storage.h>
 #include <kernel/uvm.h>
 #include <kernel/socket.h>
+#include <kernel/inet.h>
 #include <kernel/uaccess.h>
 #include <kernel/termios.h>
 #include <kernel/kfb.h>
@@ -368,6 +369,38 @@ static const struct { uint32_t req; uint16_t size; uint8_t dir; } ioctl_args[] =
     { KINPUT_GRAB, 4, IOC_IN },
 };
 
+/* SIOC* requests: struct ifreq / rtentry in and out; SIOCGIFCONF fills the
+ * caller's array through a kernel copy. */
+int net_ifconf(void *kbuf, int len);
+static int64_t net_user_ioctl(unsigned long req, uint64_t arg)
+{
+    if (req == 0x8912) {                                       /* SIOCGIFCONF */
+        struct { int32_t len, pad; uint64_t buf; } ifc;
+        if (copy_from_user(&ifc, (const void *)arg, sizeof ifc)) return -EFAULT;
+        if (ifc.len < 0) return -EINVAL;
+        int n;
+        if (!ifc.buf) n = net_ifconf(NULL, 0);
+        else {
+            int cap = ifc.len < 64 * 40 ? ifc.len : 64 * 40;
+            void *kb = kzalloc((size_t)cap + 1);
+            if (!kb) return -ENOMEM;
+            n = net_ifconf(kb, cap);
+            if (n && copy_to_user((void *)ifc.buf, kb, (size_t)n)) n = -EFAULT;
+            kfree(kb);
+            if (n < 0) return n;
+        }
+        ifc.len = n;
+        return copy_to_user((void *)arg, &ifc, sizeof ifc) ? -EFAULT : 0;
+    }
+    uint8_t kb[128];
+    size_t sz = net_ioctl_size(req, NULL);
+    memset(kb, 0, sizeof kb);
+    if (copy_from_user(kb, (const void *)arg, sz)) return -EFAULT;
+    int r = net_ioctl(req, kb);
+    if (r >= 0 && copy_to_user((void *)arg, kb, sz)) return -EFAULT;
+    return r;
+}
+
 static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
@@ -377,7 +410,9 @@ static int64_t sys_ioctl(uint64_t fd, uint64_t req, uint64_t arg, uint64_t a4, u
     for (size_t i = 0; i < sizeof ioctl_args / sizeof *ioctl_args; i++)
         if (ioctl_args[i].req == (uint32_t)req) { size = ioctl_args[i].size; dir = ioctl_args[i].dir; break; }
     int64_t r;
-    if (size < 0) {
+    if (net_ioctl_is((unsigned long)req) && (inet_is(f) || usock_is(f))) {
+        r = net_user_ioctl((unsigned long)req, arg);           /* interfaces and routes: any socket */
+    } else if (size < 0) {
         r = vfs_ioctl(f, (unsigned long)req, (void *)arg);       /* a value, or unknown */
     } else {
         uint64_t kb[64];                                        /* 512 bytes, 8-aligned */
@@ -1676,13 +1711,13 @@ static int64_t sys_getrandom(uint64_t buf, uint64_t len, uint64_t flags, uint64_
     return (int64_t)len;
 }
 
-/* ---- AF_UNIX sockets (fs/unixsock.c) ------------------------------------ */
+/* ---- sockets: AF_UNIX (fs/unixsock.c) and AF_INET (net/socket.c) ---------- */
 /* The socket behind fd, with a reference (fput it). */
 static int64_t sock_get(int fd, struct file **out)
 {
     struct file *f = fget(fd);
     if (!f) return -EBADF;
-    if (!usock_is(f)) { fput(f); return -ENOTSOCK; }
+    if (!usock_is(f) && !inet_is(f)) { fput(f); return -ENOTSOCK; }
     *out = f;
     return 0;
 }
@@ -1709,7 +1744,7 @@ static int64_t sys_socket(uint64_t dom, uint64_t type, uint64_t proto, uint64_t 
 {
     (void)a4; (void)a5; (void)a6;
     struct file *f;
-    int rc = usock_create((int)dom, (int)type, (int)proto, &f);
+    int rc = dom == AF_INET ? inet_create((int)type, (int)proto, &f) : usock_create((int)dom, (int)type, (int)proto, &f);
     return rc ? rc : install(f, type & SOCK_CLOEXEC);
 }
 
@@ -1733,7 +1768,7 @@ static int64_t sys_bind(uint64_t fd, uint64_t addr, uint64_t len, uint64_t a4, u
     if (rc) return rc;
     struct file *f;
     if ((rc = sock_get((int)fd, &f))) return rc;
-    rc = usock_bind(f, &a, (uint32_t)len);
+    rc = inet_is(f) ? inet_bind(f, &a, (uint32_t)len) : usock_bind(f, &a, (uint32_t)len);
     fput(f);
     return rc;
 }
@@ -1743,7 +1778,7 @@ static int64_t sys_listen(uint64_t fd, uint64_t backlog, uint64_t a3, uint64_t a
     (void)a3; (void)a4; (void)a5; (void)a6;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
-    rc = usock_listen(f, (int)backlog);
+    rc = inet_is(f) ? inet_listen(f, (int)backlog) : usock_listen(f, (int)backlog);
     fput(f);
     return rc;
 }
@@ -1756,7 +1791,7 @@ static int64_t sys_connect(uint64_t fd, uint64_t addr, uint64_t len, uint64_t a4
     if (rc) return rc;
     struct file *f;
     if ((rc = sock_get((int)fd, &f))) return rc;
-    rc = usock_connect(f, &a, (uint32_t)len);
+    rc = inet_is(f) ? inet_connect(f, &a, (uint32_t)len) : usock_connect(f, &a, (uint32_t)len);
     fput(f);
     return rc;
 }
@@ -1770,7 +1805,12 @@ static int64_t sys_accept4(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t f
     struct file *nf;
     struct sockaddr_un a;
     uint32_t got = sizeof a;
-    rc = usock_accept(f, (int)flags, &nf, &a, &got);
+    if (inet_is(f)) {
+        struct sockaddr_in sin;
+        rc = inet_accept(f, (int)flags, &nf, &sin);
+        memcpy(&a, &sin, sizeof sin);
+        got = sizeof sin;
+    } else rc = usock_accept(f, (int)flags, &nf, &a, &got);
     fput(f);
     if (rc) return rc;
     if (addr && (rc = put_sockaddr(addr, lenp, &a, got))) { vfs_close(nf); return rc; }
@@ -1809,13 +1849,52 @@ static int64_t sock_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags,
     return total;
 }
 
+/* AF_INET data through a bounce buffer. A datagram goes whole (up to 64 KiB);
+ * a blocking stream send queues everything, chunk by chunk; a receive
+ * returns what one call gets. */
+static int64_t inet_xfer(struct file *f, uint64_t ubuf, uint64_t len, int flags, bool send,
+                         const struct sockaddr_un *to, uint32_t tolen, struct sockaddr_in *from, int *mflags)
+{
+    bool stream = inet_type(f) == SOCK_STREAM;
+    if (len && !ubuf_ok(ubuf, len)) return -EFAULT;
+    if (!stream && send && len > 65535) return -EMSGSIZE;
+    size_t chunk = !stream ? (size_t)(len ? len : 1) : len < IO_CHUNK ? (size_t)(len ? len : 1) : IO_CHUNK;
+    if (!stream && !send) chunk = len < 65536 ? (size_t)(len ? len : 1) : 65536;
+    uint8_t *kb = kmalloc(chunk);
+    if (!kb) return -ENOMEM;
+    int64_t total = 0;
+    do {
+        size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
+        long n;
+        if (send) {
+            if (want && copy_from_user(kb, (const void *)(ubuf + (uint64_t)total), want)) { if (!total) total = -EFAULT; break; }
+            n = inet_sendto(f, kb, want, flags, to, tolen);
+        } else {
+            n = inet_recvfrom(f, kb, want, flags, from, mflags);
+            size_t got = n > 0 ? ((size_t)n < want ? (size_t)n : want) : 0;
+            if (got && copy_to_user((void *)(ubuf + (uint64_t)total), kb, got)) { if (!total) total = -EFAULT; break; }
+        }
+        if (n < 0) { if (!total) total = n; break; }
+        total += n;
+        if (!send || !stream || (size_t)n < want) break;
+    } while ((uint64_t)total < len);
+    kfree(kb);
+    return total;
+}
+
 static int64_t sys_sendto(uint64_t fd, uint64_t buf, uint64_t len, uint64_t flags, uint64_t addr, uint64_t alen)
 {
-    (void)alen;
     if ((int64_t)len < 0) return -EINVAL;
-    if (addr) return -EISCONN;                          /* stream sockets only */
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
+    if (inet_is(f)) {
+        struct sockaddr_un a;
+        if (addr && (rc = get_sockaddr(addr, alen, &a))) { fput(f); return rc; }
+        rc = inet_xfer(f, buf, len, (int)flags, true, addr ? &a : NULL, addr ? (uint32_t)alen : 0, NULL, NULL);
+        fput(f);
+        return rc;
+    }
+    if (addr) { fput(f); return -EISCONN; }             /* AF_UNIX: stream sockets only */
     rc = sock_xfer(f, buf, len, (int)flags, true);
     fput(f);
     return rc;
@@ -1826,6 +1905,13 @@ static int64_t sys_recvfrom(uint64_t fd, uint64_t buf, uint64_t len, uint64_t fl
     if ((int64_t)len < 0) return -EINVAL;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
+    if (inet_is(f)) {
+        struct sockaddr_in from;
+        rc = inet_xfer(f, buf, len, (int)flags, false, NULL, 0, &from, NULL);
+        fput(f);
+        if (rc >= 0 && addr && alenp && (int64_t)put_sockaddr(addr, alenp, (const struct sockaddr_un *)&from, sizeof from)) return -EFAULT;
+        return rc;
+    }
     rc = sock_xfer(f, buf, len, (int)flags, false);
     fput(f);
     if (rc >= 0 && addr && alenp && put_user_u32((void *)alenp, 0)) return -EFAULT;
@@ -1899,6 +1985,63 @@ static int64_t take_rights(const uint8_t *ctl, uint64_t len, struct file **files
     return 0;
 }
 
+/* sendmsg/recvmsg on AF_INET: gather the iovecs into one buffer (a datagram
+ * is one unit), no control messages. */
+static int64_t inet_msg_io(struct file *f, struct msghdr_k *m, uint64_t umsg, uint64_t flags, bool send)
+{
+    struct iovec *v = m->iovlen ? kmalloc(m->iovlen * sizeof *v) : NULL;
+    uint8_t *kb = NULL;
+    int64_t total = 0;
+    uint64_t len = 0;
+    if (m->iovlen && !v) return -ENOMEM;
+    if (copy_from_user(v, (const void *)m->iov, m->iovlen * sizeof *v)) { total = -EFAULT; goto out; }
+    for (uint64_t i = 0; i < m->iovlen; i++) {
+        if ((int64_t)v[i].len < 0 || len + v[i].len < len || len + v[i].len > 0x7ffff000) { total = -EINVAL; goto out; }
+        if (v[i].len && !ubuf_ok(v[i].base, v[i].len)) { total = -EFAULT; goto out; }
+        len += v[i].len;
+    }
+    bool stream = inet_type(f) == SOCK_STREAM;
+    if (!stream && send && len > 65535) { total = -EMSGSIZE; goto out; }
+    struct msg_cursor cur = { v, m->iovlen, 0, 0 };
+    size_t chunk = len < IO_CHUNK ? (size_t)len : IO_CHUNK;
+    if (!stream && !send) chunk = 65536;
+    if (!(kb = kmalloc(chunk ? chunk : 1))) { total = -ENOMEM; goto out; }
+    if (send) {
+        struct sockaddr_un to;
+        if (m->name && m->namelen) {
+            if ((total = get_sockaddr(m->name, m->namelen, &to))) goto out;
+        }
+        do {
+            size_t want = len - (uint64_t)total < chunk ? (size_t)(len - (uint64_t)total) : chunk;
+            if (iov_xfer(&cur, kb, want, false)) { if (!total) total = -EFAULT; break; }
+            long n = inet_sendto(f, kb, want, (int)flags, m->name && m->namelen ? &to : NULL, m->namelen);
+            if (n < 0) { if (!total) total = n; break; }
+            total += n;
+            if ((size_t)n < want || !stream) break;
+        } while ((uint64_t)total < len);
+    } else {
+        struct sockaddr_in from;
+        int mflags = 0;
+        long n = inet_recvfrom(f, kb, chunk < len ? chunk : (size_t)len, (int)flags, &from, &mflags);
+        if (n < 0) { total = n; goto out; }
+        size_t got = (size_t)n < len ? (size_t)n : (size_t)len;
+        if (iov_xfer(&cur, kb, got, true)) { total = -EFAULT; goto out; }
+        total = n;
+        if (m->name) {
+            uint32_t nl = m->namelen < sizeof from ? m->namelen : (uint32_t)sizeof from;
+            if (nl && copy_to_user((void *)m->name, &from, nl)) { total = -EFAULT; goto out; }
+            m->namelen = sizeof from;
+        }
+        m->controllen = 0;
+        m->flags = mflags;
+        if (copy_to_user((void *)umsg, m, sizeof *m)) total = -EFAULT;
+    }
+out:
+    kfree(kb);
+    kfree(v);
+    return total;
+}
+
 static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
 {
     struct msghdr_k m;
@@ -1907,6 +2050,7 @@ static int64_t msg_io(uint64_t fd, uint64_t umsg, uint64_t flags, bool send)
     if (m.controllen > MAX_CONTROL) { if (send) return -ENOBUFS; m.controllen = MAX_CONTROL; }
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
+    if (inet_is(f)) { rc = inet_msg_io(f, &m, umsg, flags, send); fput(f); return rc; }
     struct iovec *v = m.iovlen ? kmalloc(m.iovlen * sizeof *v) : NULL;
     uint8_t *ctl = m.controllen ? kmalloc(m.controllen) : NULL;
     uint8_t *kb = NULL;
@@ -1998,7 +2142,7 @@ static int64_t sys_shutdown(uint64_t fd, uint64_t how, uint64_t a3, uint64_t a4,
     if (how > SHUT_RDWR) return -EINVAL;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
-    rc = usock_shutdown(f, (int)how);
+    rc = inet_is(f) ? inet_shutdown(f, (int)how) : usock_shutdown(f, (int)how);
     fput(f);
     return rc;
 }
@@ -2009,7 +2153,12 @@ static int64_t sock_name(uint64_t fd, uint64_t addr, uint64_t lenp, bool peer)
     if (rc) return rc;
     struct sockaddr_un tmp;
     uint32_t got = sizeof tmp;
-    rc = usock_name(f, peer, &tmp, &got);
+    if (inet_is(f)) {
+        struct sockaddr_in sin;
+        rc = inet_name(f, peer, &sin);
+        memcpy(&tmp, &sin, sizeof sin);
+        got = sizeof sin;
+    } else rc = usock_name(f, peer, &tmp, &got);
     fput(f);
     return rc ? rc : put_sockaddr(addr, lenp, &tmp, got);
 }
@@ -2020,15 +2169,21 @@ static int64_t sys_getsockname(uint64_t fd, uint64_t addr, uint64_t lenp, uint64
 static int64_t sys_getpeername(uint64_t fd, uint64_t addr, uint64_t lenp, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a4; (void)a5; (void)a6; return sock_name(fd, addr, lenp, true); }
 
-/* Options are accepted and ignored (SO_REUSEADDR, buffer sizes, ...). */
+/* AF_INET options are real (net/socket.c); AF_UNIX ones are accepted and ignored. */
 static int64_t sys_setsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_t val, uint64_t len, uint64_t a6)
 {
-    (void)level; (void)opt; (void)val; (void)a6;
+    (void)a6;
     if ((int32_t)len < 0) return -EINVAL;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
+    if (inet_is(f)) {
+        uint8_t kv[64];
+        uint32_t kl = len < sizeof kv ? (uint32_t)len : (uint32_t)sizeof kv;
+        if (kl && copy_from_user(kv, (const void *)val, kl)) rc = -EFAULT;
+        else rc = inet_setsockopt(f, (int)level, (int)opt, kv, kl);
+    }
     fput(f);
-    return 0;
+    return rc;
 }
 
 static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_t val, uint64_t lenp, uint64_t a6)
@@ -2042,7 +2197,7 @@ static int64_t sys_getsockopt(uint64_t fd, uint64_t level, uint64_t opt, uint64_
     uint32_t klen = len < sizeof kv ? len : sizeof kv;
     struct file *f; int64_t rc = sock_get((int)fd, &f);
     if (rc) return rc;
-    rc = usock_getsockopt(f, (int)level, (int)opt, kv, &klen);
+    rc = inet_is(f) ? inet_getsockopt(f, (int)level, (int)opt, kv, &klen) : usock_getsockopt(f, (int)level, (int)opt, kv, &klen);
     fput(f);
     if (rc) return rc;
     if (copy_to_user((void *)val, kv, klen)) return -EFAULT;

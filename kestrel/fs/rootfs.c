@@ -129,6 +129,8 @@ int rootfs_mount(void)
     if (!(m->flags & MNT_RDONLY)) {
         if (vfs_lookup("/etc", &vn) < 0) vfs_mkdir("/etc", 0755);
         for (size_t i = 0; i < sizeof etc / sizeof *etc; i++) seed(etc[i], saved[i]);
+        if (vfs_symlink_at("/proc/net/pnp", NULL, "/etc/resolv.conf") == 0)    /* fails with EEXIST if present */
+            kprintf("rootfs: /etc/resolv.conf -> /proc/net/pnp written (the volume had none)\n");
         if (vfs_lookup("/root", &vn) < 0) vfs_mkdir("/root", 0700);
     }
     for (size_t i = 0; i < sizeof etc / sizeof *etc; i++) kfree(saved[i]);

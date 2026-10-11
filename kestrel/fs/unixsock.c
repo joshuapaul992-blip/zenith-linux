@@ -149,8 +149,10 @@ static struct file *file_for(struct usock *s, int flags)
 int usock_create(int domain, int type, int protocol, struct file **out)
 {
     if (domain != AF_UNIX) return -EAFNOSUPPORT;
-    /* connection-oriented only: unconnected datagrams need addressing */
-    if ((type & 0xf) != SOCK_STREAM && (type & 0xf) != SOCK_SEQPACKET) return -EPROTONOSUPPORT;
+    /* Connection-oriented, plus SOCK_DGRAM so that the socket exists (musl's
+     * if_nametoindex() wants one for its ioctl); unconnected datagrams
+     * still have no addressing. */
+    if ((type & 0xf) != SOCK_STREAM && (type & 0xf) != SOCK_SEQPACKET && (type & 0xf) != SOCK_DGRAM) return -EPROTONOSUPPORT;
     if (protocol != 0) return -EPROTONOSUPPORT;
     struct usock *s = usock_new(type & 0xf);
     if (!s) return -ENOMEM;

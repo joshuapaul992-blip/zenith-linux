@@ -13,6 +13,7 @@
  * for a preempted thread, is inside the timer interrupt handler. When the
  * handler returns, iretq restores the thread's full user/kernel state. */
 #include <kernel/task.h>
+#include <kernel/net.h>
 #include <kernel/arch.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
@@ -426,6 +427,7 @@ void sched_tick(void)
             signal_send(&tasks[i], SIGALRM);
         }
     }
+    net_tick();                                 /* received frames or a due timer wake netd */
     sched_tick_local();
 }
 

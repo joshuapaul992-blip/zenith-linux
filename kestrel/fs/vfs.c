@@ -1052,6 +1052,7 @@ void vfs_init(void)
         "export PS1\n"
         "cd \"$HOME\" 2>/dev/null\n"
         "echo \"$(uname -sr) on $(tty). Ctrl+Alt+F1..F12: other monitors; startx: the desktop.\"\n");
+    vfs_symlink_at("/proc/net/pnp", NULL, "/etc/resolv.conf");    /* name servers from DHCP or kestrel.ip */
     ramfs_write_file("/etc/motd",
         "Welcome to Kestrel -- a freestanding x86_64 POSIX-style kernel.\n"
         "Everything above was read through open/read/getdents64 system calls.\n");

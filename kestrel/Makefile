@@ -85,6 +85,8 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kerne
            proc/task.c proc/exec.c proc/process.c \
            fs/vfs.c fs/devfs.c fs/procfs.c fs/sysfs.c \
            ui/bootmgr.c \
+           net/core.c net/arp.c net/ipv4.c net/udp.c net/tcp.c net/socket.c net/dhcp.c net/proc.c \
+           drivers/net/virtio_net.c drivers/net/e1000.c \
            lib/string.c lib/printf.c
 
 OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC))
@@ -194,7 +196,7 @@ USER_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -ffreestanding -fPIE -fno-stack-p
 # stock x86_64 musl works unchanged); static-PIE, self-relocating via rcrt1.
 MUSL_CC     ?= musl-gcc
 MUSL_CFLAGS := -std=gnu11 -O2 -g -Wall -Wextra -fPIE -static-pie
-MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest
+MUSL_PROGS  := libctest socktest proctest ptytest faulttest vmtest threadtest eventtest smptest fstest nettest
 USER_PROGS  := $(BUILD)/user/hello $(if $(shell command -v $(MUSL_CC)),$(addprefix $(BUILD)/user/,$(MUSL_PROGS)))
 
 $(addprefix $(BUILD)/user/,$(MUSL_PROGS)): $(BUILD)/user/%: user/%.c

@@ -31,6 +31,7 @@
 #include <kernel/usyscall.h>
 #include <kernel/bootmgr.h>
 #include <kernel/bootinfo.h>
+#include <kernel/net.h>
 #include <kernel/string.h>
 #include "pci.h"
 #include <kernel/storage.h>
@@ -484,6 +485,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     bootvol_mount_root();
     /* An ext2 volume labelled "kestrel-root" (any disk) becomes "/". */
     rootfs_mount();
+    /* Network cards, the IPv4 stack and its thread; DHCP runs in the background. */
+    net_init();
 
     /* No serial port on many machines: write REPORT.TXT (and the video BIOS)
      * to the stick's "KESTREL RPT" volume, if there is one. */
