@@ -174,6 +174,8 @@ void        sched_yield(void);
 void        task_set_idle_class(struct tcb *t);  /* background work (kworker/0) */
 void        sched_tick(void);           /* boot CPU timer: sleepers, alarms, slice */
 void        sched_tick_local(void);     /* other CPUs' timers: slice only          */
+bool        sched_tick_fast(bool from_user);    /* the same without the kernel lock, if
+                                                   nothing needs it (false: take it) */
 void        sched_idle_loop(void) __attribute__((noreturn));
 
 /* A sleeping, recursive mutex: the owner may lock it again (a page fault

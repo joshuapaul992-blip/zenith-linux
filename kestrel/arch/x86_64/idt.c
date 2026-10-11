@@ -299,6 +299,11 @@ static bool lockless(struct int_frame *f)
         tlb_service();
         lapic_eoi();
         return true;
+    case VEC_LAPIC_TIMER:                               /* other CPUs: accounting, the slice */
+        if (this_cpu()->id == 0 || !sched_tick_fast((f->cs & 3) == 3)) return false;
+        lapic_eoi();
+        this_cpu()->ticks++;
+        return true;
     case VEC_RESCHED:                                   /* the idle loop looks after the hlt */
         lapic_eoi();
         return true;

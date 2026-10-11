@@ -171,6 +171,7 @@ void smp_kick_idle(void)
     if (ncpus == 1) return;
     uint64_t f = irq_save();
     struct percpu *me = this_cpu();
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);            /* the task made ready before in_idle is read */
     for (int i = 0; i < MAX_CPUS; i++) {
         struct percpu *c = &cpus[i];
         if (c != me && c->online && __atomic_load_n(&c->in_idle, __ATOMIC_ACQUIRE)) {

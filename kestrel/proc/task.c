@@ -406,12 +406,35 @@ void sched_tick_local(void)
 {
     if (!running) return;
     cur->cpu_ticks++;
-    if (cur->pid == 0) ticks_idle++;
-    else if (cur->user) ticks_user++;
-    else ticks_system++;
+    if (cur->pid == 0) __atomic_add_fetch(&ticks_idle, 1, __ATOMIC_RELAXED);
+    else if (cur->user) __atomic_add_fetch(&ticks_user, 1, __ATOMIC_RELAXED);
+    else __atomic_add_fetch(&ticks_system, 1, __ATOMIC_RELAXED);
     if (cur->pid == 0) { if (need_resched) schedule(); return; }
     if (cur->idle_class && preempt && normal_ready()) { schedule(); return; }   /* yield at once */
     if (preempt && (--cur->quantum <= 0 || need_resched)) schedule();
+}
+
+/* Every other CPU's tick, without the kernel lock (idt.c): the same
+ * accounting and slice countdown as sched_tick_local(). False when the tick
+ * has more to do -- switch tasks, or deliver a signal to the interrupted
+ * user code -- before anything is counted; the caller then takes the lock
+ * and runs sched_tick_local(). Most ticks end here, so a CPU running user
+ * code or halted no longer queues for the lock a thousand times a second. */
+bool sched_tick_fast(bool from_user)
+{
+    if (!running) return true;
+    struct tcb *t = cur;
+    if (need_resched) return false;
+    if (t->pid != 0) {
+        if (from_user && signal_pending()) return false;
+        if (preempt && (t->quantum <= 1 || (t->idle_class && normal_ready()))) return false;
+    }
+    t->cpu_ticks++;
+    if (t->pid == 0) __atomic_add_fetch(&ticks_idle, 1, __ATOMIC_RELAXED);
+    else if (t->user) __atomic_add_fetch(&ticks_user, 1, __ATOMIC_RELAXED);
+    else __atomic_add_fetch(&ticks_system, 1, __ATOMIC_RELAXED);
+    if (t->pid != 0 && preempt) t->quantum--;
+    return true;
 }
 
 /* The boot CPU's tick: timed sleeps and interval timers, then its slice. */
@@ -630,23 +653,36 @@ int task_wait(int pid)
     return code;
 }
 
+static bool any_ready(void)
+{
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (__atomic_load_n(&tasks[i].state, __ATOMIC_RELAXED) == TASK_READY) return true;
+    return false;
+}
+
 /* A CPU's idle thread. Entered holding the big kernel lock; it lets go of
- * it while halted, so the other CPUs can run kernel code meanwhile. */
+ * it while halted, so the other CPUs can run kernel code meanwhile, and
+ * takes it back only when there is a task to run: waking for a timer tick
+ * with nothing to do costs no trip through the lock. */
 void sched_idle_loop(void)
 {
     struct percpu *c = this_cpu();
     for (;;) {
         cli();
         reap_zombies();
-        bool ready = false;
-        for (int i = 1; i < MAX_TASKS; i++) if (tasks[i].state == TASK_READY) { ready = true; break; }
-        if (ready) { schedule(); continue; }
-        __atomic_store_n(&c->in_idle, true, __ATOMIC_RELEASE);
+        if (any_ready()) { schedule(); continue; }
         bkl_exit();
-        c->ks.idle_tsc = rdtsc();
-        __asm__ volatile("sti; hlt" ::: "memory");   /* atomic: no lost wakeup */
-        cli();
-        if (c->ks.idle_tsc) { c->ks.idle_cyc += rdtsc() - c->ks.idle_tsc; c->ks.idle_tsc = 0; }
+        for (;;) {
+            /* in_idle before the look at the task table, make_ready() the
+             * other way round (smp_kick_idle): one of us sees the other */
+            __atomic_store_n(&c->in_idle, true, __ATOMIC_SEQ_CST);
+            __atomic_thread_fence(__ATOMIC_SEQ_CST);
+            if (any_ready()) break;
+            c->ks.idle_tsc = rdtsc();
+            __asm__ volatile("sti; hlt" ::: "memory");   /* atomic: no lost wakeup */
+            cli();
+            if (c->ks.idle_tsc) { c->ks.idle_cyc += rdtsc() - c->ks.idle_tsc; c->ks.idle_tsc = 0; }
+        }
         __atomic_store_n(&c->in_idle, false, __ATOMIC_RELEASE);
         bkl_enter();
     }
