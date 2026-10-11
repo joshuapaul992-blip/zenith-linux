@@ -581,6 +581,8 @@ void vfs_sync_all(bool final)
 /*  open file objects                                                        */
 /* ======================================================================= */
 
+static int open_node(struct vnode *vn, int flags, bool created, struct file **out);
+
 int vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, struct file **out)
 {
     struct vnode *vn;
@@ -602,7 +604,18 @@ int vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, st
     } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
         return -EEXIST;
     }
+    return open_node(vn, flags, created, out);
+}
 
+/* Open a node already found (/proc/self/fd/N): as open() would, minus creation. */
+int vfs_open_vnode(struct vnode *vn, int flags, struct file **out)
+{
+    return open_node(vn, flags & ~(O_CREAT | O_EXCL), false, out);
+}
+
+static int open_node(struct vnode *vn, int flags, bool created, struct file **out)
+{
+    int r;
     int acc = flags & O_ACCMODE;
     if (vn->type == VLNK && !(flags & O_PATH)) return -ELOOP;  /* O_NOFOLLOW on a link */
     if (vn->type == VSOCK && !(flags & O_PATH)) return -ENXIO;  /* sockets are connect()ed, not opened */
@@ -819,6 +832,7 @@ void vfs_close(struct file *f)
     if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
     if (f->ep_links) epoll_file_closing(f);            /* leaves every epoll set */
     flock_drop(f);
+    vfs_locks_file_gone(f);
     struct vnode *vn = f->vn;
     if (vn && (vn->type == VREG || vn->type == VDIR))
         inotify_self(vn, (f->flags & O_ACCMODE) != O_RDONLY ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE);

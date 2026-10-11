@@ -114,6 +114,7 @@ void signal_deliver(struct int_frame *f, uint64_t nr, bool syscall);
 int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid, uint64_t tls);
 int64_t proc_execve(uint64_t path, uint64_t argv, uint64_t envp);
 int64_t proc_wait4(int64_t pid, uint64_t status, uint64_t options, uint64_t rusage);
+int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options);
 int64_t proc_setsid(void);
 int64_t proc_setpgid(int64_t pid, int64_t pgid);
 int64_t proc_getpgid(int64_t pid);

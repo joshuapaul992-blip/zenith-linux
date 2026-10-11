@@ -163,6 +163,7 @@ int           vfs_bind(const char *src, const char *dst);     /* show src's cont
 int     vfs_lookup(const char *path, struct vnode **out);
 int     vfs_lookup_at(struct vnode *base, const char *path, bool follow, struct vnode **out);
 int     vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, struct file **out);
+int     vfs_open_vnode(struct vnode *vn, int flags, struct file **out);
 int     vfs_mkdir_at(struct vnode *base, const char *path, mode_t mode);
 int     vfs_unlink_at(struct vnode *base, const char *path);
 int     vfs_rmdir_at(struct vnode *base, const char *path);
@@ -212,6 +213,11 @@ struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
 void    vfs_close(struct file *f);                  /* drops one reference */
 int     vfs_flock(struct file *f, int op);          /* flock(2) LOCK_SH/EX/UN, LOCK_NB */
+/* fcntl byte-range locks (fs/lockf.c); kfl is a kernel copy of struct flock */
+int     vfs_lock_get(struct file *f, void *kfl, bool ofd);
+int     vfs_lock_set(struct file *f, void *kfl, bool ofd, bool wait);
+void    vfs_locks_fd_closed(struct file *f);        /* the process closes a descriptor of f */
+void    vfs_locks_file_gone(struct file *f);        /* the open file's last reference */
 struct file *vfs_file_get(struct file *f);         /* takes one (atomic), returns f */
 int     vfs_truncate(struct vnode *vn, uint64_t size);
 struct vm_object *vfs_vmobject(struct vnode *vn);  /* see vnode_ops.vmobject */

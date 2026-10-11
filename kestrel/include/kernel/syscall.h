@@ -207,8 +207,13 @@ struct int_frame;
 #define SYS_munlock      150
 #define SYS_mlockall     151
 #define SYS_munlockall   152
+#define SYS_capget       125
+#define SYS_capset       126
+#define SYS_quotactl     179
+#define SYS_readahead    187
 #define SYS_time         201
 #define SYS_fadvise64    221
+#define SYS_waitid       247
 #define SYS_ioprio_set   251
 #define SYS_ioprio_get   252
 #define SYS_fallocate    285

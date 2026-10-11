@@ -245,11 +245,40 @@ static int at_dir(int64_t dirfd, const char *p, struct vnode **base, struct file
     { int r_ = get_path(upath, p); if (r_) return r_;                       \
       if ((r_ = at_dir(dirfd, p, &base, &hold))) return r_; }
 
+/* /proc/self/fd/N, /proc/<own pid>/fd/N, /dev/fd/N: the descriptor's file.
+ * Returns the fd number, or -1 if p names no such link. */
+static int fd_link_of(const char *p)
+{
+    const char *q;
+    if (!strncmp(p, "/proc/self/fd/", 14)) q = p + 14;
+    else if (!strncmp(p, "/dev/fd/", 8)) q = p + 8;
+    else if (!strncmp(p, "/proc/", 6) && p[6] >= '0' && p[6] <= '9') {
+        int pid = 0;
+        for (q = p + 6; *q >= '0' && *q <= '9' && pid < 1000000; q++) pid = pid * 10 + (*q - '0');
+        if (strncmp(q, "/fd/", 4) || pid != current_task()->tgid) return -1;
+        q += 4;
+    } else return -1;
+    int fd = 0;
+    if (!*q) return -1;
+    for (; *q >= '0' && *q <= '9' && fd < MAX_FDS; q++) fd = fd * 10 + (*q - '0');
+    return *q ? -1 : fd;
+}
+
 static int64_t sys_openat(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t mode, uint64_t a5, uint64_t a6)
 {
     (void)a5; (void)a6;
     AT_PATH(dirfd, path);
     struct file *f;
+    int fdl = fd_link_of(p);
+    if (fdl >= 0) {             /* a new open file on the same file, with these flags (memfd read-only dups) */
+        fput(hold);
+        struct file *of = fget(fdl);
+        if (!of) return -ENOENT;
+        int r = of->vn->type == VREG || of->vn->type == VDIR ? vfs_open_vnode(of->vn, (int)flags, &f) : -ENXIO;
+        fput(of);
+        if (r < 0) return r;
+        return install(f, (flags & O_CLOEXEC) != 0);
+    }
     int r = vfs_open_at(base, p, (int)flags, (mode_t)mode, &f);
     fput(hold);
     if (r < 0) return r;
@@ -264,6 +293,7 @@ static int64_t sys_close(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uin
     (void)a2; (void)a3; (void)a4; (void)a5; (void)a6;
     struct file *f = fd_take(current_task(), (int)fd);
     if (!f) return -EBADF;
+    vfs_locks_fd_closed(f);
     vfs_close(f);
     return 0;
 }
@@ -1043,11 +1073,14 @@ XATTR_PATH(sys_removexattr, 197, true)  XATTR_PATH(sys_lremovexattr, 198, false)
  * be shared with MAP_SHARED and passed to other processes). */
 #define MFD_CLOEXEC       1
 #define MFD_ALLOW_SEALING 2
+#define MFD_HUGETLB       4
+#define MFD_NOEXEC_SEAL   8             /* sealable, and F_SEAL_EXEC from the start */
+#define MFD_EXEC          0x10
 static int64_t sys_memfd_create(uint64_t uname, uint64_t flags, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a3; (void)a4; (void)a5; (void)a6;
-    if (flags & ~(uint64_t)(MFD_CLOEXEC | MFD_ALLOW_SEALING | 4 /* MFD_HUGETLB */)) return -EINVAL;
-    if (flags & 4) return -EINVAL;
+    if (flags & ~(uint64_t)(MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_HUGETLB | MFD_NOEXEC_SEAL | MFD_EXEC)) return -EINVAL;
+    if ((flags & MFD_HUGETLB) || ((flags & MFD_NOEXEC_SEAL) && (flags & MFD_EXEC))) return -EINVAL;
     char name[250 + 7];
     strlcpy(name, "memfd:", sizeof name);
     long n = strncpy_from_user(name + 6, (const char *)uname, sizeof name - 6);
@@ -1057,7 +1090,8 @@ static int64_t sys_memfd_create(uint64_t uname, uint64_t flags, uint64_t a3, uin
     if (!f) return -ENOMEM;
     struct vm_object *o = vfs_vmobject(f->vn);
     if (!o) { vfs_close(f); return -ENOMEM; }
-    if (!(flags & MFD_ALLOW_SEALING)) o->seals = 0x0001;   /* F_SEAL_SEAL: no seals can be added */
+    if (flags & MFD_NOEXEC_SEAL) o->seals = 0x0020;        /* F_SEAL_EXEC */
+    else if (!(flags & MFD_ALLOW_SEALING)) o->seals = 0x0001;   /* F_SEAL_SEAL: no seals can be added */
     return install(f, flags & MFD_CLOEXEC);
 }
 
@@ -1213,7 +1247,7 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
         struct vm_object *o = f->vn->type == VREG ? vfs_vmobject(f->vn) : NULL;
         if (!o || !f->vn->unlinked) { r = -EINVAL; break; }     /* memfds only */
         if (o->seals & 0x0001) { r = -EPERM; break; }           /* F_SEAL_SEAL */
-        if (arg & ~0x1fULL) { r = -EINVAL; break; }
+        if (arg & ~0x3fULL) { r = -EINVAL; break; }     /* SEAL, SHRINK, GROW, WRITE, FUTURE_WRITE, EXEC */
         if ((f->flags & O_ACCMODE) == O_RDONLY) { r = -EPERM; break; }
         o->seals |= (uint32_t)arg;
         r = 0;
@@ -1222,6 +1256,20 @@ static int64_t sys_fcntl(uint64_t fd, uint64_t cmd, uint64_t arg, uint64_t a4, u
     case 1034: {                                        /* F_GET_SEALS */
         struct vm_object *o = f->vn->type == VREG ? vfs_vmobject(f->vn) : NULL;
         r = o && f->vn->unlinked ? (int64_t)o->seals : -EINVAL;
+        break;
+    }
+    case 5: case 36: {                                  /* F_GETLK, F_OFD_GETLK */
+        uint8_t k[32];
+        if (copy_from_user(k, (const void *)arg, sizeof k)) { r = -EFAULT; break; }
+        r = vfs_lock_get(f, k, cmd == 36);
+        if (!r && copy_to_user((void *)arg, k, sizeof k)) r = -EFAULT;
+        break;
+    }
+    case 6: case 7: case 37: case 38: {                 /* F_SETLK(W), F_OFD_SETLK(W) */
+        uint8_t k[32];
+        if (copy_from_user(k, (const void *)arg, sizeof k)) { r = -EFAULT; break; }
+        if (f->vn->type != VREG && f->vn->type != VDIR) { r = -EINVAL; break; }
+        r = vfs_lock_set(f, k, cmd >= 37, cmd == 7 || cmd == 38);
         break;
     }
     case F_SETFL:                                       /* only these two may change */
@@ -1251,7 +1299,7 @@ static int64_t do_dup(int oldfd, int newfd, int flags, bool any)
     t->files->fd[newfd] = f;
     t->files->cloexec[newfd] = (flags & O_CLOEXEC) != 0;
     irq_restore(fl);
-    if (old) vfs_close(old);
+    if (old) { vfs_locks_fd_closed(old); vfs_close(old); }
     return newfd;
 }
 
@@ -1683,6 +1731,12 @@ static int64_t sys_prctl(uint64_t op, uint64_t arg, uint64_t a3, uint64_t a4, ui
     case 1: return 0;                                   /* PR_SET_PDEATHSIG: never sent */
     case 3: return 1;                                   /* PR_GET_DUMPABLE */
     case 4: return 0;                                   /* PR_SET_DUMPABLE */
+    case 23: return arg <= 40 ? 1 : -EINVAL;             /* PR_CAPBSET_READ: every capability (sys_capget) */
+    case 24: return arg <= 40 ? 0 : -EINVAL;             /* PR_CAPBSET_DROP */
+    case 36: return 0;                                  /* PR_SET_CHILD_SUBREAPER: orphans go to init regardless */
+    case 37: return put_user_u32((void *)arg, 0) ? -EFAULT : 0;    /* PR_GET_CHILD_SUBREAPER */
+    case 38: return 0;                                  /* PR_SET_NO_NEW_PRIVS: nothing gains them anyway */
+    case 39: return 0;                                  /* PR_GET_NO_NEW_PRIVS */
     default: return -EINVAL;
     }
 }
@@ -2415,7 +2469,7 @@ static int64_t sys_fork(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint
 static int64_t sys_vfork(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; return proc_clone(CLONE_VM_ | CLONE_VFORK_ | SIGCHLD_, 0, 0, 0, 0); }
 static int64_t sys_clone(uint64_t flags, uint64_t sp, uint64_t ptid, uint64_t ctid, uint64_t tls, uint64_t a6)
-{ (void)a6; return proc_clone(flags, sp, ptid, ctid, tls); }
+{ (void)a6; return proc_clone(flags & 0xffffffffu, sp, ptid, ctid, tls); }   /* clone3-only flags live above bit 31 */
 static int64_t sys_execve(uint64_t path, uint64_t argv, uint64_t envp, uint64_t a4, uint64_t a5, uint64_t a6)
 { (void)a4; (void)a5; (void)a6; return proc_execve(path, argv, envp); }
 static int64_t sys_wait4(uint64_t pid, uint64_t status, uint64_t options, uint64_t ru, uint64_t a5, uint64_t a6)
@@ -2471,6 +2525,67 @@ static int64_t sys_fadvise64(uint64_t fd, uint64_t off, uint64_t len, uint64_t a
     if (!f) return -EBADF;
     fput(f);
     return advice > 5 ? -EINVAL : 0;
+}
+
+/* readahead(fd, off, count): a hint; regular files only, as on Linux. */
+static int64_t sys_readahead(uint64_t fd, uint64_t off, uint64_t len, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)off; (void)len; (void)a4; (void)a5; (void)a6;
+    struct file *f = fget((int)fd);
+    if (!f) return -EBADF;
+    int r = f->vn->type == VREG && (f->flags & O_ACCMODE) != O_WRONLY ? 0 : -EINVAL;
+    fput(f);
+    return r;
+}
+
+static int64_t sys_waitid(uint64_t idtype, uint64_t id, uint64_t infop, uint64_t options, uint64_t ru, uint64_t a6)
+{
+    (void)a6;
+    if (ru && clear_user((void *)ru, 144)) return -EFAULT;
+    return proc_waitid((int64_t)idtype, (int64_t)(int32_t)id, infop, options);
+}
+
+/* Capabilities: root holds every one (CAP_LAST_CAP 40), others none. capset
+ * may keep or drop them in the report but nothing is enforced by them. */
+#define CAP_V1 0x19980330u
+#define CAP_V2 0x20071026u
+#define CAP_V3 0x20080522u
+static int cap_words(uint64_t uhdr, int *words)
+{
+    uint32_t hdr[2];
+    if (copy_from_user(hdr, (const void *)uhdr, sizeof hdr)) return -EFAULT;
+    if (hdr[0] == CAP_V1) *words = 1;
+    else if (hdr[0] == CAP_V2 || hdr[0] == CAP_V3) *words = 2;
+    else {
+        uint32_t v = CAP_V3;
+        if (copy_to_user((void *)uhdr, &v, 4)) return -EFAULT;
+        return -EINVAL;
+    }
+    if ((int32_t)hdr[1] < 0) return -EINVAL;
+    if (hdr[1] && !task_find((int)hdr[1])) return -ESRCH;
+    return 0;
+}
+static int64_t sys_capget(uint64_t uhdr, uint64_t udata, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    int words, r = cap_words(uhdr, &words);
+    if (r) return r;
+    if (!udata) return 0;
+    bool root = current_task()->uid == 0;
+    uint32_t d[6] = { 0 };                              /* {effective, permitted, inheritable} per word */
+    if (root) { d[0] = d[1] = 0xffffffffu; d[3] = d[4] = 0x1ffu; }
+    return copy_to_user((void *)udata, d, (size_t)words * 12) ? -EFAULT : 0;
+}
+static int64_t sys_capset(uint64_t uhdr, uint64_t udata, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    (void)a3; (void)a4; (void)a5; (void)a6;
+    int words, r = cap_words(uhdr, &words);
+    if (r) return r;
+    uint32_t d[6] = { 0 };
+    if (copy_from_user(d, (const void *)udata, (size_t)words * 12)) return -EFAULT;
+    if (current_task()->uid == 0) return 0;
+    for (int i = 0; i < words * 3; i++) if (d[i]) return -EPERM;  /* nothing to raise */
+    return 0;
 }
 
 /* glibc falls back to ftruncate + writes (posix_fallocate) */
@@ -2575,7 +2690,7 @@ static int64_t sys_close_range(uint64_t first, uint64_t last, uint64_t flags, ui
     for (uint64_t fd = (uint32_t)first; fd <= hi; fd++) {
         if (flags & 4) { if (t->files->fd[fd]) t->files->cloexec[fd] = 1; continue; }
         struct file *f = fd_take(t, (int)fd);
-        if (f) vfs_close(f);
+        if (f) { vfs_locks_fd_closed(f); vfs_close(f); }
     }
     return 0;
 }
@@ -2703,8 +2818,17 @@ static int64_t sys_enosys(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, ui
 /* ------------------------------------------------------------------------- */
 #define REG(nr, fn) do { table[nr] = fn; names[nr] = #nr + 4; } while (0)
 
+static char strace_pat[64];            /* kestrel.strace=: see syscall_dispatch */
+
 void syscall_init(void)
 {
+    const char *st = strstr(g_boot.cmdline, "kestrel.strace=");
+    if (st) {
+        st += 15;
+        size_t n = 0;
+        while (st[n] && st[n] != ' ' && n + 1 < sizeof strace_pat) { strace_pat[n] = st[n]; n++; }
+        strace_pat[n] = 0;
+    }
     REG(SYS_read, sys_read);           REG(SYS_write, sys_write);
     REG(SYS_open, sys_open);           REG(SYS_close, sys_close);
     REG(SYS_stat, sys_stat);           REG(SYS_fstat, sys_fstat);
@@ -2818,7 +2942,10 @@ void syscall_init(void)
     REG(SYS_mlock, sys_mlock_ok);      REG(SYS_munlock, sys_mlock_ok);
     REG(SYS_mlockall, sys_mlock_ok);   REG(SYS_munlockall, sys_mlock_ok);
     REG(SYS_personality, sys_personality);
+    REG(SYS_readahead, sys_readahead); REG(SYS_waitid, sys_waitid);
+    REG(SYS_capget, sys_capget);       REG(SYS_capset, sys_capset);
     REG(SYS_rseq, sys_absent);         REG(SYS_pidfd_open, sys_absent);
+    REG(SYS_quotactl, sys_absent);
     REG(SYS_shmget, sys_absent);       REG(SYS_shmat, sys_absent);
     REG(SYS_shmctl, sys_absent);       REG(SYS_shmdt, sys_absent);
 
@@ -2839,8 +2966,61 @@ void syscall_cpu_init(void)
     wrmsr(MSR_FMASK, 0x200 | 0x400 | 0x100 | 0x40000 | 0x4000);
 }
 
+/* kestrel.strace=<text>: log every system call of the processes whose
+ * program path contains <text> (the call, its first four arguments and the
+ * result), for finding what a ported program trips over. Calls that may
+ * block are logged when they start as well. */
+
+static bool strace_on(const struct tcb *t)
+{
+    return strace_pat[0] && t->user && strstr(t->exe, strace_pat);
+}
+
+static bool may_block(uint64_t nr)
+{
+    switch (nr) {
+    case SYS_read: case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
+    case SYS_futex: case SYS_wait4: case SYS_waitid: case SYS_recvmsg: case SYS_recvfrom:
+    case SYS_epoll_wait: case SYS_epoll_pwait: case SYS_nanosleep: case SYS_clock_nanosleep:
+    case SYS_accept: case SYS_accept4: case SYS_connect: case SYS_rt_sigsuspend: case SYS_pause:
+    case SYS_readv: case SYS_write: case SYS_sendmsg:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Calls that touch only this thread and the clock run without the kernel
+ * lock: programs like Firefox read the time thousands of times a second, and
+ * each of those used to queue behind whatever another CPU was doing in the
+ * kernel. Anything unusual (a fault on the user buffer, a pending signal,
+ * tracing) falls back to the normal path. */
+static bool syscall_fast(struct int_frame *f)
+{
+    struct tcb *t = current_task();
+    if (strace_pat[0] || !t->user || signal_pending()) return false;
+    switch (f->rax) {
+    case SYS_clock_gettime: {
+        int kind = clock_kind(f->rdi);
+        if (kind < 0) return false;
+        struct timespec ts;
+        clock_read(kind, &ts);
+        pagefault_disable();
+        int r = copy_to_user((void *)f->rsi, &ts, sizeof ts);
+        pagefault_enable();
+        if (r) return false;                            /* not mapped yet: the slow path faults it in */
+        f->rax = 0;
+        return true;
+    }
+    case SYS_gettid: f->rax = (uint64_t)t->pid; return true;
+    case SYS_getpid: f->rax = (uint64_t)t->tgid; return true;
+    default: return false;
+    }
+}
+
 int syscall_dispatch(struct int_frame *f)
 {
+    if (syscall_fast(f)) return 0;
     bkl_enter();                                        /* kernel code: one CPU at a time */
     uint64_t nr = f->rax;
     struct tcb *t = current_task();
@@ -2857,9 +3037,14 @@ int syscall_dispatch(struct int_frame *f)
         counts[nr]++;
         t->uframe = f;
         t->iret_return = false;
+        bool tr = strace_on(t);
+        uint64_t a1 = f->rdi, a2 = f->rsi, a3 = f->rdx, a4 = f->r10;
+        if (tr && may_block(nr))
+            kprintf("strace %d %s(%lx, %lx, %lx, %lx) ...\n", t->pid, names[nr] ? names[nr] : "?", a1, a2, a3, a4);
         if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
         int64_t r = table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
         f->rax = (uint64_t)r;
+        if (tr) kprintf("strace %d %s(%lx, %lx, %lx, %lx) = %ld\n", t->pid, names[nr] ? names[nr] : "?", a1, a2, a3, a4, r);
         /* a write to a pipe or socket nobody reads raises SIGPIPE */
         if (r == -EPIPE && t->user &&
             (nr == SYS_write || nr == SYS_writev ||

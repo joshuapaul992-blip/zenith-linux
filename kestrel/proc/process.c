@@ -38,11 +38,12 @@ extern void user_return(struct int_frame *f) __attribute__((noreturn));
 #define CLONE_UNTRACED       0x00800000
 #define CLONE_CHILD_SETTID   0x01000000
 #define CLONE_IO             0x80000000u
+#define CLONE_CLEAR_SIGHAND  0x100000000ull   /* clone3 only: caught signals start at SIG_DFL */
 /* Namespaces, pidfds, cgroups are not supported: they fail with EINVAL. */
 #define CLONE_SUPPORTED      (0xff | CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_PTRACE | \
                               CLONE_VFORK | CLONE_PARENT | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | \
                               CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID | CLONE_DETACHED | CLONE_UNTRACED | \
-                              CLONE_CHILD_SETTID | CLONE_IO)
+                              CLONE_CHILD_SETTID | CLONE_IO | CLONE_CLEAR_SIGHAND)
 
 #define WNOHANG     1
 
@@ -207,6 +208,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (flags & ~(uint64_t)CLONE_SUPPORTED) return -EINVAL;
     if ((flags & CLONE_THREAD) && !(flags & CLONE_SIGHAND)) return -EINVAL;     /* as Linux */
     if ((flags & CLONE_SIGHAND) && !(flags & CLONE_VM)) return -EINVAL;
+    if ((flags & CLONE_SIGHAND) && (flags & CLONE_CLEAR_SIGHAND)) return -EINVAL;
     if ((flags & CLONE_PARENT) && !p->ppid) return -EINVAL;
     if ((flags & CLONE_PARENT_SETTID) && !user_range_ok(ptid, 4)) return -EFAULT;
     if ((flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID)) && !user_range_ok(ctid, 4)) return -EFAULT;
@@ -229,6 +231,14 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     else fs = fs_new(p->fs->cwd, p->fs->umask);
     if (flags & CLONE_SIGHAND) { sh = p->sighand; __atomic_add_fetch(&sh->refs, 1, __ATOMIC_ACQ_REL); }
     else sh = sighand_new(p->sighand);
+    if (sh && (flags & CLONE_CLEAR_SIGHAND))            /* posix_spawn: handlers reset, ignored stay ignored */
+        for (int s = 0; s < NSIG; s++)
+            if (sh->action[s].handler != SIG_IGN) {
+                sh->action[s].handler = SIG_DFL;
+                sh->action[s].flags = 0;
+                sh->action[s].restorer = 0;
+                sh->action[s].mask = 0;
+            }
     cf = kmalloc(sizeof *cf);
     if (!files || !fs || !sh || !cf) goto nomem;
     *cf = *p->uframe;
@@ -444,6 +454,7 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
             struct file *x = ft->fd[fd];
             ft->fd[fd] = NULL;
             ft->cloexec[fd] = 0;
+            vfs_locks_fd_closed(x);
             vfs_close(x);
         }
     struct k_sigaction *act = t->sighand->action;
@@ -525,6 +536,62 @@ int64_t proc_wait4(int64_t pid, uint64_t ustatus, uint64_t options, uint64_t rus
         if (options & WNOHANG) { irq_restore(fl); return 0; }
         if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
         sleep_on(self->signal);                         /* a child's exit wakes the process */
+    }
+}
+
+/* waitid(idtype, id, infop, options): wait4 with a siginfo for the result,
+ * and WNOWAIT to look without reaping. No job control: only exits are seen. */
+#define P_ALL     0
+#define P_PID     1
+#define P_PGID    2
+#define WEXITED   4
+#define WSTOPPED  2
+#define WCONTINUED 8
+#define WNOWAIT   0x01000000
+int64_t proc_waitid(int64_t idtype, int64_t id, uint64_t infop, uint64_t options)
+{
+    struct tcb *self = current_task();
+    if (!self->user) return -ECHILD;
+    if (options & ~(uint64_t)(WNOHANG | WEXITED | WSTOPPED | WCONTINUED | WNOWAIT | 0xe0000000u)) return -EINVAL;
+    if (!(options & (WEXITED | WSTOPPED | WCONTINUED))) return -EINVAL;
+    int64_t pid;
+    switch (idtype) {
+    case P_ALL:  pid = -1; break;
+    case P_PID:  if (id <= 0) return -EINVAL; pid = id; break;
+    case P_PGID: if (id < 0) return -EINVAL; pid = id ? -id : 0; break;
+    default:     return -EINVAL;                        /* P_PIDFD: no pidfds */
+    }
+    if (infop && !user_range_ok(infop, 128)) return -EFAULT;
+    uint64_t fl = irq_save();
+    for (;;) {
+        bool any = false;
+        struct tcb *z = NULL;
+        for (int i = 0; i < MAX_TASKS && !z; i++) {
+            struct tcb *c = task_slot(i);
+            if (!wait_matches(self, c, pid)) continue;
+            any = true;
+            if ((options & WEXITED) && c->state == TASK_ZOMBIE && c->signal->nr_threads == 0) z = c;
+        }
+        if (!any) { irq_restore(fl); return -ECHILD; }
+        if (z) {
+            int32_t info[32] = { 0 };
+            info[0] = SIGCHLD;                          /* si_signo; si_errno 0 */
+            info[2] = z->term_signal ? 2 : 1;           /* si_code: CLD_KILLED, CLD_EXITED */
+            info[4] = z->pid;                           /* si_pid */
+            info[5] = (int32_t)z->uid;                  /* si_uid */
+            info[6] = z->term_signal ? (z->term_signal & 0x7f) : (z->exit_code & 0xff);  /* si_status */
+            if (!(options & WNOWAIT)) task_reap(z);
+            irq_restore(fl);
+            if (infop && copy_to_user((void *)infop, info, sizeof info)) return -EFAULT;
+            return 0;
+        }
+        if (options & WNOHANG) {
+            irq_restore(fl);
+            if (infop && clear_user((void *)infop, 128)) return -EFAULT;    /* si_pid 0: nothing yet */
+            return 0;
+        }
+        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
+        sleep_on(self->signal);
     }
 }
 

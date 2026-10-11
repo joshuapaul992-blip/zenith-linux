@@ -95,7 +95,8 @@ struct files_struct *files_dup(struct files_struct *src)
 void files_put(struct files_struct *f)
 {
     if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
-    for (int i = 0; i < MAX_FDS; i++) if (f->fd[i]) { struct file *x = f->fd[i]; f->fd[i] = NULL; vfs_close(x); }
+    for (int i = 0; i < MAX_FDS; i++)
+        if (f->fd[i]) { struct file *x = f->fd[i]; f->fd[i] = NULL; vfs_locks_fd_closed(x); vfs_close(x); }
     kfree(f);
 }
 

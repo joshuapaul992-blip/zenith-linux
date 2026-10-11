@@ -27,6 +27,7 @@
 #include <sys/xattr.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <poll.h>
 #include <sys/reboot.h>
 
@@ -125,6 +126,7 @@ static char P[512];
 static const char *in(const char *dir, const char *name) { snprintf(P, sizeof P, "%s/%s", dir, name); return P; }
 
 static void inotify_checks(const char *dir);
+static void lock_checks(const char *dir);
 
 static void checks(const char *dir)
 {
@@ -282,6 +284,9 @@ static void checks(const char *dir)
     printf("inotify:\n");
     inotify_checks(dir);
 
+    printf("record locks, descriptor reopen, waitid:\n");
+    lock_checks(dir);
+
     printf("space accounting:\n");
     rm_rf(dir);
     CHECK(access(dir, F_OK) < 0, "rm -r of the whole tree (deleting while reading directories)");
@@ -354,6 +359,102 @@ static void inotify_checks(const char *dir)
     CHECK(strstr(ev, "8000:") != NULL, "...queues IN_IGNORED");
     CHECK(inotify_rm_watch(fd, wd) < 0 && errno == EINVAL, "...and the watch is gone");
     close(fd);
+}
+
+/* fcntl byte-range locks between two processes (SQLite's way of locking),
+ * reopening a descriptor through /proc/self/fd (Firefox's read-only memfd
+ * copies) and waitid. */
+static int lock_probe(int fd, short type, off_t start, off_t len, struct flock *out)
+{
+    struct flock l = { .l_type = type, .l_whence = SEEK_SET, .l_start = start, .l_len = len };
+    int r = fcntl(fd, F_GETLK, &l);
+    if (out) *out = l;
+    return r;
+}
+
+static void lock_checks(const char *dir)
+{
+    char a[256];
+    snprintf(a, sizeof a, "%s/locked", dir);
+    int fd = open(a, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    write(fd, "0123456789", 10);
+    struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 4 };
+    CHECK(fcntl(fd, F_SETLK, &l) == 0, "F_SETLK: write lock on bytes 0-3");
+    l = (struct flock){ .l_type = F_RDLCK, .l_whence = SEEK_SET, .l_start = 6, .l_len = 0 };
+    CHECK(fcntl(fd, F_SETLK, &l) == 0, "F_SETLK: read lock from byte 6 to the end");
+    struct flock g;
+    CHECK(lock_probe(fd, F_WRLCK, 0, 0, &g) == 0 && g.l_type == F_UNLCK, "F_GETLK: our own locks never conflict");
+    int p[2];
+    pipe(p);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct flock c;
+        int ok = 1;
+        ok &= lock_probe(fd, F_WRLCK, 2, 1, &c) == 0 && c.l_type == F_WRLCK && c.l_start == 0 && c.l_len == 4 && c.l_pid == getppid();
+        ok &= lock_probe(fd, F_RDLCK, 8, 1, &c) == 0 && c.l_type == F_UNLCK;        /* read vs read */
+        ok &= lock_probe(fd, F_WRLCK, 4, 2, &c) == 0 && c.l_type == F_UNLCK;        /* the gap */
+        c = (struct flock){ .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 3, .l_len = 1 };
+        ok &= fcntl(fd, F_SETLK, &c) < 0 && (errno == EAGAIN || errno == EACCES);
+        c.l_start = 4;
+        ok &= fcntl(fd, F_SETLK, &c) == 0;
+        write(p[1], "r", 1);
+        c = (struct flock){ .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1 };
+        ok &= fcntl(fd, F_SETLKW, &c) == 0;                 /* waits for the parent's unlock */
+        _exit(ok ? 0 : 1);
+    }
+    char ch;
+    read(p[0], &ch, 1);
+    CHECK(lock_probe(fd, F_WRLCK, 4, 1, &g) == 0 && g.l_type == F_WRLCK && g.l_pid == pid, "the child's lock on byte 4, seen by F_GETLK");
+    usleep(100000);
+    int st = -1;
+    CHECK(waitpid(pid, &st, WNOHANG) == 0, "the child waits in F_SETLKW...");
+    l = (struct flock){ .l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+    CHECK(fcntl(fd, F_SETLK, &l) == 0, "F_UNLCK of everything");
+    siginfo_t si;
+    memset(&si, 0xff, sizeof si);
+    CHECK(waitid(P_PID, pid, &si, WEXITED | WNOWAIT) == 0 && si.si_pid == pid && si.si_code == CLD_EXITED && si.si_status == 0,
+          "...gets it, and passes every check (waitid with WNOWAIT)");
+    CHECK(waitid(P_ALL, 0, &si, WEXITED) == 0 && si.si_pid == pid, "waitid reaps it after the look");
+    CHECK(waitid(P_ALL, 0, &si, WEXITED | WNOHANG) < 0 && errno == ECHILD, "waitid: no children left, ECHILD");
+    close(p[0]); close(p[1]);
+    l = (struct flock){ .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+    fcntl(fd, F_SETLK, &l);
+    pid = fork();
+    if (pid == 0) {
+        struct flock c = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+        _exit(fcntl(fd, F_SETLK, &c) == 0 ? 0 : 1);
+    }
+    int fd2 = open(a, O_RDONLY);
+    close(fd2);                                             /* any close drops the process's locks */
+    waitpid(pid, &st, 0);
+    st = -1;
+    pid = fork();
+    if (pid == 0) {
+        struct flock c = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 0 };
+        _exit(fcntl(fd, F_SETLK, &c) == 0 ? 0 : 1);
+    }
+    waitpid(pid, &st, 0);
+    CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0, "closing another descriptor of the file releases the locks (POSIX)");
+
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fd/%d", fd);
+    int ro = open(path, O_RDONLY);
+    char buf[4] = { 0 };
+    CHECK(ro >= 0 && ro != fd && pread(ro, buf, 3, 2) == 3 && !memcmp(buf, "234", 3), "open(/proc/self/fd/N): the same file again");
+    CHECK((fcntl(ro, F_GETFL) & O_ACCMODE) == O_RDONLY && write(ro, "x", 1) < 0 && errno == EBADF, "...with the new open's access mode");
+    close(ro);
+    close(fd);
+    unlink(a);
+
+    int m = memfd_create("fstest", MFD_CLOEXEC | 8 /* MFD_NOEXEC_SEAL */);
+    CHECK(m >= 0 && fcntl(m, F_GET_SEALS) == 0x20, "memfd_create(MFD_NOEXEC_SEAL): sealable, F_SEAL_EXEC set");
+    ftruncate(m, 4096);
+    CHECK(fcntl(m, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) == 0, "F_ADD_SEALS: shrink and grow");
+    snprintf(path, sizeof path, "/proc/self/fd/%d", m);
+    ro = open(path, O_RDONLY | O_CLOEXEC);
+    CHECK(ro >= 0 && (fcntl(ro, F_GET_SEALS) & 0x6) == 0x6, "a read-only reopen of the memfd keeps its seals");
+    close(ro);
+    close(m);
 }
 
 #define PERSIST "/var/fstest-persist"
