@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-#define MAX_TASKS       256             /* threads included */
+#define MAX_TASKS       512             /* threads included */
 #define KSTACK_SIZE     (16 * 1024)
 #define TASK_NAME_LEN   24
 #define MAX_FDS         1024            /* per process (RLIMIT_NOFILE) */
