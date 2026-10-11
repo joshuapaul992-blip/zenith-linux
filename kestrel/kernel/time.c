@@ -114,6 +114,12 @@ static void acpi_init(uintptr_t mbi)
     acpi_x = x;
 }
 
+const void *acpi_map_table(uint64_t phys)
+{
+    const struct sdt_header *h = map_table(phys);
+    return h && h->length >= sizeof *h && checksum_ok(h, h->length) ? h : NULL;
+}
+
 const void *acpi_find_table(const char sig[4])
 {
     if (!acpi_root) return NULL;

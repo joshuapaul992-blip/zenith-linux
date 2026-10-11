@@ -1,4 +1,5 @@
 /* kernel/recovery.c -- boot failure diagnostics and the recovery shell */
+#include <kernel/power.h>
 #include <kernel/recovery.h>
 #include <kernel/bootvol.h>
 #include <kernel/block.h>
@@ -245,28 +246,13 @@ static void cmd_scan(void)
 static void reboot(void)
 {
     rputs("restarting...\n");
-    storage_shutdown();
-    cli();
-    outb(0xCF9, 0x02);                  /* PCI reset control: system reset */
-    outb(0xCF9, 0x06);
-    for (volatile int i = 0; i < 1000000; i++) ;
-    for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) ;
-    outb(0x64, 0xFE);                   /* 8042 reset line */
-    for (volatile int i = 0; i < 1000000; i++) ;
-    rputs("reset did not happen; halting. Power-cycle the machine.\n");
-    cpu_halt_forever();
+    power_reboot();                     /* kernel/power.c: ACPI reset, 0xCF9, 8042, triple fault */
 }
 
 static void poweroff(void)
 {
     rputs("powering off...\n");
-    storage_shutdown();
-    cli();
-    outw(0x604, 0x2000);                /* QEMU q35/pc ACPI PM1a */
-    outw(0xB004, 0x2000);               /* Bochs, old QEMU */
-    outw(0x4004, 0x3400);               /* VirtualBox */
-    rputs("no software power-off here; system halted. It is safe to turn it off.\n");
-    cpu_halt_forever();
+    power_off();                        /* kernel/power.c: ACPI S5, then emulator ports, then halt */
 }
 
 static void help(void)
@@ -283,7 +269,7 @@ static void help(void)
           "  retry             run the whole boot volume discovery again\n"
           "  continue          boot on without a boot volume\n"
           "  reboot            restart the machine\n"
-          "  poweroff          power off (emulators) or halt\n");
+          "  poweroff          power off (ACPI) or halt\n");
 }
 
 enum recovery_action recovery_enter(const char *reason, const char *detail)

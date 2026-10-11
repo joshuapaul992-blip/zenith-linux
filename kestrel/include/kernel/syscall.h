@@ -136,6 +136,8 @@ struct int_frame;
 #define SYS_mincore        27
 #define SYS_fsync          74
 #define SYS_fdatasync      75
+#define SYS_sync          162
+#define SYS_syncfs        306
 #define SYS_truncate       76
 #define SYS_ftruncate      77
 #define SYS_futex         202

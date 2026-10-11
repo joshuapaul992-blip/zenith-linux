@@ -293,7 +293,7 @@ static int cmd_reboot(struct kush_session *sh, int argc, char **argv)
     (void)argc;
     bool off = argv[0][0] == 'p';
     tty_puts(sh->tty, off ? "Powering off...\n" : "Restarting...\n");
-    u_reboot(off ? LINUX_REBOOT_CMD_POWER_OFF : LINUX_REBOOT_CMD_RESTART);
+    u_reboot(off ? LINUX_REBOOT_CMD_POWER_OFF : LINUX_REBOOT_CMD_RESTART);   /* -> kernel/power.c */
     return 1;
 }
 
@@ -315,7 +315,7 @@ static const struct kush_cmd commands[] = {
     { "run",      "PROG",   "run a ring-3 program (from /boot/bin)",           cmd_run },
     { "font",     "",       "show all 256 glyphs of kestrel_font",             cmd_font },
     { "reboot",   "",       "restart the machine",                             cmd_reboot },
-    { "poweroff", "",       "power off (emulators) or halt",                   cmd_reboot },
+    { "poweroff", "",       "power off the machine (ACPI)",                    cmd_reboot },
     { NULL, NULL, NULL, NULL },
 };
 

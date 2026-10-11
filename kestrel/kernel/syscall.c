@@ -8,6 +8,8 @@
  * a user field twice (no time-of-check/time-of-use window). Open files are
  * looked up with a reference held (fget/fput), so a close() from another
  * thread cannot free one under a running call. */
+#include <kernel/power.h>
+#include <kernel/block.h>
 #include <kernel/syscall.h>
 #include <kernel/process.h>
 #include <kernel/mm.h>
@@ -577,24 +579,20 @@ static int64_t sys_uname(uint64_t p, uint64_t a2, uint64_t a3, uint64_t a4, uint
 static int64_t sys_reboot(uint64_t m1, uint64_t m2, uint64_t cmd, uint64_t a4, uint64_t a5, uint64_t a6)
 {
     (void)a4; (void)a5; (void)a6;
-    if (m1 != 0xfee1deadu || m2 != 672274793u) return -EINVAL;
-    kprintf("reboot: cmd=%lx\n", cmd);
-    storage_shutdown();                                 /* NVMe: clean shutdown before the reset */
-    cli();
-    switch (cmd) {
-    case 0x01234567u:                                   /* RESTART: 8042 reset line */
-        for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) ;
-        outb(0x64, 0xFE);
-        __asm__ volatile("lidt %0; int3" :: "m"((struct { uint16_t l; uint64_t b; } __attribute__((packed))){0, 0}));
-        break;
-    case 0x4321FEDCu:                                   /* POWER_OFF: ACPI PM1a in common VMs */
-        outw(0x604, 0x2000);                            /* QEMU (q35/pc, ACPI)  */
-        outw(0xB004, 0x2000);                           /* Bochs, old QEMU      */
-        outw(0x4004, 0x3400);                           /* VirtualBox           */
-        /* real hardware needs ACPI AML parsing -> just halt */
-        __attribute__((fallthrough));
+    if (m1 != 0xfee1deadu || (m2 != 672274793u && m2 != 85072278u && m2 != 369367448u && m2 != 537993216u))
+        return -EINVAL;
+    if (current_task()->user && current_task()->uid != 0) return -EPERM;   /* CAP_SYS_BOOT: root */
+    switch ((uint32_t)cmd) {
+    case 0x01234567u:                                   /* RESTART */
+    case 0xA1B2C3D4u:                                   /* RESTART2 (argument ignored) */
+        power_reboot();
+    case 0x4321FEDCu:                                   /* POWER_OFF */
+        power_off();
     case 0xCDEF0123u:                                   /* HALT */
-        panic("System halted. It is now safe to turn off your computer.");
+        power_halt();
+    case 0x89ABCDEFu:                                   /* CAD_ON / CAD_OFF: Ctrl-Alt-Del is ours */
+    case 0x00000000u:
+        return 0;
     }
     return -EINVAL;
 }
@@ -740,6 +738,15 @@ static int64_t sys_truncate(uint64_t path, uint64_t len, uint64_t a3, uint64_t a
     struct vnode *vn;
     if ((r = vfs_lookup(p, &vn))) return r;
     return vfs_truncate(vn, len);
+}
+
+/* sync(2)/syncfs(2): files live in memory; ask every block device to
+ * commit its write cache (the report volume, raw writes). */
+static int64_t sys_sync(uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
+{
+    UNUSED6(a1, a2, a3, a4, a5, a6);
+    for (int i = 0; i < blk_count(); i++) { struct blkdev *b = blk_get(i); if (b) blk_flush(b); }
+    return 0;
 }
 
 static int64_t sys_fsync(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -2089,6 +2096,7 @@ void syscall_init(void)
     REG(SYS_set_tid_address, sys_set_tid_address);
     REG(SYS_gettid, sys_gettid);
     REG(SYS_futex, sys_futex);
+    REG(SYS_sync, sys_sync);                     REG(SYS_syncfs, sys_sync);
     REG(SYS_epoll_create, sys_epoll_create);     REG(SYS_epoll_create1, sys_epoll_create1);
     REG(SYS_epoll_ctl, sys_epoll_ctl);           REG(SYS_epoll_wait, sys_epoll_wait);
     REG(SYS_epoll_pwait, sys_epoll_pwait);

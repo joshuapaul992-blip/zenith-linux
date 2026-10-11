@@ -621,7 +621,9 @@ Every pointer a call receives is checked to lie in the user half and copied thro
 - **Processes and threads:** fork, vfork, clone (processes and threads), execve, exit (the thread), exit_group (the process), wait4, getpid, gettid, getppid, set_tid_address, set_robust_list, get_robust_list, futex, arch_prctl (`ARCH_SET_FS`/`GET_FS`/`SET_GS`/`GET_GS`), sched_yield, sched_getaffinity, sched_setaffinity, setsid, setpgid, getpgid, getpgrp, getsid, prctl (`PR_SET_NAME`/`PR_GET_NAME`).
 - **Signals:** kill, tkill, tgkill, rt_sigaction, rt_sigprocmask, rt_sigpending, rt_sigreturn, rt_sigsuspend, pause, alarm, getitimer, setitimer (`ITIMER_REAL`).
 - **Identity and limits:** getuid, getgid, geteuid, getegid, setuid, setgid, setreuid, setregid, setresuid, setresgid, getresuid, getresgid, getgroups, setgroups (one uid and gid per process; only root may change them), getrlimit, setrlimit, prlimit64 (fixed limits; 1024 descriptors).
-- **Time and system:** nanosleep, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET/TSC), gettimeofday, times, getrusage, sysinfo, uname, getrandom, reboot.
+- **Time and system:** nanosleep, clock_gettime and clock_getres (`CLOCK_REALTIME` from the RTC; `CLOCK_MONOTONIC`, `_RAW`, `_COARSE` and `CLOCK_BOOTTIME` from the HPET/TSC), gettimeofday, times, getrusage, sysinfo, uname, getrandom, sync, syncfs, reboot.
+
+**Power:** `poweroff`, `reboot` and `halt` work from any shell (as root). BusyBox asks init with a signal to pid 1, and the kernel plays that part; `reboot(2)` and the `-f` forms go straight to `kernel/power.c`. Power-off uses ACPI S5 (PM1 control ports from the FADT, the `\_S5_` sleep type from the DSDT), so it works on real machines, with the QEMU/Bochs/VirtualBox ports as a fallback. Restart tries the FADT reset register, port `0xCF9`, the keyboard controller, then a triple fault. Storage is flushed and the other CPUs are stopped first.
 
 `cat /proc/syscalls` lists every call with its status and call count.
 

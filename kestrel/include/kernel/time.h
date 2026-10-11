@@ -18,6 +18,7 @@ uint64_t    time_us(void);
 uint64_t    time_ms(void);
 /* An ACPI table by signature ("APIC", "HPET", ...), checksum verified; NULL if absent. */
 const void *acpi_find_table(const char sig[4]);
+const void *acpi_map_table(uint64_t phys);       /* a table not in the root (the DSDT), checked */
 void        udelay(uint32_t us);        /* busy-wait, interrupts may be off */
 void        mdelay(uint32_t ms);
 const char *time_source(void);          /* "HPET 100.000 MHz", "TSC 2.394 GHz (PIT-calibrated)" */

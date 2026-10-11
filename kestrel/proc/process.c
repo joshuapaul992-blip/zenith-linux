@@ -3,6 +3,7 @@
  * See include/kernel/process.h for the model. Everything here runs in the
  * context of the calling process, with its address space loaded, so user
  * memory is reached directly once it has been checked to be mapped. */
+#include <kernel/power.h>
 #include <kernel/process.h>
 #include <kernel/task.h>
 #include <kernel/exec.h>
@@ -1005,6 +1006,20 @@ void sig_temp_mask_end(void)
     t->saved_mask_valid = false;
 }
 
+/* Signals to pid 1 mean what BusyBox init makes of them: poweroff, reboot
+ * and halt (without -f) ask init this way. Only root may. */
+static int64_t init_signal(int sig, struct tcb *self)
+{
+    if (sig == 0) return 0;
+    if (self->uid != 0) return -EPERM;
+    switch (sig) {
+    case SIGTERM: power_reboot();
+    case SIGUSR2: power_off();
+    case SIGUSR1: power_halt();
+    default:      return 0;                             /* nothing else means anything to init */
+    }
+}
+
 int64_t sig_kill(int64_t pid, int64_t sig)
 {
     struct tcb *self = current_task();
@@ -1012,6 +1027,8 @@ int64_t sig_kill(int64_t pid, int64_t sig)
     struct ksig_info info = { .code = SI_USER, .pid = self->tgid, .uid = self->uid };
     if (pid > 0) {
         struct tcb *t = process_of((int)pid);
+        if (pid == 1 && (!t || t->state == TASK_UNUSED || !t->user))
+            return init_signal((int)sig, self);         /* the kernel plays init */
         if (!t || t->state == TASK_UNUSED) return -ESRCH;
         if (!t->user) return -EPERM;                    /* kernel threads */
         if (!proc_alive(t)) return 0;                   /* a zombie */

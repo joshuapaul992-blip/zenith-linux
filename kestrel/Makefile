@@ -66,7 +66,7 @@ BUILD := build
 ASM_SRC := boot/multiboot2_header.asm boot/boot.asm \
            arch/x86_64/isr.asm arch/x86_64/switch.asm arch/x86_64/syscall_entry.asm arch/x86_64/uaccess.asm \
            arch/x86_64/trampoline.asm
-C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kernel/futex.c fs/epoll.c fs/anonfd.c mm/vm.c mm/vmobj.c \
+C_SRC   := kernel/kernel.c kernel/klog.c kernel/syscall.c kernel/uaccess.c kernel/futex.c kernel/power.c fs/epoll.c fs/anonfd.c mm/vm.c mm/vmobj.c \
            arch/x86_64/gdt.c arch/x86_64/idt.c arch/x86_64/pic.c arch/x86_64/pit.c arch/x86_64/apic.c arch/x86_64/smp.c \
            drivers/serial.c drivers/fb.c drivers/console.c drivers/keyboard.c drivers/kinput.c \
            drivers/font_8x16.c drivers/font_12x24.c drivers/pci/pci.c \
