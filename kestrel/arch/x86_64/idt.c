@@ -293,6 +293,8 @@ static bool lockless(struct int_frame *f)
         return true;
     case 8: case 18:                                    /* #DF, #MC: state unknown, stop */
         kernel_exception(f);
+    case 14:                                            /* most user page faults (vm.c) */
+        return (f->cs & 3) == 3 && vm_fault_fast(read_cr2(), f->error);
     case VEC_TLB:
         tlb_service();
         lapic_eoi();

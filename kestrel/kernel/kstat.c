@@ -154,6 +154,7 @@ size_t kstat_gen(char *buf, size_t cap)
         sum.irq_n += k.irq_n; sum.irq_cyc += k.irq_cyc;
         sum.sys_n += k.sys_n; sum.sys_cyc += k.sys_cyc; sum.fast_n += k.fast_n;
         for (int f = 0; f < KF_KINDS; f++) { sum.fault_n[f] += k.fault_n[f]; sum.fault_cyc[f] += k.fault_cyc[f]; }
+        sum.fault_fast_n += k.fault_fast_n;
         sum.io_n += k.io_n; sum.io_bytes += k.io_bytes; sum.io_cyc += k.io_cyc;
     }
     uint64_t busy = sum.lock_hold_cyc + sum.lock_spin_cyc + sum.idle_cyc;
@@ -167,7 +168,7 @@ size_t kstat_gen(char *buf, size_t cap)
     P("syscalls slow=%lu fast=%lu cpu_us=%lu\n", sum.sys_n, sum.fast_n, kstat_us(sum.sys_cyc));
     P("faults");
     for (int f = 0; f < KF_KINDS; f++) P(" %s=%lu %s_us=%lu", fault_names[f], sum.fault_n[f], fault_names[f], kstat_us(sum.fault_cyc[f]));
-    P("\n");
+    P(" lockless=%lu\n", sum.fault_fast_n);
     P("io requests=%lu kib=%lu wait_us=%lu\n", sum.io_n, sum.io_bytes / 1024, kstat_us(sum.io_cyc));
     for (int i = 0; i < blk_count(); i++) {
         struct blkdev *b = blk_get(i);

@@ -1,9 +1,13 @@
-/* mm/pmm.c -- bitmap physical frame allocator fed by the Multiboot2 memory map */
+/* mm/pmm.c -- bitmap physical frame allocator fed by the Multiboot2 memory map.
+ * Its own spinlock (interrupts off while held) guards the bitmap, so frames
+ * can be taken and freed without the big kernel lock: page faults resolved
+ * outside it (vm.c) do both. Zeroing happens after the lock is dropped. */
 #include <kernel/mm.h>
 #include <kernel/multiboot2.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
+#include <kernel/spinlock.h>
 
 #define MAX_FRAMES (PMM_MAX_PHYS / PAGE_SIZE)
 
@@ -11,6 +15,7 @@ static uint8_t  bitmap[MAX_FRAMES / 8];      /* 1 = used */
 static uint64_t total_frames, free_frames, highest;
 static uint64_t search_hint;
 static uint64_t low_page;                    /* usable RAM below 640 KiB (AP start-up) */
+static struct spinlock lock;                 /* bitmap, counters, search_hint */
 
 uint64_t pmm_low_page(void) { return low_page; }
 
@@ -72,7 +77,7 @@ void pmm_init(uintptr_t mbi)
 
 static uint64_t alloc_run(size_t n, uint64_t limit)
 {
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock_irqsave(&lock);
     for (int pass = 0; pass < 2; pass++) {
         uint64_t run = 0, start = pass ? 0x100 : search_hint;
         for (uint64_t f = start; f < limit; f++) {
@@ -82,13 +87,13 @@ static uint64_t alloc_run(size_t n, uint64_t limit)
                 for (uint64_t i = first; i <= f; i++) set_used(i);
                 free_frames -= n;
                 if (n == 1) search_hint = f + 1;
-                irq_restore(flags);
+                spin_unlock_irqrestore(&lock, flags);
                 memset((void *)(first * PAGE_SIZE), 0, n * PAGE_SIZE);
                 return first * PAGE_SIZE;
             }
         }
     }
-    irq_restore(flags);
+    spin_unlock_irqrestore(&lock, flags);
     return 0;
 }
 
@@ -104,13 +109,13 @@ uint64_t pmm_alloc_dma32(size_t n)
 
 void pmm_free_contig(uint64_t phys, size_t n)
 {
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock_irqsave(&lock);
     for (size_t i = 0; i < n; i++) {
         uint64_t f = phys / PAGE_SIZE + i;
         if (f < MAX_FRAMES && is_used(f)) { set_free(f); free_frames++; }
     }
     if (phys / PAGE_SIZE < search_hint) search_hint = phys / PAGE_SIZE;
-    irq_restore(flags);
+    spin_unlock_irqrestore(&lock, flags);
 }
 
 void pmm_free(uint64_t phys) { pmm_free_contig(phys, 1); }

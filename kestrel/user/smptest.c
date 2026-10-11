@@ -1,6 +1,7 @@
 /* user/smptest.c -- multiprocessor behaviour: CPUs seen by programs, real
  * parallelism, TLB shootdowns (a thread on another CPU loses an unmapped
- * page at once), and the kernel under concurrent system calls.
+ * page at once), page faults on several CPUs at once (resolved without the
+ * kernel lock), and the kernel under concurrent system calls.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -103,6 +104,73 @@ static int churn_threads(int rounds)
     return total;
 }
 
+/* ---- page faults on several CPUs at once ---------------------------------------------
+ * Four threads write into the same 8 MiB, each page by all of them, in
+ * different orders, so first touches and copy-on-write breaks race; the
+ * main thread forks and mprotects meanwhile (both wait for faults in
+ * flight). A child forked before checks its copy never changes. */
+#define FS_PAGES   2048
+#define FS_THREADS 4
+#define FS_MARK    0x5EED0000ull
+static volatile uint64_t *fs_mem;
+static volatile int fs_go;
+
+static void *fault_storm(void *arg)
+{
+    int id = (int)(intptr_t)arg;
+    while (!fs_go) sched_yield();
+    for (int p = 0; p < FS_PAGES; p++) {
+        int q = (p * 7 + id * 131) % FS_PAGES;
+        fs_mem[q * 512 + id] = (uint64_t)q << 8 | (uint64_t)id;
+    }
+    return NULL;
+}
+
+static int fault_round(void)
+{
+    int bad = 0;
+    fs_mem = mmap(NULL, FS_PAGES * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *other = mmap(NULL, 16 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (fs_mem == MAP_FAILED || other == MAP_FAILED) return 1;
+    for (int p = 0; p < FS_PAGES; p += 4) fs_mem[p * 512 + 15] = FS_MARK + (uint64_t)p;
+    int go[2];
+    if (pipe(go)) return 1;
+    pid_t snap = fork();                                /* every marked page becomes copy-on-write */
+    if (snap == 0) {
+        char c;
+        read(go[0], &c, 1);
+        int wrong = 0;
+        for (int p = 0; p < FS_PAGES; p++) {
+            for (int t = 0; t < FS_THREADS; t++) if (fs_mem[p * 512 + t]) wrong++;
+            if (fs_mem[p * 512 + 15] != (p % 4 ? 0 : FS_MARK + (uint64_t)p)) wrong++;
+        }
+        _exit(wrong ? 1 : 0);
+    }
+    pthread_t th[FS_THREADS];
+    fs_go = 0;
+    for (int i = 0; i < FS_THREADS; i++) pthread_create(&th[i], NULL, fault_storm, (void *)(intptr_t)i);
+    fs_go = 1;
+    for (int i = 0; i < 20; i++) {
+        mprotect(other, 16 * 4096, i & 1 ? PROT_READ : PROT_READ | PROT_WRITE);
+        pid_t c = fork();
+        if (c == 0) _exit(0);
+        if (c > 0) waitpid(c, NULL, 0);
+    }
+    for (int i = 0; i < FS_THREADS; i++) pthread_join(th[i], NULL);
+    for (int p = 0; p < FS_PAGES; p++) {
+        for (int t = 0; t < FS_THREADS; t++) if (fs_mem[p * 512 + t] != ((uint64_t)p << 8 | (uint64_t)t)) bad++;
+        if (fs_mem[p * 512 + 15] != (p % 4 ? 0 : FS_MARK + (uint64_t)p)) bad++;
+    }
+    write(go[1], "x", 1);
+    int st = 0;
+    if (waitpid(snap, &st, 0) != snap || !WIFEXITED(st) || WEXITSTATUS(st)) bad++;
+    close(go[0]);
+    close(go[1]);
+    munmap((void *)fs_mem, FS_PAGES * 4096);
+    munmap(other, 16 * 4096);
+    return bad;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -169,6 +237,11 @@ int main(void)
         }
         if (round == 4) CHECK(1, "a thread reading a page faults as soon as another thread unmaps it (5 rounds)");
     }
+
+    printf("page faults on several CPUs:\n");
+    int fbad = 0;
+    for (int r = 0; r < 3; r++) fbad += fault_round();
+    CHECK(fbad == 0, "4 threads x 8 MiB of racing first touches and copy-on-write, forks alongside (3 rounds)");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

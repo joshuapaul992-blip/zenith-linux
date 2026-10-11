@@ -34,6 +34,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <kernel/task.h>
+#include <kernel/spinlock.h>
 
 /* Page-fault error code bits */
 #define PF_PRESENT  0x01        /* protection violation (else: not present) */
@@ -90,12 +91,17 @@ struct mm {
     struct vma  *vmas;          /* sorted, non-overlapping                  */
     int          users;         /* tasks running in it (threads, vfork)     */
     struct kmutex lock;         /* regions and page tables                  */
+    struct spinlock fast;       /* held by faults resolved without the big
+                                 * kernel lock (vm_fault_fast); see vm.c   */
     uint64_t     brk_start, brk;
     uint64_t     rss;           /* user pages mapped (statistics, OOM)      */
     bool         oom_victim;    /* the OOM killer is waiting for it to go   */
 };
 
 int vm_fault(uint64_t addr, uint64_t err, bool user_mode);   /* 0, -EFAULT, -EACCES, -EIO, -ENOMEM */
+/* A user-mode fault resolved without the big kernel lock, interrupts off:
+ * true if done, false to go through vm_fault() under the lock. */
+bool vm_fault_fast(uint64_t addr, uint64_t err);
 
 struct mm *mm_create(void);                 /* empty address space; NULL on OOM */
 void       mm_get(struct mm *mm);

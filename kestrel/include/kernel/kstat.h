@@ -49,6 +49,7 @@ struct kstat_cpu {                      /* one CPU */
     uint64_t irq_n, irq_cyc;            /* device interrupts (handler time)           */
     uint64_t sys_n, sys_cyc, fast_n;
     uint64_t fault_n[KF_KINDS], fault_cyc[KF_KINDS];
+    uint64_t fault_fast_n;              /* of those, resolved without the big lock    */
     uint64_t io_n, io_bytes, io_cyc;
 };
 

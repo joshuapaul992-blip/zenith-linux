@@ -5,7 +5,15 @@
  * regions or page tables change, and while a fault is resolved -- a fault
  * may sleep (reading a file, waiting for the OOM killer), so it is not a
  * spinlock. A uaccess copy made while the lock is held can fault again; the
- * mutex is recursive, so that nests. Page frames are reference counted with
+ * mutex is recursive, so that nests.
+ *
+ * Most user faults need no sleeping, though: a zero-filled page, a copy on
+ * write, a file page the page cache already holds. vm_fault_fast() resolves
+ * those straight from the exception, without the big kernel lock, holding
+ * only the mm's spinlock mm->fast. Taking mm->lock (mm_lock) waits for such
+ * a fault in progress to finish; a fast fault that finds mm->lock taken
+ * goes the slow way, so the two never overlap. Everything else falls back
+ * to vm_fault() under the big lock. Page frames are reference counted with
  * locked instructions (mm.h). When a page-table entry loses rights or
  * changes frames, every CPU that has the address space loaded invalidates
  * the translation (smp.h: tlb_shootdown) before the call goes on, and
@@ -24,6 +32,8 @@
 #include <kernel/uaccess.h>
 #include <kernel/time.h>
 #include <kernel/pagecache.h>
+#include <kernel/spinlock.h>
+#include <kernel/kstat.h>
 
 #define PTE_P        0x001ull
 #define PTE_W        0x002ull
@@ -125,6 +135,25 @@ static void copy_page(uint64_t dst, uint64_t src)
     uint64_t n = PAGE / 8;
     __asm__ volatile("rep movsq" : "+D"(dst), "+S"(src), "+c"(n) :: "memory");
 }
+
+/* ---- the mm's locks (see the top of this file) ---------------------------------- */
+/* mm->fast, interrupts off; spinning services TLB requests, as the holder
+ * may be shooting down with this CPU's translation in the way. */
+static uint64_t fast_lock(struct mm *mm)
+{
+    uint64_t f = irq_save();
+    while (__atomic_exchange_n(&mm->fast.locked, 1, __ATOMIC_ACQUIRE))
+        while (__atomic_load_n(&mm->fast.locked, __ATOMIC_RELAXED)) { tlb_service(); cpu_relax(); }
+    return f;
+}
+
+static void mm_lock(struct mm *mm)
+{
+    kmutex_lock(&mm->lock);
+    spin_unlock_irqrestore(&mm->fast, fast_lock(mm));   /* a fast fault in progress ends first */
+}
+
+static void mm_unlock(struct mm *mm) { kmutex_unlock(&mm->lock); }
 
 /* ---- regions ---------------------------------------------------------------- */
 static struct vma *vma_find(struct mm *mm, uint64_t addr)
@@ -319,7 +348,7 @@ struct mm *mm_fork(struct mm *src)
 {
     struct mm *dst = mm_create();
     if (!dst) return NULL;
-    kmutex_lock(&src->lock);
+    mm_lock(src);
     dst->brk_start = src->brk_start;
     dst->brk = src->brk;
     int err = 0;
@@ -336,7 +365,7 @@ struct mm *mm_fork(struct mm *src)
         err = c.err;
     }
     tlb_shootdown(src->pml4, 0, UVM_USER_END);          /* the parent lost write access to private pages */
-    kmutex_unlock(&src->lock);
+    mm_unlock(src);
     if (err) { mm_put(dst); return NULL; }
     return dst;
 }
@@ -377,7 +406,9 @@ static void fault_around(struct mm *mm, struct vma *v, uint64_t va, uint64_t fsi
     }
 }
 
-static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t va, bool write)
+/* fast: without the big kernel lock (vm_fault_fast), where anything that
+ * would sleep or needs the lock returns -EAGAIN instead. */
+static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t va, bool write, bool fast)
 {
     bool writable = v->prot & PROT_WRITE;
     uint64_t phys;
@@ -387,12 +418,13 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
         v->file->vn->ops->getpage && va + PAGE <= v->file_end) {
         /* a whole page of a cached file: share the cache's frame */
         uint64_t off = v->off + (va - v->start), fsize = file_size(v->file);
-        if (off >= pgup(fsize)) return -EIO;            /* past EOF: SIGBUS */
-        int r = v->file->vn->ops->getpage(v->file->vn, off / PAGE, true, &phys);
-        if (r < 0) return r == -ENOMEM ? -ENOMEM : -EIO;
+        if (off >= pgup(fsize)) return fast ? -EAGAIN : -EIO;   /* past EOF: SIGBUS */
+        int r = v->file->vn->ops->getpage(v->file->vn, off / PAGE, !fast, &phys);
+        if (r < 0) return fast ? -EAGAIN : r == -ENOMEM ? -ENOMEM : -EIO;
+        if (!phys) return -EAGAIN;                      /* fast: not cached, the disk is needed */
         if (write) {                                    /* written at once: the private copy now */
             uint64_t n = page_alloc();
-            if (!n) { page_unref(phys); return -ENOMEM; }
+            if (!n) { page_unref(phys); return fast ? -EAGAIN : -ENOMEM; }
             copy_page(n, phys);
             page_unref(phys);
             *pte = n | leaf_flags(v, true);
@@ -403,6 +435,7 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
         fault_around(mm, v, va, fsize);
         return 0;
     }
+    if (fast && ((v->flags & VMA_SHARED) || (v->file && va < v->file_end))) return -EAGAIN;
     if (v->flags & VMA_SHARED) {
         uint64_t off = v->off + (va - v->start);
         if (off >= pgup(v->obj->size)) return -EIO;     /* past the end of the object: SIGBUS */
@@ -411,7 +444,7 @@ static int fault_missing(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t v
         page_ref(phys);
     } else {
         phys = page_alloc();                            /* zeroed */
-        if (!phys) return -ENOMEM;
+        if (!phys) return fast ? -EAGAIN : -ENOMEM;
         if (v->file && va < v->file_end) {
             uint64_t off = v->off + (va - v->start);
             uint64_t fsize = file_size(v->file);
@@ -444,7 +477,7 @@ static int fault_cow(struct mm *mm, struct vma *v, uint64_t *pte, uint64_t va)
     return 0;
 }
 
-static int fault_once(struct mm *mm, uint64_t addr, uint64_t err)
+static int fault_once(struct mm *mm, uint64_t addr, uint64_t err, bool fast)
 {
     uint64_t va = pgdown(addr);
     struct vma *v = vma_find(mm, addr);
@@ -460,20 +493,21 @@ static int fault_once(struct mm *mm, uint64_t addr, uint64_t err)
         tlb_page(mm, va);                               /* stale translation: retry */
         return 0;
     }
+    if ((e & PTE_PROTNONE) && fast) return -EAGAIN;
     if (e & PTE_PROTNONE) {                             /* rights came back (mprotect) */
         bool w = (v->prot & PROT_WRITE) && !(e & PTE_COW);
         *pte = (e & ADDR_MASK) | (e & PTE_COW) | leaf_flags(v, w);
         return write && !w ? fault_cow(mm, v, pte, va) : 0;
     }
-    return fault_missing(mm, v, pte, va, write);
+    return fault_missing(mm, v, pte, va, write, fast);
 }
 
 static int fault_retry(struct tcb *t, struct mm *mm, uint64_t addr, uint64_t err, bool user_mode)
 {
     for (int attempt = 0;; attempt++) {
-        kmutex_lock(&mm->lock);
-        int r = fault_once(mm, addr, err);
-        kmutex_unlock(&mm->lock);
+        mm_lock(mm);
+        int r = fault_once(mm, addr, err, false);
+        mm_unlock(mm);
         if (r != -ENOMEM) return r;
         if (attempt < 20 && pcache_shrink(1024)) continue;     /* cached file pages go first */
         /* Out of memory: free some by ending the largest process, then try
@@ -498,18 +532,37 @@ int vm_fault(uint64_t addr, uint64_t err, bool user_mode)
     return r;
 }
 
+bool vm_fault_fast(uint64_t addr, uint64_t err)
+{
+    struct tcb *t = current_task();
+    struct mm *mm = t ? t->mm : NULL;
+    if (!mm || !t->user || !user_range_ok(addr, 1)) return false;
+    uint64_t t0 = rdtsc();
+    uint64_t f = fast_lock(mm);
+    int r = -EAGAIN;
+    if (!__atomic_load_n(&mm->lock.owner, __ATOMIC_ACQUIRE)) {     /* else the slow way, after it */
+        t->fault_kind = KF_OTHER;
+        r = fault_once(mm, addr, err, true);
+    }
+    spin_unlock_irqrestore(&mm->fast, f);
+    if (r) return false;                                /* an error is reported by the slow path */
+    kstat_fault(t, t->fault_kind, rdtsc() - t0);
+    this_cpu()->ks.fault_fast_n++;
+    return true;
+}
+
 int vm_populate(struct mm *mm, uint64_t addr, uint64_t len, bool write)
 {
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     int r = 0;
     for (uint64_t va = pgdown(addr); va < addr + len && !r; va += PAGE) {
         uint64_t *pte = pte_walk(mm->pml4, va, false);
         if (pte && (*pte & PTE_P) && (!write || (*pte & PTE_W))) continue;
         struct vma *v = vma_find(mm, va);
         if (!v || v->prot == PROT_NONE) continue;
-        r = fault_once(mm, va, write && (v->prot & PROT_WRITE) ? PF_WRITE : 0);
+        r = fault_once(mm, va, write && (v->prot & PROT_WRITE) ? PF_WRITE : 0, false);
     }
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return r == -EACCES || r == -EIO ? 0 : r;
 }
 
@@ -521,7 +574,7 @@ int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
     len = pgup(len);
     if (!len || len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
     if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) return -EINVAL;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     int64_t r;
     if (flags & (MAP_FIXED | MAP_FIXED_NOREPLACE)) {
         if ((addr & (PAGE - 1)) || !user_range_ok(addr, len)) { r = -EINVAL; goto out; }
@@ -548,7 +601,7 @@ int64_t vm_mmap(struct mm *mm, uint64_t addr, uint64_t len, int prot, int flags,
     vma_merge_all(mm);
     r = (int64_t)addr;
 out:
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     if (r > 0 && (flags & MAP_POPULATE)) vm_populate(mm, (uint64_t)r, len, false);
     return r;
 }
@@ -558,9 +611,9 @@ int vm_munmap(struct mm *mm, uint64_t addr, uint64_t len)
     if ((addr & (PAGE - 1)) || !len) return -EINVAL;
     len = pgup(len);
     if (!user_range_ok(addr, len)) return -EINVAL;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     int r = unmap_range(mm, addr, addr + len);
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return r;
 }
 
@@ -590,7 +643,7 @@ int vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot)
     if (!len) return 0;
     if (!user_range_ok(addr, len)) return -ENOMEM;
     uint64_t end = addr + len;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     int r = 0;
     for (uint64_t a = addr; a < end; ) {                /* all of it must be mapped */
         struct vma *v = vma_find(mm, a);
@@ -611,7 +664,7 @@ int vm_mprotect(struct mm *mm, uint64_t addr, uint64_t len, int prot)
     tlb_range(mm, addr, end);
     vma_merge_all(mm);
 out:
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return r;
 }
 
@@ -636,7 +689,7 @@ int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int
     olen = pgup(olen);
     nlen = pgup(nlen);
     if (!nlen || !olen || !user_range_ok(old, olen)) return -EINVAL;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     int64_t r;
     struct vma *v = vma_find(mm, old);
     if (!v || old + olen > v->end) { r = -EFAULT; goto out; }     /* must lie in one region */
@@ -676,7 +729,7 @@ int64_t vm_mremap(struct mm *mm, uint64_t old, uint64_t olen, uint64_t nlen, int
     vma_merge_all(mm);
     r = (int64_t)naddr;
 out:
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return r;
 }
 
@@ -685,15 +738,15 @@ int vm_madvise_dontneed(struct mm *mm, uint64_t addr, uint64_t len)
     if (addr & (PAGE - 1)) return -EINVAL;
     len = pgup(len);
     if (!user_range_ok(addr, len)) return -EINVAL;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     zap_range(mm, addr, addr + len);                    /* next touch: zeros / file / object page */
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return 0;
 }
 
 int vm_mincore(struct mm *mm, uint64_t addr, uint64_t len, uint8_t *vec)
 {
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     int r = 0;
     uint64_t i = 0;
     for (uint64_t va = addr; va < addr + len; va += PAGE, i++) {
@@ -701,13 +754,13 @@ int vm_mincore(struct mm *mm, uint64_t addr, uint64_t len, uint8_t *vec)
         uint64_t *pte = pte_walk(mm->pml4, va, false);
         vec[i] = pte && has_frame(*pte) ? 1 : 0;
     }
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return r;
 }
 
 int64_t vm_brk(struct mm *mm, uint64_t addr)
 {
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     uint64_t cur = mm->brk;
     if (addr < mm->brk_start || addr >= UVM_MMAP_BASE) goto out;
     uint64_t oend = pgup(mm->brk), nend = pgup(addr);
@@ -726,30 +779,30 @@ int64_t vm_brk(struct mm *mm, uint64_t addr)
     }
     mm->brk = cur = addr;
 out:
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return (int64_t)cur;
 }
 
 void vm_mark(struct mm *mm, uint64_t addr, uint32_t flag)
 {
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     struct vma *v = vma_find(mm, addr);
     if (v) v->flags |= flag;
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
 }
 
 /* Futex key of a shared mapping: the object and the byte offset in it. */
 int vm_shared_key(struct mm *mm, uint64_t addr, struct vm_object **obj, uint64_t *off)
 {
     int r = -EFAULT;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     struct vma *v = vma_find(mm, addr);
     if (v) {
         r = 0;
         if (v->flags & VMA_SHARED && v->obj) { *obj = v->obj; *off = v->off + (addr - v->start); }
         else *obj = NULL;
     }
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return r;
 }
 
@@ -757,7 +810,7 @@ int vm_shared_key(struct mm *mm, uint64_t addr, struct vm_object **obj, uint64_t
 size_t vm_maps(struct mm *mm, char *buf, size_t cap)
 {
     size_t n = 0;
-    kmutex_lock(&mm->lock);
+    mm_lock(mm);
     for (struct vma *v = mm->vmas; v && n + 160 < cap; v = v->next) {
         char path[VFS_PATH_MAX] = "";
         if (v->file && v->file->vn) vfs_path_of(v->file->vn, path, sizeof path);
@@ -772,7 +825,7 @@ size_t vm_maps(struct mm *mm, char *buf, size_t cap)
                               (v->flags & VMA_SHARED) ? 's' : 'p', v->off,
                               v->file && v->file->vn ? v->file->vn->ino : 0, path);
     }
-    kmutex_unlock(&mm->lock);
+    mm_unlock(mm);
     return n < cap ? n : cap;
 }
 

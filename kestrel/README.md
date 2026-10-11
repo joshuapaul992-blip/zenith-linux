@@ -536,8 +536,8 @@ drivers/      fb.c           put_pixel, draw_rect, draw_rect_outline, draw_char,
               usb/           standalone xHCI driver + HID boot keyboard/mouse (xhci.h, usb.h, xhci.c),
                              firmware handoff (usb_legacy.c), mass storage BOT/SCSI (usb_msc.c)
 
-mm/           pmm.c          bitmap frame allocator from the MB2 memory map, frame reference counts
-              heap.c         kmalloc/kfree (first fit, split, coalesce, IRQ-safe)
+mm/           pmm.c          bitmap frame allocator from the MB2 memory map, frame reference counts, own lock
+              heap.c         kmalloc/kfree (size bins, split, coalesce, own lock, IRQ-safe)
               vmm.c          identity map changes: MMIO uncached, write-combining (PAT), guard pages
               vm.c           user address spaces: regions (VMAs), demand paging, copy-on-write,
                              NX, mmap/munmap/mprotect/mremap/madvise/mincore/brk, OOM killer
@@ -625,7 +625,7 @@ The calling convention is the Linux x86_64 one: the call number goes in `rax`, t
 **Performance counters** (`kernel/kstat.c`). The kernel counts, in TSC cycles and without locks, where its time goes:
 - per CPU: time holding the big kernel lock, waiting for it, halted, and the rest (user code);
 - system calls by number: calls, time on the CPU, wall time and the longest single call;
-- page faults by kind (anonymous, file, shared, copy-on-write), with their time, and the pages read from files;
+- page faults by kind (anonymous, file, shared, copy-on-write), with their time, how many were resolved without the big lock (`lockless=`, their time counts as user time), and the pages read from files;
 - block requests per disk (count, bytes, busy time), ext2 block cache hits and misses, and the page cache (files and pages cached, hits, misses, pages read ahead, pages evicted);
 - per process and per thread: run time, system calls, lock waits, faults and I/O.
 
@@ -844,7 +844,7 @@ make usbimg
 
 **Per-CPU data.** In the kernel, the GS base points at the CPU's `struct percpu` (`include/kernel/smp.h`); entries from ring 3 run `SWAPGS`, and NMI, #DF and #MC (which can arrive between `SYSCALL` and its `SWAPGS`) decide from the GS base itself. The running task is read with a single GS-relative load, so a thread that is preempted and moved to another CPU never reads the wrong one.
 
-**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. Disk I/O does not hold it while the device works: USB, SATA and NVMe commands sleep until the controller's MSI wakes them (`io_pause()`/`io_wake()`), and unlocking a kernel mutex wakes only the tasks waiting for it. `/proc/kstat` shows how long each CPU holds the lock and waits for it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
+**Locking.** The kernel's own critical sections were written for one CPU ("interrupts off"). On several CPUs a recursive big kernel lock keeps that true: a CPU holds it whenever it executes kernel code, so kernel code runs on one CPU at a time while user code runs on all of them. The lock depth is saved per task across context switches, and the idle loop and pure computation (kworker/0) let go of it. Disk I/O does not hold it while the device works: USB, SATA and NVMe commands sleep until the controller's MSI wakes them (`io_pause()`/`io_wake()`), and unlocking a kernel mutex wakes only the tasks waiting for it. The frame allocator and the kernel heap have spinlocks of their own, and most user page faults (a zero-filled page, a copy on write, a file page the page cache holds) are resolved straight from the exception without the big lock, under a per-address-space spinlock that `mmap`, `munmap`, `mprotect`, `fork` and the other address-space changes wait for; a fault that needs the disk or anything else goes the usual way. `/proc/kstat` shows how long each CPU holds the lock and waits for it. This is a transitional design: system-call-heavy work does not scale across CPUs yet. Futex buckets and the other short spinlocks are already per-object, with interrupts off while held, and are the starting point for finer locking.
 
 **TLB shootdowns.** When a mapping loses rights or goes away, every CPU that has that address space loaded drops the translation (`invlpg`, or a CR3 reload for large ranges) through an IPI, and the call waits for each to acknowledge before a frame is freed or reused. Waiting for the kernel lock services pending requests, so a shootdown can always complete. Changes to the kernel's identity map (guard pages, cache types) go to every CPU.
 
@@ -864,7 +864,7 @@ make usbimg
 | `dyntest` | a dynamically linked program and shared library through musl's ld.so |
 | `threadtest` | 41 checks: pthreads, TLS, mutex/condvar/semaphore contention, every futex operation and timeout, process-shared futexes, signals and threads, exit/exit_group, fork and execve from threads, robust mutexes, 450 thread lifecycles |
 | `eventtest` | 71 checks: epoll (level, edge, one-shot, nesting, fairness), eventfd, timerfd, signalfd, poll/select sleeps, ppoll masks, `SCM_RIGHTS`, record sockets, POSIX shared memory |
-| `smptest` | CPU count, real parallel speed-up, TLB shootdown (a thread on another CPU loses an unmapped page at once), thread churn across processes, concurrent system calls |
+| `smptest` | CPU count, real parallel speed-up, TLB shootdown (a thread on another CPU loses an unmapped page at once), racing page faults and copy-on-write on four CPUs with forks alongside, thread churn across processes, concurrent system calls |
 
 Together with `libctest`, `proctest`, `ptytest`, `socktest` and the shell script test they pass on 1 and on 4 CPUs (QEMU, `-smp 4 -accel tcg,thread=multi`).
 

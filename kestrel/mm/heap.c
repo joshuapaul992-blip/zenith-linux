@@ -7,13 +7,16 @@
  * are also kept in bins by size (one per power of two), so an allocation
  * looks only at free blocks big enough for it, not at every block: with
  * tens of thousands of blocks (a large program's page cache and mappings)
- * a list walk per kmalloc made the whole kernel crawl. All operations are
- * IRQ-safe. A failed allocation returns NULL: callers turn that into
+ * a list walk per kmalloc made the whole kernel crawl. A spinlock of its
+ * own (interrupts off while held) makes every operation safe from
+ * interrupt handlers and from code running without the big kernel lock;
+ * growing takes the frame allocator's lock inside it. A failed allocation returns NULL: callers turn that into
  * -ENOMEM, never into a crash. */
 #include <kernel/mm.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
 #include <kernel/cpu.h>
+#include <kernel/spinlock.h>
 
 #define HEAP_MAGIC 0x4B4845415055ull      /* "KHEAPU" */
 #define ALIGN      16
@@ -32,6 +35,7 @@ static struct block *head;
 static struct block *bins[NBINS];   /* bin k: free blocks of 2^k to 2^(k+1)-1 bytes */
 static uint64_t bin_map;            /* bit k: bins[k] is not empty */
 static size_t arena_size, used_bytes;
+static struct spinlock lock;        /* everything above */
 
 static int bin_of(size_t size)
 {
@@ -76,7 +80,7 @@ static bool adjacent(const struct block *a, const struct block *b)
     return (const uint8_t *)(a + 1) + a->size == (const uint8_t *)b;
 }
 
-/* Add a new arena of at least `need` payload bytes; interrupts are off. */
+/* Add a new arena of at least `need` payload bytes; the lock is held. */
 static bool heap_grow(size_t need)
 {
     size_t bytes = need + 2 * sizeof(struct block);
@@ -120,7 +124,7 @@ void *kmalloc(size_t n)
     if (!n) return NULL;
     if (n > (1ull << 30)) return NULL;
     n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&lock);
     for (int attempt = 0; attempt < 2; attempt++) {
         struct block *b = find_free(n);
         if (!b) {
@@ -141,10 +145,10 @@ void *kmalloc(size_t n)
         }
         b->free = 0;
         used_bytes += b->size + sizeof(struct block);
-        irq_restore(f);
+        spin_unlock_irqrestore(&lock, f);
         return b + 1;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&lock, f);
     kprintf("heap: out of memory (request %zu bytes)\n", n);
     return NULL;
 }
@@ -161,7 +165,7 @@ void kfree(void *p)
     if (!p) return;
     struct block *b = (struct block *)p - 1;
     if (b->magic != HEAP_MAGIC || b->free) panic("kfree: bad pointer %p", p);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&lock);
     b->free = 1;
     used_bytes -= b->size + sizeof(struct block);
     if (b->next && b->next->free && adjacent(b, b->next)) { /* merge right */
@@ -180,7 +184,7 @@ void kfree(void *p)
         b = l;
     }
     bin_add(b);
-    irq_restore(f);
+    spin_unlock_irqrestore(&lock, f);
 }
 
 void *krealloc(void *p, size_t n)
@@ -200,7 +204,7 @@ void *krealloc_shrink(void *p, size_t n)
     struct block *b = (struct block *)p - 1;
     if (b->magic != HEAP_MAGIC || b->free) panic("krealloc_shrink: bad pointer %p", p);
     n = (n + ALIGN - 1) & ~(size_t)(ALIGN - 1);
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&lock);
     if (b->size >= n + sizeof(struct block) + 64) {
         struct block *nb = (struct block *)((uint8_t *)(b + 1) + n);
         nb->magic = HEAP_MAGIC;
@@ -212,11 +216,11 @@ void *krealloc_shrink(void *p, size_t n)
         used_bytes -= b->size - n;
         b->size = n;
         used_bytes += nb->size + sizeof(struct block);
-        irq_restore(f);
+        spin_unlock_irqrestore(&lock, f);
         kfree(nb + 1);                                      /* merges with any free neighbour */
         return p;
     }
-    irq_restore(f);
+    spin_unlock_irqrestore(&lock, f);
     return p;
 }
 

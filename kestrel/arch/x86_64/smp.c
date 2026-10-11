@@ -109,7 +109,11 @@ void bkl_reacquire(int depth)
     irq_restore(f);
 }
 
-/* ---- TLB shootdowns ------------------------------------------------------------- */
+/* ---- TLB shootdowns -------------------------------------------------------------
+ * Each CPU has one request slot: tlb_pending is 0 (free), 2 (claimed: a
+ * sender is filling it in) or 1 (posted). Senders claim it with a compare-
+ * and-swap, since page faults resolved outside the big kernel lock can shoot
+ * down at the same time as its holder. Whoever waits services its own slot. */
 #define TLB_KERNEL (~0ull)
 #define FLUSH_PAGES_MAX 32
 
@@ -122,7 +126,7 @@ static void flush_local(uint64_t start, uint64_t end)
 void tlb_service(void)
 {
     struct percpu *c = this_cpu();
-    if (!__atomic_load_n(&c->tlb_pending, __ATOMIC_ACQUIRE)) return;
+    if (__atomic_load_n(&c->tlb_pending, __ATOMIC_ACQUIRE) != 1) return;
     uint64_t p = c->tlb_pml4;
     if (p == TLB_KERNEL || (read_cr3() & ADDR_MASK) == p) flush_local(c->tlb_start, c->tlb_end);
     c->tlb_flushes++;
@@ -140,7 +144,11 @@ static void shootdown(uint64_t pml4, uint64_t start, uint64_t end)
         struct percpu *c = &cpus[i];
         if (c == me || !c->online) continue;
         if (pml4 != TLB_KERNEL && c->loaded_cr3 != pml4) continue;   /* nothing cached there */
-        while (__atomic_load_n(&c->tlb_pending, __ATOMIC_ACQUIRE)) { tlb_service(); cpu_relax(); }
+        for (int idle = 0; !__atomic_compare_exchange_n(&c->tlb_pending, &idle, 2, false, __ATOMIC_ACQUIRE,
+                                                        __ATOMIC_RELAXED); idle = 0) {
+            tlb_service();
+            cpu_relax();
+        }
         c->tlb_pml4 = pml4;
         c->tlb_start = start;
         c->tlb_end = end;
