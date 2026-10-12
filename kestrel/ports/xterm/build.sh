@@ -18,6 +18,9 @@
 # Configuration: core fonts (no FreeType), no setuid/utmp helper, no luit,
 # no session management, no input methods, no Tektronix emulation. The
 # shell is $SHELL, else the passwd entry's, else /bin/sh (BusyBox ash).
+# Backspace sends the pty's erase character (DEL, as the kernel sets it):
+# xterm's default is BS whatever the pty says, and a shell without line
+# editing of its own (dash) then shows ^H.
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 SRC=$(cd "$1" && pwd)
@@ -60,7 +63,7 @@ cd "$OUT"
     --x-includes="$SYSROOT/include" --x-libraries="$SYSROOT/lib" \
     --disable-setuid --disable-setgid --without-utempter --disable-freetype --without-xinerama \
     --disable-luit --disable-session-mgt --disable-i18n --disable-tek4014 --disable-desktop \
-    --without-pcre --without-pcre2 \
+    --without-pcre --without-pcre2 --enable-backarrow-is-erase --enable-pty-erase \
     --with-app-defaults=/boot/share/X11/app-defaults \
     --with-own-terminfo=/boot/share/terminfo --enable-env-terminfo \
     --with-icondir=/boot/share/icons --with-pixmapdir=/boot/share/pixmaps >"$BUILD/xterm.log" 2>&1 \

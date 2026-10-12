@@ -406,9 +406,10 @@ static int process_main(void *arg)
     /* PATH as a Linux distribution sets it (Alpine keeps apk in /sbin and
      * most tools in /usr/bin); directories Kestrel lacks are skipped. */
 #define KPATH "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    static char *const envp[] = { KPATH, "HOME=/", "TERM=kestrel", "DISPLAY=:0", "SHELL=/bin/sh" };
-    static char *const console_envp[] = { KPATH, "HOME=/root", "TERM=linux", "SHELL=/bin/sh", "USER=root",
-                                           "LOGNAME=root" };
+    char shell[EXEC_SHELL_MAX + 6] = "SHELL=";     /* xterm runs $SHELL */
+    exec_login_shell(shell + 6, sizeof shell - 6);
+    char *const envp[] = { KPATH, "HOME=/", "TERM=kestrel", "DISPLAY=:0", shell };
+    char *const console_envp[] = { KPATH, "HOME=/root", "TERM=linux", shell, "USER=root", "LOGNAME=root" };
     struct exec_args ea = { a->argc, (int)(sizeof envp / sizeof *envp), a->argv, (char **)envp };
     if (a->ctty) { ea.envc = (int)(sizeof console_envp / sizeof *console_envp); ea.envp = (char **)console_envp; }
     uint64_t entry = 0, sp = 0;
@@ -467,6 +468,34 @@ static int spawn(const char *path, int argc, char *const argv[], const char *std
     struct tcb *t = task_create(name, process_main, a);
     if (!t) { for (int i = 0; i < argc; i++) kfree(a->argv[i]); kfree(a); return -EAGAIN; }
     return t->pid;
+}
+
+/* root's login shell: the last field of its /etc/passwd line, if that
+ * program is there; else /bin/sh. A distribution's root (Ubuntu's, where
+ * /bin/sh is dash) can name bash this way. */
+void exec_login_shell(char *out, size_t n)
+{
+    strlcpy(out, "/bin/sh", n);
+    struct file *f;
+    if (vfs_open("/etc/passwd", O_RDONLY, 0, &f) < 0) return;
+    char *buf = kmalloc(4096);
+    ssize_t len = buf ? vfs_read(f, buf, 4095) : -1;
+    vfs_close(f);
+    if (len <= 0) { kfree(buf); return; }
+    buf[len] = 0;
+    for (char *line = buf; line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = 0;
+        if (!strncmp(line, "root:", 5)) {
+            char *sh = strrchr(line, ':') + 1;
+            struct stat st;
+            if (sh[0] == '/' && vfs_stat(sh, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG && (st.st_mode & 0111))
+                strlcpy(out, sh, n);
+            break;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    kfree(buf);
 }
 
 int exec_spawn_io(const char *path, int argc, char *const argv[], const char *stdio)

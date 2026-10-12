@@ -1187,7 +1187,13 @@ void vfs_init(void)
         "sysfs    /sys          sysfs    ro\n");
     ramfs_write_file("/etc/profile",
         "# /etc/profile -- read by the login shells on the text terminals (kernel/vt.c)\n"
-        "PS1='\\[\\e[92m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[94m\\]\\w\\[\\e[0m\\]\\$ '\n"
+        "if (eval 'x=a; : \"${x//a/b}\"') 2>/dev/null; then    # bash, BusyBox ash: prompt escapes\n"
+        "    PS1='\\[\\e[92m\\]\\u@\\h\\[\\e[0m\\]:\\[\\e[94m\\]\\w\\[\\e[0m\\]\\$ '\n"
+        "else                                                # dash: none, but $PWD expands\n"
+        "    e=$(printf '\\033'); p='$'; [ \"$(id -u)\" = 0 ] && p='#'\n"
+        "    PS1=\"$e[92m$(id -un)@$(hostname 2>/dev/null || cat /etc/hostname)$e[0m:$e[94m\"'$PWD'\"$e[0m$p \"\n"
+        "    unset e p\n"
+        "fi\n"
         "export PS1\n"
         "cd \"$HOME\" 2>/dev/null\n"
         "echo \"$(uname -sr) on $(tty). Ctrl+Alt+F1..F12: other monitors; startx: the desktop.\"\n");

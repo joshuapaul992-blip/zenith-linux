@@ -3,6 +3,7 @@
 # Choose Logout in IceWM's menu to end the session; the X server stops too
 # and the monitors return to their text terminals.
 export DISPLAY=:0
+export NO_AT_BRIDGE=1                  # no accessibility bus: GTK programs would warn
 Xkestrel :0 "$@" &
 xpid=$!
 i=0

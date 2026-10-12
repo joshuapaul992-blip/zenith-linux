@@ -11,8 +11,10 @@
 #define KESTREL_EXEC_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define EXEC_MAX_ARGS   32
+#define EXEC_SHELL_MAX  256             /* a login shell's path, with its NUL */
 
 /* Start `path` with argv[0..argc) as a new process sharing the caller's TTY.
  * Returns its pid, or a negative errno if it could not even be created
@@ -26,6 +28,8 @@ int exec_spawn_io(const char *path, int argc, char *const argv[], const char *st
  * on it, and it becomes the controlling terminal of the new process, which
  * leads its own session. The environment says TERM=linux. */
 int exec_spawn_tty(const char *path, int argc, char *const argv[], const char *tty);
+/* root's login shell from /etc/passwd, else /bin/sh (the text terminals' and $SHELL) */
+void exec_login_shell(char *out, size_t n);
 
 /* Wait for process `pid` to exit; returns its exit status, or -ECHILD. */
 int exec_wait(int pid);

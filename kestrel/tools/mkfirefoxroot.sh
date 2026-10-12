@@ -20,6 +20,8 @@
 #   programs to Kestrel's /dev/dsp and /dev/mixer, and PulseAudio with
 #   module-oss on /dev/dsp (/etc/pulse/kestrel.pa), because Firefox's
 #   official builds play only through PulseAudio (or JACK);
+# - bash as root's login shell, and halt, reboot, poweroff and shutdown
+#   that work without systemd;
 # - /usr/local/bin/firefox, which starts PulseAudio if it is not running
 #   and Firefox with the sandbox off (Kestrel has no seccomp or namespaces
 #   yet), and an IceWM menu for root.
@@ -71,6 +73,28 @@ load-module module-always-sink
 set-default-sink kestrel
 EOF
 sed -i 's/^; autospawn = yes/autospawn = no/' "$ROOT/etc/pulse/client.conf"
+# root logs in to bash (the kernel takes root's shell from /etc/passwd);
+# /bin/sh stays dash
+printf '%s\n' 'root:x:0:0:root:/root:/bin/bash' 'user:x:1000:1000:Kestrel User:/home/user:/bin/bash' \
+    > "$ROOT/etc/passwd"
+# halt, reboot, poweroff and shutdown are systemctl here, which needs
+# systemd: BusyBox's instead (Kestrel's, which tools/mergeroot.py adds)
+for c in halt reboot poweroff; do
+    rm -f "$ROOT/usr/sbin/$c"
+    printf '#!/bin/sh\n# no systemd on Kestrel: BusyBox %s, straight to the kernel\nexec busybox %s -f "$@"\n' \
+        $c $c > "$ROOT/usr/sbin/$c"
+done
+rm -f "$ROOT/usr/sbin/shutdown"
+cat > "$ROOT/usr/sbin/shutdown" <<'EOF'
+#!/bin/sh
+# shutdown [-r|-H|-P] [TIME]: no systemd on Kestrel, so at once, by BusyBox
+case " $* " in
+*" -r "*|*" --reboot "*) exec busybox reboot -f ;;
+*" -H "*|*" --halt "*)   exec busybox halt -f ;;
+esac
+exec busybox poweroff -f
+EOF
+chmod 755 "$ROOT/usr/sbin/halt" "$ROOT/usr/sbin/reboot" "$ROOT/usr/sbin/poweroff" "$ROOT/usr/sbin/shutdown"
 python3 -c "import uuid; print(uuid.uuid4().hex)" > "$ROOT/etc/machine-id"
 mkdir -p "$ROOT/var/lib/dbus" "$ROOT/proc" "$ROOT/sys" "$ROOT/dev" "$ROOT/tmp" "$ROOT/root"
 cp "$ROOT/etc/machine-id" "$ROOT/var/lib/dbus/machine-id"

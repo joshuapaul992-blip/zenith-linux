@@ -140,11 +140,14 @@ void vt_session(int index)
     }
     char dev[16];
     snprintf(dev, sizeof dev, "/dev/tty%d", index + 1);
-    char *argv[] = { "-sh" };                           /* a login shell: reads /etc/profile */
     int quick = 0;
     for (;;) {
         uint64_t start = uptime_ms();
-        int pid = exec_spawn_tty("/bin/sh", 1, argv, dev);
+        char sh[EXEC_SHELL_MAX], arg0[EXEC_SHELL_MAX + 1] = "-";
+        exec_login_shell(sh, sizeof sh);                /* root's, from /etc/passwd */
+        strlcat(arg0, strrchr(sh, '/') + 1, sizeof arg0);
+        char *argv[] = { arg0 };                        /* "-bash": a login shell, reads /etc/profile */
+        int pid = exec_spawn_tty(sh, 1, argv, dev);
         int st = pid < 0 ? pid : exec_wait(pid);
         pty_console_hangup(v->pty);
         task_sleep_ms(50);                              /* let its last output reach the screen */
