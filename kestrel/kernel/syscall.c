@@ -3042,15 +3042,31 @@ static bool syscall_fast(struct int_frame *f)
     return true;
 }
 
-/* Per call number: on-CPU and wall cycles, the longest call (kstat.h) */
+/* Calls that run without the big kernel lock: they keep their own locks
+ * and sleep through the scheduler lock. Private futexes (the futex.c
+ * buckets; a shared one needs the address space's mappings) and yields --
+ * every pthread lock, condition variable and join of a busy program. */
+#define FUTEX_PRIVATE_FLAG 128
+static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
+{
+    switch (nr) {
+    case SYS_futex:       return (f->rsi & FUTEX_PRIVATE_FLAG) != 0;
+    case SYS_sched_yield: return true;
+    default:              return false;
+    }
+}
+
+/* Per call number: on-CPU and wall cycles, the longest call (kstat.h).
+ * Updated with atomics: lock-free calls count here too. */
 static uint64_t cost_cpu[SYS_MAX], cost_wall[SYS_MAX], cost_max[SYS_MAX];
 
 int syscall_dispatch(struct int_frame *f)
 {
     if (syscall_fast(f)) return 0;
-    bkl_enter();                                        /* kernel code: one CPU at a time */
     uint64_t nr = f->rax;
     struct tcb *t = current_task();
+    bool locked = strace_pat[0] || !t->user || !syscall_nolock(nr, f);
+    if (locked) bkl_enter();                            /* kernel code: one CPU at a time */
     if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
         static uint8_t warned[SYS_MAX + 1];
         uint64_t k = nr < SYS_MAX ? nr : SYS_MAX;
@@ -3061,7 +3077,7 @@ int syscall_dispatch(struct int_frame *f)
         }
         f->rax = (uint64_t)-ENOSYS;
     } else {
-        counts[nr]++;
+        __atomic_add_fetch(&counts[nr], 1, __ATOMIC_RELAXED);
         t->uframe = f;
         t->iret_return = false;
         bool tr = strace_on(t);
@@ -3074,8 +3090,9 @@ int syscall_dispatch(struct int_frame *f)
         f->rax = (uint64_t)r;
         cli();
         uint64_t wall = rdtsc() - w0, cpu = kstat_run_cycles(t) - c0;
-        cost_cpu[nr] += cpu; cost_wall[nr] += wall;
-        if (cpu > cost_max[nr]) cost_max[nr] = cpu;
+        __atomic_add_fetch(&cost_cpu[nr], cpu, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&cost_wall[nr], wall, __ATOMIC_RELAXED);
+        if (cpu > cost_max[nr]) cost_max[nr] = cpu;     /* a race only loses a maximum */
         t->ks.sys_n++; t->ks.sys_cyc += cpu; t->ks.sys_wall += wall;
         struct kstat_cpu *k = &this_cpu()->ks;
         k->sys_n++; k->sys_cyc += cpu;
@@ -3087,11 +3104,16 @@ int syscall_dispatch(struct int_frame *f)
             signal_send_thread(t, SIGPIPE, NULL);
         cli();
     }
-    if (t->user && (f->cs & 3) == 3) signal_deliver(f, nr, true);
+    if (t->user && (f->cs & 3) == 3) {
+        /* signals are delivered under the lock: a lock-free call that has
+         * one to deliver (or a wait's mask to restore) takes it now */
+        if (!locked && (signal_pending() || t->saved_mask_valid)) { bkl_enter(); locked = true; }
+        if (locked) signal_deliver(f, nr, true);
+    }
     int iret = t->iret_return;
     t->iret_return = false;
     cli();
-    bkl_exit();
+    if (locked) bkl_exit();
     return iret;
 }
 

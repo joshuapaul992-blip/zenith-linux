@@ -293,8 +293,16 @@ static bool lockless(struct int_frame *f)
         return true;
     case 8: case 18:                                    /* #DF, #MC: state unknown, stop */
         kernel_exception(f);
-    case 14:                                            /* most user page faults (vm.c) */
-        return (f->cs & 3) == 3 && vm_fault_fast(read_cr2(), f->error);
+    case 14: {                                          /* most user page faults (vm.c) */
+        if ((f->cs & 3) == 3) return vm_fault_fast(read_cr2(), f->error);
+        /* a no-fault user access (page faults off, maybe under a spinlock
+         * whose holder must not wait for the kernel lock): straight to the
+         * fixup */
+        uint64_t addr = read_cr2(), fix;
+        if (!pagefault_disabled() || !user_range_ok(addr, 1) || !(fix = extable_fixup(f->rip))) return false;
+        f->rip = fix;
+        return true;
+    }
     case VEC_TLB:
         tlb_service();
         lapic_eoi();
@@ -320,13 +328,15 @@ void isr_dispatch(struct int_frame *f)
     struct kstat_cpu *k = &this_cpu()->ks;
     if (k->idle_tsc) { k->idle_cyc += rdtsc() - k->idle_tsc; k->idle_tsc = 0; }   /* woken from hlt */
     if (lockless(f)) return;
+    if (f->vector == SYSCALL_VECTOR) {                  /* takes the lock itself, if the call needs it, */
+        syscall_dispatch(f);                            /* and delivers signals                         */
+        cli();
+        return;
+    }
     bkl_enter();
     bool user = (f->cs & 3) == 3;
     if (f->vector < 32) {
         exception(f);
-    } else if (f->vector == SYSCALL_VECTOR) {
-        syscall_dispatch(f);                            /* delivers signals itself */
-        user = false;
     } else if (f->vector >= IRQ_BASE && f->vector < IRQ_BASE + 16) {
         int irq = (int)f->vector - IRQ_BASE;
         if (apic_enabled()) {

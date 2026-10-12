@@ -8,14 +8,17 @@ section .text
 global context_switch
 global thread_trampoline
 extern task_exit
+extern sched_switch_tail
 
 ; -----------------------------------------------------------------------------
-; void context_switch(uint64_t *save_rsp, uint64_t load_rsp);
+; void context_switch(uint64_t *save_rsp, uint64_t load_rsp, int *saved);
 ;
 ; Saves the callee-saved registers and RFLAGS of the current thread on its
-; own kernel stack, stores RSP into *save_rsp, switches to load_rsp and
-; restores the next thread's registers. Caller-saved registers are already
-; preserved by the C calling convention.
+; own kernel stack, stores RSP into *save_rsp, clears *saved (the thread's
+; on_cpu: another CPU may resume it from here on, so the old stack is not
+; touched again), switches to load_rsp and restores the next thread's
+; registers. Caller-saved registers are already preserved by the C calling
+; convention.
 ; Saved frame (low -> high): r15 r14 r13 r12 rbp rbx rflags return-rip
 ; -----------------------------------------------------------------------------
 context_switch:
@@ -27,6 +30,7 @@ context_switch:
     push    r14
     push    r15
     mov     [rdi], rsp
+    mov     dword [rdx], 0              ; a release store under x86 ordering
     mov     rsp, rsi
     pop     r15
     pop     r14
@@ -42,9 +46,11 @@ context_switch:
 ; context_switch frame whose return address points here, with
 ;     rbx = entry function,  r12 = argument.
 ; New threads begin with interrupts disabled (we were switched to from inside
-; the scheduler), so enable them before running the thread body.
+; the scheduler): finish the switch as schedule() would (the big kernel lock),
+; then enable them and run the thread body.
 ; -----------------------------------------------------------------------------
 thread_trampoline:
+    call    sched_switch_tail
     sti
     mov     rdi, r12
     call    rbx

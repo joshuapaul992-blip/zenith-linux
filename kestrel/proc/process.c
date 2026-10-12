@@ -246,8 +246,8 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (newsp) cf->rsp = newsp;
     cf->vector = (flags & CLONE_CHILD_SETTID) ? ctid : 0;   /* fork_child_entry writes the tid there */
 
-    uint64_t fl = irq_save();                           /* the child must not run half-built */
-    struct tcb *c = task_create(p->name, fork_child_entry, cf);
+    uint64_t fl = irq_save();
+    struct tcb *c = task_create_paused(p->name, fork_child_entry, cf);   /* must not run half-built */
     if (!c) { irq_restore(fl); kfree(cf); cf = NULL; mm_put(mm); mm = NULL; goto again; }
     files_put(c->files); c->files = files;
     fs_put(c->fs); c->fs = fs;
@@ -288,6 +288,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (flags & CLONE_VFORK) c->vfork_parent = p->pid;
     int pid = c->pid;
     if (flags & CLONE_PARENT_SETTID) put_user_u32((void *)ptid, (uint32_t)pid);
+    task_start(c);
 
     /* vfork: the parent waits until the child has its own address space */
     while ((flags & CLONE_VFORK) && c->pid == pid && c->vfork_parent == p->pid && c->state != TASK_UNUSED)

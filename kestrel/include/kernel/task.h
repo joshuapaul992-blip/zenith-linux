@@ -147,6 +147,8 @@ struct tcb {
 
     int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
     int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */
+    bool      sched_cur;        /* some CPU's current task (under the scheduler lock) */
+    int       on_cpu;           /* until its registers are saved at a switch-out    */
     struct kstat_task ks;       /* performance counters (kstat.h)            */
     int       fault_kind;       /* what the page fault in progress did (enum kfault) */
 };
@@ -168,8 +170,11 @@ void        sched_set_preemption(bool on);
 bool        sched_preemption(void);
 struct tcb *current_task(void);
 struct tcb *task_create(const char *name, int (*entry)(void *), void *arg);
+struct tcb *task_create_paused(const char *name, int (*entry)(void *), void *arg);
+void        task_start(struct tcb *t);  /* a paused task: runnable from now on */
 __attribute__((noreturn)) void task_exit(int code);
 void        schedule(void);             /* call with interrupts disabled */
+void        sched_switch_tail(void);    /* the arriving task: its kernel lock back */
 void        sched_yield(void);
 void        task_set_idle_class(struct tcb *t);  /* background work (kworker/0) */
 void        sched_tick(void);           /* boot CPU timer: sleepers, alarms, slice */
