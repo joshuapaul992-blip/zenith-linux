@@ -89,7 +89,31 @@ C_SRC   := kernel/kernel.c kernel/klog.c kernel/kstat.c kernel/vdso.c kernel/sys
            drivers/net/virtio_net.c drivers/net/e1000.c drivers/net/rtl8139.c drivers/sound/hda.c drivers/net/rtl8169.c \
            lib/string.c lib/printf.c
 
-OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC))
+# ---- the Linux KPI (linuxkpi/, see README.md): Linux driver code, built
+# against the KPI's own <linux/...> headers instead of Kestrel's. The glue
+# (linuxkpi/glue) is ordinary Kestrel code. Unmodified upstream drivers live
+# in third_party/linux; within an initcall level they run in the order
+# listed here (pvpanic.c registers its notifier before pvpanic-pci probes).
+C_SRC += linuxkpi/glue/kestrel.c linuxkpi/glue/devfs.c
+LKPI_SRC := linuxkpi/src/printk.c linuxkpi/src/vsprintf.c linuxkpi/src/lib.c linuxkpi/src/slab.c \
+            linuxkpi/src/page.c linuxkpi/src/sched.c linuxkpi/src/kthread.c linuxkpi/src/timer.c \
+            linuxkpi/src/workqueue.c linuxkpi/src/irq.c linuxkpi/src/device.c linuxkpi/src/pci.c \
+            linuxkpi/src/dma.c linuxkpi/src/io.c linuxkpi/src/firmware.c linuxkpi/src/notifier.c \
+            linuxkpi/src/chardev.c linuxkpi/src/watchdog.c linuxkpi/src/idr.c linuxkpi/src/module.c \
+            linuxkpi/src/selftest.c
+LKPI_DRV_SRC := third_party/linux/drivers/misc/pvpanic/pvpanic.c \
+                third_party/linux/drivers/misc/pvpanic/pvpanic-pci.c \
+                third_party/linux/drivers/watchdog/i6300esb.c
+LKPI_OBJS     := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_SRC))
+LKPI_DRV_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(LKPI_DRV_SRC))
+LKPI_CFLAGS := $(filter-out -I% -W% -MMD -MP,$(CFLAGS)) -nostdinc -D__KERNEL__ \
+               -Ilinuxkpi/include -include linuxkpi/include/linux/kconfig.h \
+               -include linuxkpi/include/linux/compiler_types.h \
+               -fno-strict-aliasing -fno-delete-null-pointer-checks -fno-strict-overflow -fno-common \
+               -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -MMD -MP
+
+OBJS   := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRC)) $(patsubst %.c,$(BUILD)/%.o,$(C_SRC)) \
+          $(LKPI_OBJS) $(LKPI_DRV_OBJS)
 KERNEL := $(BUILD)/kernel.elf
 ISO    := $(BUILD)/kestrel.iso
 FLOPPY := $(BUILD)/kestrel-floppy.img
@@ -117,6 +141,18 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	@echo "  CC      $<"
 	@$(CC) $(CFLAGS) -c $< -o $@
+
+# The Linux KPI and the Linux drivers: KBUILD_MODNAME is the file's name,
+# '-' turned into '_', as Kbuild does for a one-file module.
+$(LKPI_OBJS): $(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC [K]  $<"
+	@$(CC) $(LKPI_CFLAGS) -c $< -o $@
+
+$(LKPI_DRV_OBJS): $(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	@echo "  CC [L]  $<"
+	@$(CC) $(LKPI_CFLAGS) -DKBUILD_MODNAME='"$(subst -,_,$(basename $(notdir $<)))"' -c $< -o $@
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)

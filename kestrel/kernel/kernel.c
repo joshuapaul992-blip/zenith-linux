@@ -38,6 +38,7 @@
 #include <kernel/storage.h>
 #include <kernel/usbhost.h>
 #include <kernel/tty.h>
+#include <kernel/linuxkpi.h>
 #include <kernel/kinput.h>
 #include <kernel/display.h>
 #include <kernel/report.h>
@@ -499,6 +500,8 @@ void kernel_main(uint32_t magic, uintptr_t mbi)
     net_init();
     /* HD Audio: /dev/dsp and /dev/mixer */
     hda_init();
+    /* Linux drivers built in through the Linux KPI (linuxkpi/): they probe now */
+    linuxkpi_init();
 
     /* No serial port on many machines: write REPORT.TXT (and the video BIOS)
      * to the stick's "KESTREL RPT" volume, if there is one. */
