@@ -25,7 +25,13 @@
  * Programs get the OSS interface: /dev/dsp (write PCM; S16_LE, U8, S32_LE,
  * mono or stereo, the rates the codec supports) and /dev/mixer (playback
  * volume). The hardware always runs 16-bit stereo; other formats are
- * converted on the way in. */
+ * converted on the way in.
+ *
+ * Locking, without the big kernel lock: `slock` (a spinlock) guards the
+ * stream and the codec link (the ring accounting, starting and stopping,
+ * verbs); `dsp_mutex` serialises /dev/dsp's writers and its ioctls, which
+ * share the conversion state and may sleep. The kernel thread lets go of
+ * the big lock; writes and polls of /dev/dsp run without it. */
 #include <kernel/sound.h>
 #include <kernel/vfs.h>
 #include <kernel/task.h>
@@ -36,7 +42,12 @@
 #include <kernel/string.h>
 #include <kernel/uaccess.h>
 #include <kernel/process.h>
+#include <kernel/smp.h>
+#include <kernel/spinlock.h>
 #include "../pci/pci.h"
+
+static struct spinlock slock;           /* the stream and the codec link */
+static struct kmutex dsp_mutex;         /* /dev/dsp writers and ioctls   */
 
 /* ---- controller registers ---------------------------------------------------- */
 enum {
@@ -626,8 +637,9 @@ static int hdad_main(void *arg)
 {
     (void)arg;
     uint64_t dry_since = 0;
+    bkl_release_all();                                  /* slock is all it needs */
     for (;;) {
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         if (hda.running) {
             update();
             if (!queued() && !dsp_open_count) {
@@ -636,7 +648,7 @@ static int hdad_main(void *arg)
             } else dry_since = 0;
             wakeup(&hda);
         }
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         task_sleep_ms(hda.running ? 4 : 50);
     }
     return 0;
@@ -647,6 +659,7 @@ static void set_volume(int v)
 {
     if (v < 0) v = 0;
     if (v > 100) v = 100;
+    uint64_t fl = spin_lock_irqsave(&slock);            /* verbs: the codec link */
     hda.volume = v;
     for (int i = 0; i < hda.nvol; i++) {
         struct widget *w = &hda.w[hda.vol_nid[i]];
@@ -656,6 +669,7 @@ static void set_volume(int v)
         int g = top * v / 100;
         set_amp(hda.vol_nid[i], hda.vol_out[i], 0, g, v == 0);
     }
+    spin_unlock_irqrestore(&slock, fl);
 }
 
 /* ---- /dev/dsp ---------------------------------------------------------------------------- */
@@ -727,13 +741,13 @@ static void dsp_apply_rate(void)
     dsp.phase = 0;
     dsp.prev[0] = dsp.prev[1] = 0;
     if (fmt != hda.fmt || hda.rate != hw) {
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         bool was = hda.running;
         stream_stop();
         hda.fmt = fmt;
         hda.rate = hw;
         if (was) stream_start();
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
     }
 }
 
@@ -763,20 +777,30 @@ static void dsp_release(struct file *f)
 /* write: convert, wait for room (unless O_NONBLOCK), copy into the ring.
  * Room means a fragment, or all of a smaller write: a nonblocking writer
  * gets EAGAIN instead of a trickle of tiny writes. */
+static ssize_t dsp_write_locked(struct file *f, const void *buf, size_t len);
+
 static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
 {
     if (!hda.ready) return -EIO;
+    kmutex_lock(&dsp_mutex);
+    ssize_t r = dsp_write_locked(f, buf, len);
+    kmutex_unlock(&dsp_mutex);
+    return r;
+}
+
+static ssize_t dsp_write_locked(struct file *f, const void *buf, size_t len)
+{
     const uint8_t *p = buf;
     size_t done = 0;
     int fb = in_frame_bytes();
     static int16_t tmp[2 * 2048];
     const int cap = 2048;
     while (done < len) {
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         if (!hda.running) stream_start();
         update();
         uint32_t room = space();
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         uint64_t want = (uint64_t)(len - done) / (uint64_t)fb * 4;          /* output bytes, about */
         if (dsp.resample) want = want * (uint64_t)hda.rate / (uint64_t)dsp.rate + 8;
         uint32_t need = want < FRAG_BYTES ? (uint32_t)want : FRAG_BYTES;
@@ -785,7 +809,9 @@ static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
             if (done) break;                            /* a short write; the caller writes the rest */
             if (f->flags & O_NONBLOCK) return -EAGAIN;
             if (signal_pending()) return -ERESTARTSYS;
+            kmutex_unlock(&dsp_mutex);                  /* ioctls (GETODELAY...) go on meanwhile */
             task_sleep_ms(4);
+            kmutex_lock(&dsp_mutex);
             continue;
         }
         /* a partial frame left over from the last call first */
@@ -793,7 +819,7 @@ static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
             while (dsp.ncarry < fb && done < len) dsp.carry[dsp.ncarry++] = p[done++];
             if (dsp.ncarry < fb) break;
             int n = convert(dsp.carry, 1, tmp, cap);
-            fl = irq_save(); put_frames(tmp, (uint32_t)n * 4); irq_restore(fl);
+            fl = spin_lock_irqsave(&slock); put_frames(tmp, (uint32_t)n * 4); spin_unlock_irqrestore(&slock, fl);
             dsp.ncarry = 0;
             continue;
         }
@@ -808,9 +834,9 @@ static ssize_t dsp_fwrite(struct file *f, const void *buf, size_t len)
         if (!max) max = 1;
         if (frames > max) frames = max;
         int n = convert(p + done, (int)frames, tmp, cap);
-        fl = irq_save();
+        fl = spin_lock_irqsave(&slock);
         put_frames(tmp, (uint32_t)n * 4);
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         done += frames * (size_t)fb;
     }
     return (ssize_t)done;
@@ -820,40 +846,52 @@ static int dsp_poll(struct file *f, int events)
 {
     (void)f;
     poll_wait(&hda);                                    /* and the 4 ms poll deadline */
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&slock);
     update();
     int r = (hda.ready && space() >= FRAG_BYTES) ? (events & (POLLOUT | POLLWRNORM)) : 0;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&slock, fl);
     return r;
 }
 
-static uint64_t dsp_poll_deadline(struct file *f) { (void)f; return hda.running ? time_ms() + 4 : 0; }
+static uint64_t dsp_poll_deadline(struct file *f) { (void)f; return __atomic_load_n(&hda.running, __ATOMIC_RELAXED) ? time_ms() + 4 : 0; }
 
 
 static int put_int(void *arg, int v) { return copy_to_user(arg, &v, sizeof v) ? -EFAULT : 0; }
 static int get_int(void *arg, int *v) { return copy_from_user(v, arg, sizeof *v) ? -EFAULT : 0; }
 
+static int dsp_ioctl_locked(struct file *f, unsigned long req, void *arg);
+
 static int dsp_ioctl(struct file *f, unsigned long req, void *arg)
+{
+    kmutex_lock(&dsp_mutex);
+    int r = dsp_ioctl_locked(f, req, arg);
+    kmutex_unlock(&dsp_mutex);
+    return r;
+}
+
+static int dsp_ioctl_locked(struct file *f, unsigned long req, void *arg)
 {
     int v, r;
     switch ((uint32_t)req) {
     case 0x5000:                                        /* SNDCTL_DSP_RESET */
     case 0x5008: {                                      /* SNDCTL_DSP_POST */
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         if (req == 0x5000 && hda.running) { update(); hda.written = hda.played; memset(hda.ring, 0, RING_BYTES); }
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         dsp.ncarry = 0;
         return 0;
     }
     case 0x5001:                                        /* SNDCTL_DSP_SYNC: until played */
         for (;;) {
-            uint64_t fl = irq_save();
+            uint64_t fl = spin_lock_irqsave(&slock);
             update();
             uint32_t q = hda.running ? queued() : 0;
-            irq_restore(fl);
+            spin_unlock_irqrestore(&slock, fl);
             if (!q) return 0;
             if (signal_pending()) return -ERESTARTSYS;
+            kmutex_unlock(&dsp_mutex);
             task_sleep_ms(4);
+            kmutex_lock(&dsp_mutex);
         }
     case 0xC0045002:                                    /* SNDCTL_DSP_SPEED */
         if ((r = get_int(arg, &v))) return r;
@@ -888,10 +926,10 @@ static int dsp_ioctl(struct file *f, unsigned long req, void *arg)
     case 0x8004500B:                                    /* SNDCTL_DSP_GETFMTS */
         return put_int(arg, AFMT_U8 | AFMT_S16_LE | AFMT_S32_LE);
     case 0x8010500C: {                                  /* SNDCTL_DSP_GETOSPACE */
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         update();
         uint32_t room = hda.running ? space() : RING_BYTES - GUARD;
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         int fs = to_in_bytes(FRAG_BYTES), b = to_in_bytes(room);
         int info[4] = { b / fs, to_in_bytes(RING_BYTES - GUARD) / fs, fs, b };
         return copy_to_user(arg, info, sizeof info) ? -EFAULT : 0;
@@ -906,17 +944,17 @@ static int dsp_ioctl(struct file *f, unsigned long req, void *arg)
     case 0x40045010:                                    /* SNDCTL_DSP_SETTRIGGER */
         return 0;
     case 0x800C5012: {                                  /* SNDCTL_DSP_GETOPTR */
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         update();
         int ci[3] = { to_in_bytes(hda.played), (int)(hda.played / FRAG_BYTES), to_in_bytes(hda.last_pos) };
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         return copy_to_user(arg, ci, sizeof ci) ? -EFAULT : 0;
     }
     case 0x80045017: {                                  /* SNDCTL_DSP_GETODELAY */
-        uint64_t fl = irq_save();
+        uint64_t fl = spin_lock_irqsave(&slock);
         update();
         int d = hda.running ? to_in_bytes(queued()) : 0;
-        irq_restore(fl);
+        spin_unlock_irqrestore(&slock, fl);
         return put_int(arg, d);
     }
     case 0x80044D76:                                    /* OSS_GETVERSION */
@@ -928,7 +966,7 @@ static int dsp_ioctl(struct file *f, unsigned long req, void *arg)
 
 static const struct vnode_ops dsp_ops = {
     .open = dsp_open, .fwrite = dsp_fwrite, .poll = dsp_poll, .release = dsp_release,
-    .fioctl = dsp_ioctl, .poll_deadline = dsp_poll_deadline,
+    .fioctl = dsp_ioctl, .poll_deadline = dsp_poll_deadline, .nolock = true,
 };
 
 /* ---- /dev/mixer -------------------------------------------------------------------------- */
