@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/epoll.h>
 #include <fcntl.h>
 #include <poll.h>
 
@@ -354,6 +355,61 @@ static void *ev_adder(void *arg)
     return NULL;
 }
 
+/* Edge-triggered epoll over socket pairs written from other CPUs: read
+ * until EAGAIN after each report, as event loops do. */
+#define EP_PAIRS 4
+#define EP_BYTES (512 << 10)
+static void *ep_writer(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    unsigned char buf[1500];
+    for (long pos = 0; pos < EP_BYTES; ) {
+        long n = EP_BYTES - pos < (long)sizeof buf ? EP_BYTES - pos : (long)sizeof buf;
+        for (long i = 0; i < n; i++) buf[i] = (unsigned char)((pos + i) % 251);
+        ssize_t w = write(fd, buf, (size_t)n);
+        if (w < 0 && errno == EAGAIN) { sched_yield(); continue; }
+        if (w <= 0) { us_errors++; return NULL; }
+        pos += w;
+    }
+    return NULL;
+}
+
+static int epoll_round(void)
+{
+    us_errors = 0;
+    int sv[EP_PAIRS][2], ep = epoll_create1(0);
+    long got[EP_PAIRS] = { 0 };
+    pthread_t w[EP_PAIRS];
+    if (ep < 0) return 1;
+    for (int i = 0; i < EP_PAIRS; i++) {
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0, sv[i])) return 1;
+        struct epoll_event e = { .events = EPOLLIN | EPOLLET, .data.u32 = (uint32_t)i };
+        if (epoll_ctl(ep, EPOLL_CTL_ADD, sv[i][1], &e)) return 1;
+    }
+    for (int i = 0; i < EP_PAIRS; i++) pthread_create(&w[i], NULL, ep_writer, (void *)(intptr_t)sv[i][0]);
+    long total = 0;
+    unsigned char buf[4096];
+    while (total < (long)EP_PAIRS * EP_BYTES) {
+        struct epoll_event ev[EP_PAIRS];
+        int n = epoll_wait(ep, ev, EP_PAIRS, 5000);
+        if (n <= 0) { us_errors++; break; }
+        for (int k = 0; k < n; k++) {
+            int i = (int)ev[k].data.u32;
+            for (;;) {
+                ssize_t r = read(sv[i][1], buf, sizeof buf);
+                if (r < 0 && errno == EAGAIN) break;
+                if (r <= 0) { us_errors++; break; }
+                for (ssize_t j = 0; j < r; j++) if (buf[j] != (unsigned char)((got[i] + j) % 251)) { us_errors++; break; }
+                got[i] += r;
+                total += r;
+            }
+        }
+    }
+    for (int i = 0; i < EP_PAIRS; i++) { pthread_join(w[i], NULL); close(sv[i][0]); close(sv[i][1]); }
+    close(ep);
+    return us_errors;
+}
+
 static int pipe_poll_round(void)
 {
     us_errors = 0;
@@ -463,6 +519,9 @@ int main(void)
     int pbad = 0;
     for (int r = 0; r < 2; r++) pbad += pipe_poll_round();
     CHECK(pbad == 0, "4 pipes x 1 MiB read after poll, 4 threads x 5000 eventfd adds summed (2 rounds)");
+    int ebad = 0;
+    for (int r = 0; r < 2; r++) ebad += epoll_round();
+    CHECK(ebad == 0, "4 sockets x 512 KiB through edge-triggered epoll, read to EAGAIN (2 rounds)");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

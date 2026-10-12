@@ -16,8 +16,15 @@
  * "read until EAGAIN, then wait" loop never misses data. EPOLLONESHOT
  * disables a watch after one report until EPOLL_CTL_MOD.
  *
- * The list is changed and scanned with interrupts off; epoll sets inside
- * epoll sets are allowed to a depth of 4, and loops are refused (ELOOP).
+ * All watches of all sets are guarded by one spinlock (ep_lock), so I/O
+ * on a watched file re-arms its edge-triggered watches without the big
+ * kernel lock. A set whose watched files all do without that lock
+ * (vnode_ops.nolock: sockets, pipes, eventfds) is waited on and polled
+ * without it; a set with any other file (a device, a timerfd, another set)
+ * takes it first, since that file's poll op expects it (lock_for_scan).
+ * Lock order: the big lock, ep_lock, then the watched files' own locks.
+ * Epoll sets inside epoll sets are allowed to a depth of 4, and loops are
+ * refused (ELOOP).
  * Reported watches move to the end of the list: with maxevents smaller
  * than the number of ready files, every file still gets its turn. */
 #include <kernel/vfs.h>
@@ -27,6 +34,8 @@
 #include <kernel/cpu.h>
 #include <kernel/time.h>
 #include <kernel/string.h>
+#include <kernel/smp.h>
+#include <kernel/spinlock.h>
 
 #define EPOLLIN        0x001
 #define EPOLLPRI       0x002
@@ -74,9 +83,11 @@ struct eventpoll {
     struct vnode   vn;                  /* vn.data == this */
     struct epitem *items;
     int            nitems;
+    int            locked_items;        /* watches whose file needs the big lock to be polled */
 };
 
 static const struct vnode_ops epoll_ops;
+static struct spinlock ep_lock;         /* every set's items, every file's ep_links */
 
 bool epoll_is(struct file *f) { return f && f->vn && f->vn->ops == &epoll_ops; }
 static struct eventpoll *ep_of(struct file *f) { return f->vn->data; }
@@ -101,10 +112,30 @@ static void unlink_from_file(struct epitem *it)
         if (*pp == it) { *pp = it->fnext; return; }
 }
 
+/* Polling f needs the big kernel lock (another set: its own files may). */
+static bool needs_bkl(struct file *f) { return !file_nolock(f) || epoll_is(f); }
+
 static void unlink_from_ep(struct epitem *it)
 {
     for (struct epitem **pp = &it->ep->items; *pp; pp = &(*pp)->next)
-        if (*pp == it) { *pp = it->next; it->ep->nitems--; return; }
+        if (*pp == it) {
+            *pp = it->next;
+            it->ep->nitems--;
+            if (needs_bkl(it->file)) it->ep->locked_items--;
+            return;
+        }
+}
+
+/* ep_lock, with the big lock taken first if a watched file needs it (kept
+ * to the end of the system call, as fget does). */
+static uint64_t lock_for_scan(struct eventpoll *ep)
+{
+    for (;;) {
+        uint64_t fl = spin_lock_irqsave(&ep_lock);
+        if (!ep->locked_items || bkl_depth()) return fl;
+        spin_unlock_irqrestore(&ep_lock, fl);
+        bkl_enter();
+    }
 }
 
 /* Is `target` (an epoll set) or anything nested in it the set `ep`? */
@@ -131,7 +162,7 @@ int epoll_ctl_file(struct file *epf, int op, int fd, struct file *target, uint32
     if (target == epf) return -EINVAL;
     if (op != EPOLL_CTL_DEL && (events & ~(uint32_t)(EPOLL_EVENTS | EPOLL_FLAGS))) return -EINVAL;
     if (!target->vn || !target->vn->ops || !target->vn->ops->poll) return -EPERM;   /* regular files */
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&ep_lock);
     struct epitem *it = find(ep, target, fd);
     int r = 0;
     switch (op) {
@@ -139,9 +170,9 @@ int epoll_ctl_file(struct file *epf, int op, int fd, struct file *target, uint32
         if (it) { r = -EEXIST; break; }
         if (ep->nitems >= MAX_WATCHES) { r = -ENOSPC; break; }
         if (epoll_is(target) && reaches(ep_of(target), ep, 1)) { r = -ELOOP; break; }
-        irq_restore(fl);
+        spin_unlock_irqrestore(&ep_lock, fl);
         it = kzalloc(sizeof *it);
-        fl = irq_save();
+        fl = spin_lock_irqsave(&ep_lock);
         if (!it) { r = -ENOMEM; break; }
         if (find(ep, target, fd)) { kfree(it); r = -EEXIST; break; }    /* raced with another thread */
         it->ep = ep;
@@ -153,6 +184,7 @@ int epoll_ctl_file(struct file *epf, int op, int fd, struct file *target, uint32
         it->next = ep->items;                           /* new watches are looked at first */
         ep->items = it;
         ep->nitems++;
+        if (needs_bkl(target)) ep->locked_items++;
         it->fnext = target->ep_links;
         target->ep_links = it;
         break;
@@ -173,7 +205,7 @@ int epoll_ctl_file(struct file *epf, int op, int fd, struct file *target, uint32
     default:
         r = -EINVAL;
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&ep_lock, fl);
     if (!r) wakeup(ep);                                 /* a waiter may have something to report now */
     return r;
 }
@@ -181,29 +213,33 @@ int epoll_ctl_file(struct file *epf, int op, int fd, struct file *target, uint32
 /* The last descriptor of f is going: drop every watch on it. */
 void epoll_file_closing(struct file *f)
 {
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&ep_lock);
     while (f->ep_links) {
         struct epitem *it = f->ep_links;
         f->ep_links = it->fnext;
         unlink_from_ep(it);
         kfree(it);
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&ep_lock, fl);
 }
 
 void epoll_file_used(struct file *f)
 {
+    if (!__atomic_load_n(&f->ep_links, __ATOMIC_RELAXED)) return;
+    uint64_t fl = spin_lock_irqsave(&ep_lock);
     for (struct epitem *it = f->ep_links; it; it = it->fnext) it->et_seen = 0;
+    spin_unlock_irqrestore(&ep_lock, fl);
 }
 
-static int epoll_poll(struct file *f, int events);
+static int scan(struct eventpoll *ep, struct kepoll_event *out, int max, bool peek, uint64_t *deadline, int depth);
 
 /* Readiness of one watch, in EPOLL* bits (always including ERR and HUP). */
 static uint32_t item_ready(struct epitem *it, int depth)
 {
     uint32_t want = it->events;
     int r;
-    if (epoll_is(it->file)) r = depth < MAX_DEPTH ? epoll_poll(it->file, POLLIN) : 0;
+    if (epoll_is(it->file))                             /* a set in the set: ep_lock is held already */
+        r = depth < MAX_DEPTH && scan(ep_of(it->file), NULL, 1, true, NULL, depth + 1) ? POLLIN : 0;
     else r = vfs_poll(it->file, POLLIN | POLLPRI | POLLOUT | POLLERR | POLLHUP);
     uint32_t rev = (uint32_t)r & (EPOLLERR | EPOLLHUP);
     if (r & POLLIN) rev |= want & (EPOLLIN | EPOLLRDNORM);
@@ -213,7 +249,7 @@ static uint32_t item_ready(struct epitem *it, int depth)
     return rev;
 }
 
-/* Collect up to max events (interrupts off). `peek`: only say whether any
+/* Collect up to max events (ep_lock held). `peek`: only say whether any
  * would be reported, changing nothing. *deadline: the earliest time a
  * watched file's readiness changes by itself. */
 static int scan(struct eventpoll *ep, struct kepoll_event *out, int max, bool peek, uint64_t *deadline, int depth)
@@ -222,7 +258,7 @@ static int scan(struct eventpoll *ep, struct kepoll_event *out, int max, bool pe
     struct epitem *done = NULL, **done_tail = &done;
     for (struct epitem **pp = &ep->items; *pp && n < max;) {
         struct epitem *it = *pp;
-        if (deadline) {
+        if (deadline && !epoll_is(it->file)) {          /* (ep_lock is held: not a nested set's) */
             uint64_t d = vfs_poll_deadline(it->file);
             if (d && (!*deadline || d < *deadline)) *deadline = d;
         }
@@ -259,11 +295,11 @@ int epoll_wait_file(struct file *epf, void *kevents, int maxevents, int64_t time
     struct poll_table pt;
     for (;;) {
         uint64_t seq = poll_seq_read(), tdl = 0;
-        uint64_t fl = irq_save();
+        uint64_t fl = lock_for_scan(ep);
         poll_begin(&pt);                                /* the watched files name their channels */
         int n = scan(ep, kevents, maxevents, false, &tdl, 0);
         poll_end();
-        irq_restore(fl);
+        spin_unlock_irqrestore(&ep_lock, fl);
         if (n || timeout_ms == 0) return n;
         if (signal_pending()) return -EINTR;
         if (timeout_ms > 0 && time_ms() >= deadline) return 0;
@@ -276,42 +312,41 @@ int epoll_wait_file(struct file *epf, void *kevents, int maxevents, int64_t time
 /* An epoll fd is readable when epoll_wait would report something. */
 static int epoll_poll(struct file *f, int events)
 {
-    static int depth;                                   /* nesting (interrupts are off meanwhile) */
-    uint64_t fl = irq_save();
-    depth++;
-    int r = scan(ep_of(f), NULL, 1, true, NULL, depth) ? POLLIN : 0;
-    depth--;
-    irq_restore(fl);
+    poll_wait(ep_of(f));                                /* epoll_ctl changes; the files name theirs */
+    uint64_t fl = lock_for_scan(ep_of(f));
+    int r = scan(ep_of(f), NULL, 1, true, NULL, 1) ? POLLIN : 0;
+    spin_unlock_irqrestore(&ep_lock, fl);
     return r & events;
 }
 
 static uint64_t epoll_deadline(struct file *f)
 {
     uint64_t d = 0;
-    uint64_t fl = irq_save();
+    uint64_t fl = lock_for_scan(ep_of(f));
     for (struct epitem *it = ep_of(f)->items; it; it = it->next) {
         if (epoll_is(it->file)) continue;               /* one level is enough for timers */
         uint64_t x = vfs_poll_deadline(it->file);
         if (x && (!d || x < d)) d = x;
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&ep_lock, fl);
     return d;
 }
 
 static void epoll_release(struct file *f)
 {
     struct eventpoll *ep = ep_of(f);
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&ep_lock);
     while (ep->items) {
         struct epitem *it = ep->items;
         ep->items = it->next;
         unlink_from_file(it);
         kfree(it);
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&ep_lock, fl);
     kfree(ep);
 }
 
 static const struct vnode_ops epoll_ops = {
     .poll = epoll_poll, .release = epoll_release, .poll_deadline = epoll_deadline,
+    .nolock = true,
 };

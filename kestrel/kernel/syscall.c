@@ -67,8 +67,8 @@ static struct file *fget(int fd)
     uint64_t fl = spin_lock_irqsave(&fs->lock);
     struct file *f = vfs_file_get(fs->fd[fd]);
     spin_unlock_keep_irqs(&fs->lock);
-    if (f && !bkl_depth() && (!file_nolock(f) || f->ep_links)) bkl_enter();
-    if (f && f->ep_links) epoll_file_used(f);           /* I/O on it re-arms EPOLLET watches */
+    if (f && !bkl_depth() && !file_nolock(f)) bkl_enter();
+    if (f) epoll_file_used(f);                          /* I/O on it re-arms EPOLLET watches */
     irq_restore(fl);
     return f;
 }
@@ -3092,6 +3092,7 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     /* waiting on descriptors: fget takes the kernel lock at the first file
      * that needs it, and the call keeps it from then on */
     case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
+    case SYS_epoll_wait: case SYS_epoll_pwait:
         return true;
     default:
         return false;
