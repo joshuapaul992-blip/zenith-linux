@@ -612,6 +612,25 @@ ports/busybox/               BusyBox build (/bin/sh and the command-line tools)
 ports/xterm/                 xterm build and its musl patch
 rootfs/                      contents of the boot volume payload
 ui/bootmgr.c                 boot manager, F8 screen, tools
+linuxkpi/                    the Linux KPI: build unmodified Linux drivers (see "Linux drivers")
+  include/linux/ asm/ uapi/  the KPI's own Linux API headers (written here, none copied from Linux)
+  include/lkpi/glue.h        the only bridge between the two sides (plain C types)
+  glue/kestrel.c devfs.c     glue.h implemented with Kestrel's interfaces (heap, threads, PCI,
+                             MSI, VFS, devfs)
+  src/module.c               linuxkpi_init(): KPI threads, buses, module parameters, initcalls
+  src/sched.c kthread.c      current, sleeping, wait queues, completions, mutexes, rwsems, RCU;
+                             kthreads
+  src/timer.c workqueue.c    jiffies, sleeps, timer_list; workqueues and delayed work
+  src/irq.c                  request_irq, MSI/MSI-X vectors, threaded handlers, tasklets
+  src/device.c pci.c         driver model, devres, platform bus; PCI devices and drivers
+  src/slab.c page.c dma.c    kmalloc, kmem_cache, vmalloc; struct page; DMA mappings and pools
+  src/io.c firmware.c        ioremap, port I/O, regions; request_firmware from /lib/firmware
+  src/chardev.c watchdog.c   chrdev/cdev/misc devices and user copies; the watchdog core
+  src/notifier.c idr.c       notifier chains, panic and reboot hooks; IDR/IDA
+  src/printk.c vsprintf.c    printk, dev_*, hex dumps; vsprintf with %p extensions, sscanf
+  src/lib.c selftest.c       strings, kstrto*, bitmaps; the linuxkpi.selftest=1 self-test
+third_party/linux/           unmodified Linux v6.12 drivers built through the KPI (pvpanic,
+                             i6300esb), with their upstream paths and licenses in README.md
 include/kernel/posix.h       errno, O_* flags, struct stat, dirent64, utsname (Linux ABI layout)
 include/kernel/usyscall.h    int 0x80 wrappers used by init
 ```
@@ -1065,6 +1084,192 @@ Booting with `kestrel.exec=/bin/startx+60s+/usr/local/bin/firefox` starts the de
 - Non-PIE programs (linked at a fixed address, such as Ubuntu's `python3.12`) do not load yet.
 - No GLX, no D-Bus daemon, no recording.
 
+## Linux drivers: the Linux KPI (`linuxkpi/`)
+
+Kestrel can build unmodified Linux driver source files into the kernel, the way FreeBSD's LinuxKPI does. `linuxkpi/` provides its own `<linux/...>` headers, so an upstream `.c` file compiles as it is. The implementations behind those headers use Kestrel's services: its heap and frame allocator, its threads and scheduler, PCI enumeration, MSI, devfs and the VFS. Phase 1 has two Linux drivers. Both are copied byte for byte from Linux v6.12 into `third_party/linux/`:
+
+| Driver | Device | What it does on Kestrel |
+|---|---|---|
+| `drivers/misc/pvpanic/pvpanic.c`, `pvpanic-pci.c` | QEMU `-device pvpanic-pci` | a kernel panic is reported to the host (QEMU's `guest-panicked` state) |
+| `drivers/watchdog/i6300esb.c` | Intel 6300ESB watchdog, QEMU `-device i6300esb` | `/dev/watchdog`: a program pings it, and the machine resets if the pings stop |
+
+**How it fits.** Linux code never sees a Kestrel header, and Kestrel code never sees a Linux one. The two kernels use the same names for different things (`kmalloc`, `schedule`, `panic`, `copy_to_user`), so this matters. The only bridge is `linuxkpi/include/lkpi/glue.h`. It is written in plain C types and implemented in `linuxkpi/glue/` with Kestrel's own interfaces. The KPI files and the Linux drivers are compiled with their own flags (`LKPI_CFLAGS` in the Makefile): `-nostdinc`, only `linuxkpi/include`, and Kbuild's `KBUILD_MODNAME` taken from the file name.
+
+**Start-up.** `kernel_main` calls `linuxkpi_init()` after PCI, MSI, the scheduler, networking, sound and the root file system are up. The boot thread cannot sleep, so an `lkpi-init` kernel thread does the work while the boot thread waits:
+
+1. The timer, workqueue and tasklet threads start.
+2. The platform bus and the PCI bus are built, with every function Kestrel's scan found.
+3. Module parameters are read from the command line.
+4. The initcalls run by level, then in link order. Built-in drivers register and probe here.
+5. Deferred probes are retried.
+6. With `linuxkpi.selftest=1`, the self-test runs.
+
+`module_init()` and the `*_initcall()` macros put records in the `.lkpi_initcall.<level>` sections of `linker.ld`. `MODULE_*` strings go to `.lkpi_modinfo`, and each module's description and license are logged when its initcall runs. `module_param()` records go to `.lkpi_param`.
+
+**Boot options.**
+- `MODULE.PARAM=VALUE` sets a module parameter, for example `i6300esb.heartbeat=10`. `-` and `_` are the same in names. The types are int, uint, long, ulong, short, ushort, byte, bool, invbool, charp, hexint and string; arrays are not parsed yet.
+- `linuxkpi.selftest=1` runs the self-test.
+- `linuxkpi.debug=1` shows `KERN_DEBUG` messages and each initcall as it is called.
+
+A boot with QEMU's two devices logs:
+
+```
+linuxkpi: pci: 9 devices from Kestrel's scan
+linuxkpi: module pvpanic_pci: pvpanic device driver [license: GPL]
+linuxkpi: pci 0000:00:05.0: [1b36:0011] class 088000: probing with pvpanic-pci
+linuxkpi: driver pvpanic-pci bound to pci 0000:00:05.0
+linuxkpi: module i6300esb: Watchdog driver for Intel 6300ESB chipsets [license: GPL]
+linuxkpi: pci 0000:00:04.0: [8086:25ab] class 088000: probing with i6300ESB timer
+watchdog0: i6300ESB timer registered as /dev/watchdog0 and /dev/watchdog, timeout 30 s
+i6300ESB timer 0000:00:04.0: initialized. heartbeat=30 sec (nowayout=0)
+linuxkpi: driver i6300ESB timer bound to pci 0000:00:04.0
+```
+
+### What the KPI covers
+
+The lists below say what works and what is a stub.
+
+**Basics** (`types.h`, `compiler*.h`, `kernel.h`, `minmax.h`, `bits.h`, `bitops.h`, `bitmap.h`, `list.h`, `err.h`, `overflow.h`, `math64.h`, `string.h`, `ctype.h`, `kstrtox.h`, `sprintf.h`). Linux's types and compiler macros, `container_of`, `min`/`max`/`clamp`, the bit operations and bitmaps, lists and hlists, `ERR_PTR`, the overflow helpers, 64-bit division, and the string functions, including `strscpy`, `kstrdup`, `kasprintf` and `kstrto*`. `vsprintf.c` is a complete formatter with Linux's `%p` extensions: `%pe`, `%pV`, `%pM`, `%pI4`, `%pI6`, `%pa`, `%ph`, `%pR` and `%pS`. `sscanf` works too.
+
+**Logging** (`printk.h`, `dev_printk.h`). `printk` takes the usual `KERN_*` levels and `KERN_CONT`. Messages go to Kestrel's log without the level prefix, and `KERN_DEBUG` is dropped unless `linuxkpi.debug=1`. The `dev_*`, `pr_*`, `dev_err_probe`, `print_hex_dump`, `WARN*` and `BUG*` calls work. `BUG()` calls Kestrel's `panic()`.
+
+**Memory** (`slab.h`, `gfp.h`, `mm.h`, `vmalloc.h`).
+- `kmalloc` and its family: `kzalloc`, `kcalloc`, `kmalloc_array`, `krealloc`, `ksize`, `kfree`, `kvmalloc`, `kfree_sensitive`.
+- `kmem_cache_*`, with constructors.
+- `alloc_pages` and `__get_free_pages`, with a `struct page` table that the KPI keeps itself.
+- `vmalloc` and `vzalloc`.
+
+Alignment follows Linux. GFP flags are accepted, and `GFP_DMA`/`GFP_DMA32` give memory below 4 GiB. Nothing ever sleeps for memory: an allocation that fails returns NULL. Memory is identity mapped, so `vmalloc` is physically contiguous. *Stub:* `vmap` works only when the pages are contiguous.
+
+**Locks and sleeping** (`spinlock.h`, `mutex.h`, `rwsem.h`, `semaphore.h`, `completion.h`, `wait.h`, `atomic.h`, `refcount.h`, `kref.h`, `rcupdate.h`, `idr.h`).
+- Spinlocks, including `_irqsave`, `_irq`, `_bh` and rwlocks. A held spinlock keeps interrupts off on that CPU, so a thread cannot be preempted while it holds one.
+- Mutexes, rw semaphores and counting semaphores.
+- Completions and wait queues, with the `wait_event*` family including timeouts and interruptible waits.
+- Atomics, `refcount_t` and `kref`.
+- A small RCU (`synchronize_rcu`, `call_rcu`, `kfree_rcu`, `rcu_barrier`, RCU lists).
+- IDR and IDA: sorted lists, fine for the handful of ids a driver uses.
+
+*Stubs:* lockdep annotations compile to nothing.
+
+**Time** (`jiffies.h`, `delay.h`, `timer.h`, `ktime.h`). `HZ` is 1000, so a jiffy is a millisecond. The calls are `msleep`, `msleep_interruptible`, `usleep_range`, `udelay`, `ndelay` and `mdelay`; `ktime_get` and its relatives; and `timer_list` with `mod_timer`, `timer_reduce`, `timer_delete_sync` and `timer_shutdown`. Timer callbacks run in the `lkpi-timer` thread, not in an interrupt.
+
+**Deferred work** (`workqueue.h`, `kthread.h`, `interrupt.h`).
+- Workqueues: `alloc_workqueue`, ordered queues, `queue_work`, delayed work, `mod_delayed_work`, `flush_*`, `cancel_*_sync` and `rcu_work`. A queue has its own worker threads: one for an ordered queue, two otherwise, and four shared by the system queues.
+- Kernel threads: `kthread_create`/`run`, `kthread_stop` (with the `-EINTR` rule for a thread that never ran), and parking.
+- Tasklets run in the `lkpi-tasklet` thread.
+
+*Stubs:* CPU affinity (`kthread_bind`, `queue_work_on`) is ignored, and so is the freezer.
+
+**PCI** (`pci.h`, `pci_regs.h`, `pci_ids.h`).
+- `pci_register_driver` and `module_pci_driver`, matched against the driver's id table.
+- Configuration space reads and writes (writes are real 8-, 16- and 32-bit cycles), and capability lookup (`pci_find_capability`, `pci_find_ext_capability` returns 0).
+- `pci_enable_device` and `pcim_enable_device`, bus mastering, `pci_request_regions`.
+- Mapping BARs: `pci_iomap`, `pcim_iomap`, `pcim_iomap_regions`, `pci_ioremap_bar`.
+- `pci_get_device`/`pci_get_slot`, and `pci_set_drvdata`.
+
+BARs are the ones the firmware assigned. *Stubs:* power states are recorded only, and there is no hotplug, no SR-IOV and no PCIe extended configuration space (the legacy mechanism only reaches 256 bytes).
+
+**I/O** (`io.h`, `ioport.h`). `ioremap` and `ioremap_wc` make the range uncached or write-combining in Kestrel's identity map. `memremap`, `readb`…`writeq` with `_relaxed`, `ioread*`/`iowrite*` and their `_rep` forms work on both memory and port I/O cookies, along with `ioport_map`, `pci_iomap` on I/O BARs and `devm_ioremap*`. *Stub:* `request_region` and friends always succeed and only remember the request. There is no resource tree.
+
+**Interrupts** (`interrupt.h`). `request_irq`, `request_threaded_irq`, `devm_request_*irq`, `free_irq`, `enable_irq`/`disable_irq`/`synchronize_irq`, `pci_alloc_irq_vectors` and `pci_irq_vector`, and `pci_request_irq`. Each PCI device gets an IRQ number when it is enabled. The Kestrel MSI or MSI-X vector is set up when the driver asks for vectors, or when it requests the IRQ without asking. Threaded handlers run in their own thread. *Limits:* one vector per device, so `pci_alloc_irq_vectors(dev, 1, N, …)` gives 1. There is no legacy INTx, because Kestrel has no `_PRT` routing, so a device without MSI cannot have a handler yet.
+
+**DMA** (`dma-mapping.h`, `dmapool.h`, `scatterlist.h`). Memory is identity mapped and there is no IOMMU, so a DMA address is the physical address.
+- `dma_set_mask*`.
+- `dma_alloc_coherent`, whose memory sits below 4 GiB unless the mask allows more, and `dmam_alloc_coherent`.
+- `dma_map_single`, `dma_map_page` and `dma_map_sg`, checked against the device's mask.
+- `dma_pool_*`, and the scatterlist helpers.
+
+*Stub:* there are no bounce buffers. Memory the device cannot reach gives `DMA_MAPPING_ERROR`.
+
+**The driver model** (`device.h`, `platform_device.h`, `kobject.h`).
+- Buses, devices and drivers, with binding through the bus's `match` and `probe`, `EPROBE_DEFER` retries, `get_device`/`put_device` and drvdata.
+- Classes, `device_create`/`device_destroy`, and the platform bus and platform devices.
+- devres: `devm_kmalloc` and its family, `devm_add_action_or_reset`, and `devres_alloc`/`devres_add`/`devres_free`. Everything is released when a probe fails or a driver is unbound.
+
+*Stubs:* there is no sysfs, so attribute groups (`dev_groups`, `DEVICE_ATTR_*`) are accepted and ignored. There is no runtime power management, and suspend and resume are never called.
+
+**Character devices** (`fs.h`, `cdev.h`, `miscdevice.h`, `uaccess.h`, `poll.h`).
+- `register_chrdev`, `alloc_chrdev_region`, `cdev_add`/`cdev_device_add`, `misc_register`.
+- A device with a `dev_t` gets its `/dev` node when it is added. Kestrel's devfs then calls the driver's `file_operations`: `open`, `release`, `read`, `write`, `unlocked_ioctl` and `poll`.
+- `copy_to_user`, `copy_from_user`, `get_user`, `put_user` and `strncpy_from_user`. In `read` and `write` handlers these are plain copies, because Kestrel hands the driver kernel buffers. `ioctl` arguments are real user addresses.
+
+*Stubs:* `mmap`, `fasync` and `llseek` beyond the simple helpers are not implemented.
+
+**Modules** (`module.h`, `moduleparam.h`, `init.h`, `export.h`). Every module is built in. `module_init` is an initcall, `module_exit` is compiled but never run, and `EXPORT_SYMBOL*` does nothing. `MODULE_*` strings are kept and logged. *Stubs:* `request_module` returns `-ENOENT`, and `try_module_get` always succeeds.
+
+**Firmware** (`firmware.h`). `request_firmware`, `firmware_request_nowarn`, `request_firmware_direct`, `request_firmware_into_buf` and `request_firmware_nowait` read `/lib/firmware/<name>` whole through Kestrel's VFS. Initcalls run after the root is mounted, so a driver can load firmware from its probe. *Stub:* there is no user-space fallback and no built-in firmware.
+
+**Notifiers, panic and reboot** (`notifier.h`, `panic_notifier.h`, `reboot.h`). There are atomic, blocking and raw notifier chains.
+- `panic_notifier_list` is called by Kestrel's `panic()`, once, after the other CPUs have stopped. pvpanic reports the panic from there.
+- Kestrel's power-off, reboot and halt call the reboot notifiers first, then the sys-off handlers of that kind (`register_sys_off_handler` and the `devm_` forms).
+- `kernel_restart`, `kernel_halt` and `kernel_power_off` call Kestrel's.
+
+**Watchdogs** (`watchdog.h`, `src/watchdog.c`). This is a minimal watchdog core with Linux's user interface:
+- `watchdog_register_device`/`devm_watchdog_register_device`, `watchdog_init_timeout`, nowayout, and restart handlers.
+- `/dev/watchdogN` for each device. The first one also gets `/dev/watchdog` (misc 10:130).
+- One opener at a time. Opening starts the watchdog, and writes or `WDIOC_KEEPALIVE` ping it.
+- The magic close: a `V`, then close, stops the watchdog. Closing without it leaves the watchdog running and logs `watchdog did not stop!`.
+- The ioctls `WDIOC_GETSUPPORT`, `GETSTATUS`, `GETBOOTSTATUS`, `SETOPTIONS`, `SETTIMEOUT`, `GETTIMEOUT`, `SETPRETIMEOUT`, `GETPRETIMEOUT` and `GETTIMELEFT`.
+
+The core pings by itself only for hardware that cannot be stopped (`WDOG_HW_RUNNING`), or whose limit is shorter than the timeout asked for. *Stubs:* there are no pretimeout governors and no sysfs attributes.
+
+**Not there at all.** Networking (`net_device`, NAPI, sk_buff), block devices and the block layer, input, DRM/KMS, USB, ACPI and device tree, sysfs, debugfs, procfs entries, hrtimers, per-CPU variables, the full radix-tree IDR, `struct file` beyond the fields above, and `mmap` of device memory.
+
+### Testing
+
+- **`linuxkpi.selftest=1`** runs `src/selftest.c` after the initcalls, through the same API a driver uses:
+  - workqueues: queue, flush, delayed, cancel, and order on an ordered queue;
+  - timers: expiry, re-arming, `timer_delete_sync`;
+  - completions: timeouts, counting, `complete_all` with three waiters;
+  - kthreads: stop with a result, parking, stop before the first wake gives `-EINTR`;
+  - wait queues: timeouts and spurious wakeups;
+  - locks: a mutex and a spinlock under three threads, rwsem, semaphores;
+  - sleeps and clocks;
+  - allocations, object caches, pages, vmalloc;
+  - DMA through a platform device;
+  - atomics, kref, IDR and IDA, bitmaps, `kstrto*`, `%pe` and `%pM`;
+  - tasklets and RCU callbacks;
+  - `request_firmware` of `/lib/firmware/linuxkpi/selftest.bin`.
+
+  Each group logs `linuxkpi selftest: <group>: pass` (or `FAIL (<check>)`), and the last line is `linuxkpi selftest: 12 passed, 0 failed (… ms) -- all passed`.
+- **`wdtest`** (in `/bin`) opens `/dev/watchdog` and checks the identity and options, the timeout ioctls, that a second open is `EBUSY` (also through `/dev/watchdog0`), six seconds of pings against a 3-second timeout, disable and enable, and the magic close. `wdtest starve [N]` arms an N-second timeout and stops pinging: with `-device i6300esb` QEMU resets the machine. It exits with `-no-reboot`, and QMP reports `WATCHDOG {"action": "reset"}`.
+- **pvpanic:** boot with `kestrel.crashtest=null` and QEMU's `-device pvpanic-pci -action panic=pause`. The kernel's page fault ends in `panic()`, the panic notifiers run, and QEMU stops with QMP event `GUEST_PANICKED` and `query-status` returning `guest-panicked`.
+
+### Adding a Linux driver
+
+1. **Check the license** of every file you need, by its SPDX line (see Licenses below). Only GPL-2.0-or-later, MIT/BSD or dual-licensed files may be copied. GPL-2.0-only code cannot be combined with Kestrel's GPLv3.
+2. **Copy the files unmodified** from a tagged release into `third_party/linux/<same path>`, and add them to the table in `third_party/linux/README.md`: upstream path, tag, license and SHA-256.
+3. **Add the `.c` files to `LKPI_DRV_SRC`** in the Makefile. Within an initcall level, files run in the order listed, so put a library module before the driver that uses it, as with `pvpanic.c` and `pvpanic-pci.c`. `KBUILD_MODNAME` is the file name with `-` turned into `_`, as Kbuild does for a one-file module. A module built from several files would need a per-object `KBUILD_MODNAME` in the Makefile.
+4. **Build, and fix the KPI rather than the driver.** A missing header goes under `linuxkpi/include/linux/`. Write it from the API's documentation and from what drivers call; never copy it from Linux, whose headers are mostly GPL-2.0-only. A missing function goes in the matching `linuxkpi/src/*.c`. If something can only be reached in Kestrel, add a function to `lkpi/glue.h` and implement it in `linuxkpi/glue/`. The build must stay warning-free.
+5. **If a patch is unavoidable**, keep it as a separate file in `third_party/linux/patches/`, with a header saying why. Apply it at build time to a copy under `build/`, so the vendored file stays identical to upstream.
+6. **Test in QEMU** with the matching `-device`. The probe logs `linuxkpi: driver X bound to …`, and `linuxkpi.debug=1` shows `dev_dbg` messages and every initcall.
+
+### Phase 2: DRM, the bochs driver, then nouveau
+
+**Step 1, enough DRM for `drivers/gpu/drm/tiny/bochs.c`.** That file is GPL-2.0-or-later. It drives QEMU's `-device bochs-display` and `-vga std`, whose register interface Kestrel already drives natively (`drivers/video/bochs_dispi.c`), so the results can be compared directly. The KPI needs:
+- the DRM device and driver structures (`drm_device`, `drm_driver`, `devm_drm_dev_alloc`, `drm_dev_register`);
+- `drm_mode_config` with the CRTC, plane, encoder and connector objects;
+- the simple display pipe or atomic helpers that bochs uses (`drm_atomic_helper_*` and the GEM shadow-plane helpers);
+- `drm_gem_vram_helper` (GPL-2.0-or-later), since bochs keeps its buffers in VRAM;
+- EDID parsing, which Kestrel already has in `drivers/video/edid.c`;
+- `drm_fbdev_generic` emulation, and the aperture helpers (`aperture_remove_conflicting_pci_devices`).
+
+Kestrel's side is a display backend that calls `display_register()` for each DRM connector that comes up, so the multi-monitor terminals use it like any other head. User space gets no DRM ioctls in step 1.
+
+**Licensing.** DRM's licenses differ file by file, so each one is checked when it is vendored. Most of the core modesetting code carries MIT terms; those files may be vendored, and the rest is written in the KPI. Some neighbours are GPL-2.0-only and must be written from scratch: for example `drivers/dma-buf/dma-fence.c` and the GEM shmem helpers.
+
+**Step 2, nouveau.** `drivers/gpu/drm/nouveau` is MIT-licensed (Red Hat's terms, as in `third_party/nouveau/LICENSE`), and TTM is `GPL-2.0 OR MIT`, so both can be vendored. Getting there takes:
+- the TTM memory manager;
+- the DMA fence and reservation objects (dma-buf): `dma-resv.c` is MIT, while `dma-fence.c` has to be written in the KPI;
+- the firmware loader, which already exists;
+- full MSI with several vectors, and IOMMU-free DMA above 4 GiB;
+- workqueues with per-CPU behaviour;
+- hrtimers and `wait_event` variants on `dma_fence`;
+- larger parts of `<linux/mm.h>`: `vm_area_struct` and `mmap` for buffer objects;
+- PCIe extended configuration space, through ECAM.
+
+Kestrel's own NVIDIA code (`drivers/gpu/nvidia/`) stays as the fallback until nouveau's modesetting works on the same boards. The order is to first bring nouveau up with the display only, and add acceleration, which needs the GPU firmware in `/lib/firmware/nvidia`, later.
+
 ## Memory map at boot
 
 | Range | Use |
@@ -1086,6 +1291,7 @@ Phase 1 (foundations for real applications) is done: user mode with fault-safe u
 6. **Native GPU display drivers** (Intel, AMD, NVIDIA) that register their monitors with `display_register()`. The multi-monitor terminals already work with any head.
 7. **Hardware support:** MSI/MSI-X interrupts for network and sound cards (storage and USB have them), USB hubs, an EHCI driver for machines without xHCI.
 8. **Firefox, properly:** seccomp-bpf and namespaces so its sandboxes can stay on, GLX in the X server, non-PIE executables, and finer locking so it starts quickly.
+9. **Linux drivers, phase 2:** enough of DRM in the Linux KPI for `drivers/gpu/drm/tiny/bochs.c`, then nouveau (see "Linux drivers: the Linux KPI").
 
 ## Licenses
 
@@ -1094,3 +1300,5 @@ Kestrel source: yours to license as you wish.
 Spleen fonts (`third_party/spleen`): BSD-2-Clause, © Frederic Cambus. The terminal font (`third_party/kestrel_font`) is the project's own.
 
 NVIDIA register and VBIOS table knowledge in `drivers/gpu/nvidia/` is derived from nouveau (`third_party/nouveau/LICENSE`): MIT, © Red Hat Inc.
+
+Linux drivers (`third_party/linux`): unmodified files from Linux v6.12, each under the license in its SPDX line (all GPL-2.0-or-later today); `third_party/linux/README.md` lists them. Kestrel as a whole is distributed under the GPL version 3 (the repository's `LICENSE`), and only Linux code that may be combined with it is vendored: **GPL-2.0-or-later, MIT/BSD, or dual-licensed with one of those. GPL-2.0-only code (including `GPL-2.0 WITH Linux-syscall-note` headers) cannot be combined with GPLv3 code and is never copied**; what the KPI needs from such files is written from scratch in `linuxkpi/`.
