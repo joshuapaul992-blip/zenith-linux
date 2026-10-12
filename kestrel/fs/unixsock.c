@@ -595,4 +595,5 @@ static void sock_release(struct file *f) { usock_destroy(us(f)); }
 
 static const struct vnode_ops sock_ops = {
     .fread = sock_fread, .fwrite = sock_fwrite, .poll = sock_poll, .release = sock_release, .ioctl = sock_ioctl,
+    .nolock = true,
 };

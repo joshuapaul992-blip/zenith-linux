@@ -862,6 +862,8 @@ struct file *vfs_file_new(struct vnode *vn, int flags)
     return f;
 }
 
+bool file_nolock(struct file *f) { return f && f->vn && f->vn->ops && f->vn->ops->nolock; }
+
 uint64_t vfs_poll_deadline(struct file *f)
 {
     return f->vn && f->vn->ops && f->vn->ops->poll_deadline ? f->vn->ops->poll_deadline(f) : 0;

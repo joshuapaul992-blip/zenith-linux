@@ -19,6 +19,7 @@
 #include <kernel/cpu.h>
 #include <kernel/time.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
 
 #define EFD_SEMAPHORE   1
 #define NONBLOCK_FLAG   04000           /* EFD_/TFD_/SFD_NONBLOCK = O_NONBLOCK */
@@ -51,6 +52,7 @@ static void free_object(struct file *f) { kfree(f->vn->data); }
 /* ---- eventfd ------------------------------------------------------------------- */
 struct eventfd {
     struct vnode vn;
+    struct spinlock lock;                               /* count: read and written without the big lock */
     uint64_t     count;
     bool         semaphore;
 };
@@ -61,16 +63,16 @@ static ssize_t efd_read(struct file *f, void *buf, size_t len)
 {
     struct eventfd *e = f->vn->data;
     if (len < 8) return -EINVAL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&e->lock);
     while (!e->count) {
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(e);
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&e->lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&e->lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(e, &e->lock);
     }
     uint64_t v = e->semaphore ? 1 : e->count;
     e->count -= v;
     wakeup(e);                                          /* writers waiting for room */
-    irq_restore(fl);
+    spin_unlock_irqrestore(&e->lock, fl);
     memcpy(buf, &v, 8);
     return 8;
 }
@@ -82,15 +84,15 @@ static ssize_t efd_write(struct file *f, const void *buf, size_t len)
     uint64_t v;
     memcpy(&v, buf, 8);
     if (v == ~0ull) return -EINVAL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&e->lock);
     while (EFD_MAX - e->count < v) {                    /* would overflow: wait for a read */
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(e);
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&e->lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&e->lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(e, &e->lock);
     }
     e->count += v;
     if (v) wakeup(e);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&e->lock, fl);
     return 8;
 }
 
@@ -99,13 +101,15 @@ static int efd_poll(struct file *f, int events)
     struct eventfd *e = f->vn->data;
     int r = 0;
     poll_wait(e);
-    if (e->count) r |= POLLIN;
-    if (e->count < EFD_MAX) r |= POLLOUT;
+    uint64_t c = __atomic_load_n(&e->count, __ATOMIC_RELAXED);
+    if (c) r |= POLLIN;
+    if (c < EFD_MAX) r |= POLLOUT;
     return r & events;
 }
 
 static const struct vnode_ops efd_ops = {
     .fread = efd_read, .fwrite = efd_write, .poll = efd_poll, .release = free_object,
+    .nolock = true,
 };
 
 int eventfd_create(uint32_t initval, int flags, struct file **out)

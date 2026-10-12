@@ -5,17 +5,23 @@
  * wait for data while a writer exists (then read 0 = EOF), writers wait for
  * room while a reader exists (none: -EPIPE; there are no signals yet, so no
  * SIGPIPE). O_NONBLOCK on either end turns waiting into -EAGAIN. Waiting
- * uses the scheduler's sleep_on()/wakeup() on the pipe itself. */
+ * uses the scheduler's sleep_on()/wakeup() on the pipe itself.
+ *
+ * Each pipe has its own spinlock: reads, writes and polls run without the
+ * big kernel lock. The data is copied between kernel buffers (the system
+ * call's bounce buffer), so nothing under the lock faults or sleeps. */
 #include <kernel/process.h>
 #include <kernel/vfs.h>
 #include <kernel/task.h>
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
 
 #define PIPE_BUF_SIZE   16384
 
 struct pipe {
+    struct spinlock lock;
     uint8_t  buf[PIPE_BUF_SIZE];
     size_t   head, count;           /* read position, bytes stored */
     int      readers, writers;
@@ -28,19 +34,19 @@ static ssize_t pipe_read(struct file *f, void *dst, size_t len)
 {
     struct pipe *p = pipe_of(f);
     if (!len) return 0;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     while (!p->count) {
-        if (!p->writers) { irq_restore(fl); return 0; }
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(p);
+        if (!p->writers) { spin_unlock_irqrestore(&p->lock, fl); return 0; }
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&p->lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&p->lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(p, &p->lock);
     }
     size_t n = len < p->count ? len : p->count;
     for (size_t i = 0; i < n; i++) ((uint8_t *)dst)[i] = p->buf[(p->head + i) % PIPE_BUF_SIZE];
     p->head = (p->head + n) % PIPE_BUF_SIZE;
     p->count -= n;
     wakeup(p);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
     return (ssize_t)n;
 }
 
@@ -48,13 +54,13 @@ static ssize_t pipe_write(struct file *f, const void *src, size_t len)
 {
     struct pipe *p = pipe_of(f);
     size_t done = 0;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     while (done < len) {
-        if (!p->readers) { irq_restore(fl); return done ? (ssize_t)done : -EPIPE; }
+        if (!p->readers) { spin_unlock_irqrestore(&p->lock, fl); return done ? (ssize_t)done : -EPIPE; }
         if (p->count == PIPE_BUF_SIZE) {
             if (f->flags & O_NONBLOCK) break;
-            if (signal_pending()) { irq_restore(fl); return done ? (ssize_t)done : -ERESTARTSYS; }
-            sleep_on(p);
+            if (signal_pending()) { spin_unlock_irqrestore(&p->lock, fl); return done ? (ssize_t)done : -ERESTARTSYS; }
+            sleep_on_locked(p, &p->lock);
             continue;
         }
         size_t room = PIPE_BUF_SIZE - p->count, n = len - done < room ? len - done : room;
@@ -64,7 +70,7 @@ static ssize_t pipe_write(struct file *f, const void *src, size_t len)
         done += n;
         wakeup(p);
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
     return done ? (ssize_t)done : -EAGAIN;
 }
 
@@ -73,6 +79,7 @@ static int pipe_poll(struct file *f, int events)
     struct pipe *p = pipe_of(f);
     int r = 0;
     poll_wait(p);
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     if (f->vn == &p->rd) {
         if (p->count) r |= POLLIN;
         if (!p->writers) r |= POLLHUP;
@@ -80,22 +87,24 @@ static int pipe_poll(struct file *f, int events)
         if (p->count < PIPE_BUF_SIZE) r |= POLLOUT;
         if (!p->readers) r |= POLLERR;
     }
+    spin_unlock_irqrestore(&p->lock, fl);
     return r & (events | POLLERR | POLLHUP);
 }
 
 static void pipe_release(struct file *f)
 {
     struct pipe *p = pipe_of(f);
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&p->lock);
     if (f->vn == &p->rd) p->readers--; else p->writers--;
     bool gone = !p->readers && !p->writers;
     wakeup(p);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&p->lock, fl);
     if (gone) kfree(p);
 }
 
 static const struct vnode_ops pipe_ops = {
     .fread = pipe_read, .fwrite = pipe_write, .poll = pipe_poll, .release = pipe_release,
+    .nolock = true,
 };
 
 int pipe_create(struct file **rd, struct file **wr, int flags)

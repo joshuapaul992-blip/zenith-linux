@@ -38,6 +38,10 @@ struct vnode_ops {
     ssize_t (*fread)(struct file *f, void *buf, size_t len);
     ssize_t (*fwrite)(struct file *f, const void *buf, size_t len);
     int     (*poll)(struct file *f, int events);   /* ready POLL* bits     */
+    /* fread, fwrite, poll and poll_deadline lock the object themselves:
+     * reads, writes and polls of the file run without the big kernel lock
+     * (kernel/syscall.c: fget). Pipes, eventfds and unix sockets. */
+    bool    nolock;
     void    (*release)(struct file *f);            /* last close of f      */
     int     (*fioctl)(struct file *f, unsigned long req, void *arg);  /* preferred over ioctl */
     /* Optional: create the open file (devices that hand out a new object per
@@ -216,6 +220,7 @@ int     vfs_ioctl(struct file *f, unsigned long req, void *arg);
 int     vfs_fstat(struct file *f, struct stat *st);
 int     vfs_poll(struct file *f, int events);   /* ready subset of events (+ERR/HUP) */
 uint64_t vfs_poll_deadline(struct file *f);     /* see vnode_ops.poll_deadline */
+bool     file_nolock(struct file *f);           /* see vnode_ops.nolock; false for NULL */
 struct file *vfs_file_new(struct vnode *vn, int flags);    /* refcnt 1 */
 int     pipe_create(struct file **rd, struct file **wr, int flags);   /* fs/pipe.c */
 void    vfs_close(struct file *f);                  /* drops one reference */

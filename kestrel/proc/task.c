@@ -641,7 +641,7 @@ static bool polls_for(const struct tcb *t, void *chan)
 void wakeup(void *chan)
 {
     __atomic_add_fetch(&poll_seq, 1, __ATOMIC_SEQ_CST);
-    bool polls = __atomic_load_n(&pollers, __ATOMIC_RELAXED) > 0;
+    bool polls = __atomic_load_n(&pollers, __ATOMIC_SEQ_CST) > 0;
     uint64_t f = spin_lock_irqsave(&sched_lock);
     for (int i = 0; i < MAX_TASKS; i++) {
         struct tcb *t = &tasks[i];
@@ -696,6 +696,10 @@ void poll_wait(void *chan)
 
 void poll_end(void) { cur->poll_tab = NULL; }
 
+/* The sequence number is checked with sched_lock held, as the task blocks:
+ * wakeup() advances it before it takes the lock to look for sleepers, so
+ * a wakeup either moved it already (no sleep) or finds this task asleep.
+ * Pollers run without the kernel lock, so nothing else orders the two. */
 void poll_sleep(uint64_t seq, uint64_t deadline_ms, struct poll_table *pt)
 {
     uint64_t f = irq_save();
@@ -703,11 +707,20 @@ void poll_sleep(uint64_t seq, uint64_t deadline_ms, struct poll_table *pt)
         /* Objects that change state without a wakeup() (a device polled by
          * a driver) are still seen within 100 ms; with every object's
          * channels known, a second is plenty. */
-        uint64_t cap = time_ms() + (pt && !pt->all ? 1000 : 100);
+        uint64_t now = time_ms(), cap = now + (pt && !pt->all ? 1000 : 100);
+        uint64_t d = deadline_ms && deadline_ms < cap ? deadline_ms : cap;
+        uint64_t wake = uptime_ms() + (d > now ? d - now : 0);
         __atomic_add_fetch(&pollers, 1, __ATOMIC_SEQ_CST);
         cur->poll_tab = pt;
-        task_block_self(&poll_seq, deadline_ms && deadline_ms < cap ? deadline_ms : cap);
-        schedule();
+        spin_lock_irqsave(&sched_lock);
+        bool sleep = __atomic_load_n(&poll_seq, __ATOMIC_SEQ_CST) == seq;
+        if (sleep) {
+            cur->wait_chan = &poll_seq;
+            cur->wake_ms = wake ? wake : 1;
+            cur->state = TASK_SLEEPING;
+        }
+        spin_unlock_keep_irqs(&sched_lock);
+        if (sleep) schedule();
         cur->wait_chan = NULL;
         cur->poll_tab = NULL;
         __atomic_sub_fetch(&pollers, 1, __ATOMIC_SEQ_CST);

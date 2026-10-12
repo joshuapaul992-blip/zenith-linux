@@ -19,6 +19,9 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/eventfd.h>
+#include <fcntl.h>
+#include <poll.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -297,6 +300,88 @@ static int unix_round(void)
     return us_errors;
 }
 
+/* ---- pipes, eventfds and poll from several CPUs --------------------------------------- */
+#define PP_PIPES 4
+#define PP_BYTES (1 << 20)
+#define EV_THREADS 4
+#define EV_ADDS 5000
+
+static void *pp_reader(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    unsigned char buf[5000];
+    long pos = 0;
+    for (;;) {
+        struct pollfd p = { fd, POLLIN, 0 };
+        if (poll(&p, 1, 5000) != 1) { us_errors++; break; }
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r < 0 && errno == EAGAIN) continue;         /* another wakeup took it: poll again */
+        if (r < 0) { us_errors++; break; }
+        if (r == 0) break;
+        for (ssize_t i = 0; i < r; i++) if (buf[i] != (unsigned char)((pos + i) % 251)) { us_errors++; return NULL; }
+        pos += r;
+    }
+    if (pos != PP_BYTES) us_errors++;
+    return NULL;
+}
+
+static void *pp_writer(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    unsigned char buf[3000];
+    for (long pos = 0; pos < PP_BYTES; ) {
+        long n = PP_BYTES - pos < (long)sizeof buf ? PP_BYTES - pos : (long)sizeof buf;
+        for (long i = 0; i < n; i++) buf[i] = (unsigned char)((pos + i) % 251);
+        for (long off = 0; off < n; ) {
+            ssize_t w = write(fd, buf + off, (size_t)(n - off));
+            if (w <= 0) { us_errors++; return NULL; }
+            off += w;
+        }
+        pos += n;
+    }
+    close(fd);
+    return NULL;
+}
+
+static void *ev_adder(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    for (int i = 0; i < EV_ADDS; i++) {
+        uint64_t one = 1;
+        if (write(fd, &one, 8) != 8) { us_errors++; break; }
+        if (!(i & 63)) sched_yield();
+    }
+    return NULL;
+}
+
+static int pipe_poll_round(void)
+{
+    us_errors = 0;
+    pthread_t w[PP_PIPES], r[PP_PIPES], ev[EV_THREADS];
+    int pv[PP_PIPES][2];
+    for (int i = 0; i < PP_PIPES; i++) {
+        if (pipe(pv[i])) return 1;
+        fcntl(pv[i][0], F_SETFL, O_NONBLOCK);
+        pthread_create(&r[i], NULL, pp_reader, (void *)(intptr_t)pv[i][0]);
+        pthread_create(&w[i], NULL, pp_writer, (void *)(intptr_t)pv[i][1]);
+    }
+    int efd = eventfd(0, EFD_NONBLOCK);
+    if (efd < 0) return 1;
+    for (int i = 0; i < EV_THREADS; i++) pthread_create(&ev[i], NULL, ev_adder, (void *)(intptr_t)efd);
+    uint64_t sum = 0;
+    while (sum < (uint64_t)EV_THREADS * EV_ADDS) {
+        struct pollfd p = { efd, POLLIN, 0 };
+        if (poll(&p, 1, 5000) != 1) { us_errors++; break; }
+        uint64_t v;
+        if (read(efd, &v, 8) == 8) sum += v;
+    }
+    if (sum != (uint64_t)EV_THREADS * EV_ADDS) us_errors++;
+    for (int i = 0; i < EV_THREADS; i++) pthread_join(ev[i], NULL);
+    close(efd);
+    for (int i = 0; i < PP_PIPES; i++) { pthread_join(w[i], NULL); pthread_join(r[i], NULL); close(pv[i][0]); }
+    return us_errors;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -373,6 +458,11 @@ int main(void)
     int ubad = 0;
     for (int r = 0; r < 2; r++) ubad += unix_round();
     CHECK(ubad == 0, "4 streams x 2 MiB checked byte by byte, 300 records with descriptors, 200 close-while-reading (2 rounds)");
+
+    printf("pipes, eventfds and poll on several CPUs:\n");
+    int pbad = 0;
+    for (int r = 0; r < 2; r++) pbad += pipe_poll_round();
+    CHECK(pbad == 0, "4 pipes x 1 MiB read after poll, 4 threads x 5000 eventfd adds summed (2 rounds)");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

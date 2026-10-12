@@ -67,19 +67,20 @@ static struct file *fget(int fd)
     uint64_t fl = spin_lock_irqsave(&fs->lock);
     struct file *f = vfs_file_get(fs->fd[fd]);
     spin_unlock_keep_irqs(&fs->lock);
-    if (f && !bkl_depth() && (!usock_is(f) || f->ep_links)) bkl_enter();
+    if (f && !bkl_depth() && (!file_nolock(f) || f->ep_links)) bkl_enter();
     if (f && f->ep_links) epoll_file_used(f);           /* I/O on it re-arms EPOLLET watches */
     irq_restore(fl);
     return f;
 }
 
-/* Is fd a unix socket (the dispatcher's guess; fget makes sure)? */
-static bool fd_is_usock(uint64_t fd)
+/* Is fd a file that does without the kernel lock: a unix socket, a pipe,
+ * an eventfd (the dispatcher's guess; fget makes sure)? */
+static bool fd_nolock(uint64_t fd)
 {
     if (fd >= MAX_FDS) return false;
     struct files_struct *fs = current_task()->files;
     uint64_t fl = spin_lock_irqsave(&fs->lock);
-    bool r = usock_is(fs->fd[fd]);
+    bool r = file_nolock(fs->fd[fd]);
     spin_unlock_irqrestore(&fs->lock, fl);
     return r;
 }
@@ -3084,10 +3085,14 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_getuid:         case SYS_geteuid:        case SYS_getgid:        case SYS_getegid:
     case SYS_sched_getaffinity:
         return true;
-    /* data through a unix socket (fs/unixsock.c has its own lock) */
+    /* data through a unix socket, a pipe or an eventfd (each has its own lock) */
     case SYS_read: case SYS_write: case SYS_readv: case SYS_writev:
     case SYS_recvmsg: case SYS_sendmsg: case SYS_recvfrom: case SYS_sendto:
-        return fd_is_usock(f->rdi);
+        return fd_nolock(f->rdi);
+    /* waiting on descriptors: fget takes the kernel lock at the first file
+     * that needs it, and the call keeps it from then on */
+    case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
+        return true;
     default:
         return false;
     }
