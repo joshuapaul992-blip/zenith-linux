@@ -663,8 +663,13 @@ ssize_t vfs_read(struct file *f, void *buf, size_t len)
     if (f->vn->type == VDIR) return -EISDIR;
     if (f->vn->ops && f->vn->ops->fread) return f->vn->ops->fread(f, buf, len);
     if (!f->vn->ops || !f->vn->ops->read) return -EINVAL;
+    /* Threads sharing a regular file read it in turn. Not other files: a read
+     * of a terminal can block, and fd 0 and fd 1 are often one file. */
+    bool reg = f->vn->type == VREG;
+    if (reg) kmutex_lock(&f->pos_lock);
     ssize_t n = f->vn->ops->read(f->vn, buf, len, f->off);
     if (n > 0) f->off += (uint64_t)n;
+    if (reg) kmutex_unlock(&f->pos_lock);
     return n;
 }
 
@@ -692,10 +697,16 @@ ssize_t vfs_write(struct file *f, const void *buf, size_t len)
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -EBADF;
     if (f->vn->ops && f->vn->ops->fwrite) return f->vn->ops->fwrite(f, buf, len);
     if (!f->vn->ops || !f->vn->ops->write) return -EINVAL;
-    if (f->flags & O_APPEND) f->off = node_size(f->vn);
-    ssize_t n = f->vn->ops->write(f->vn, buf, len, f->off);
+    bool reg = f->vn->type == VREG;
+    if (reg) kmutex_lock(&f->pos_lock);
+    /* O_APPEND on a file that locks itself: the file system finds the end
+     * under its own lock, so two appenders never write over each other */
+    bool append = (f->flags & O_APPEND) && reg && f->vn->ops->nolock;
+    if (f->flags & O_APPEND && !append) f->off = node_size(f->vn);
+    ssize_t n = f->vn->ops->write(f->vn, buf, len, append ? VFS_APPEND : f->off);
+    if (n > 0) f->off = append ? node_size(f->vn) : f->off + (uint64_t)n;
+    if (reg) kmutex_unlock(&f->pos_lock);
     if (n > 0) {
-        f->off += (uint64_t)n;
         f->vn->mtime = (uint64_t)time_realtime_sec();
         if (f->vn->type == VREG) inotify_self(f->vn, IN_MODIFY);
     }
@@ -708,8 +719,16 @@ off_t vfs_lseek(struct file *f, off_t off, int whence)
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->off
                  : whence == SEEK_END ? (int64_t)node_size(f->vn) : -1;
     if (base < 0 || base + off < 0) return -EINVAL;
-    f->off = (uint64_t)(base + off);
-    return (off_t)f->off;
+    /* In turn with reads and writes (the position lock), or with getdents
+     * of a directory (the big lock, which getdents still runs under) */
+    bool reg = f->vn->type == VREG, dir = f->vn->type == VDIR;
+    if (reg) kmutex_lock(&f->pos_lock);
+    if (dir) bkl_enter();
+    if (whence == SEEK_CUR) base = (int64_t)f->off;
+    off_t r = base + off < 0 ? -EINVAL : (off_t)(f->off = (uint64_t)(base + off));
+    if (dir) bkl_exit();
+    if (reg) kmutex_unlock(&f->pos_lock);
+    return r;
 }
 
 static uint8_t dtype(struct vnode *vn)
@@ -890,27 +909,40 @@ int vfs_poll(struct file *f, int events)
 /* ======================================================================= */
 
 /* Regular files keep their bytes in a vm_object (created on first write),
- * so shared mappings of the file and read()/write() stay coherent. */
+ * so shared mappings of the file and read()/write() stay coherent. The
+ * object locks itself: reads and writes run without the big kernel lock
+ * (vnode_ops.nolock). */
 static ssize_t ramfs_read(struct vnode *vn, void *buf, size_t len, uint64_t off)
 {
-    return vn->data ? vmobj_read(vn->data, buf, len, off) : 0;
+    struct vm_object *o = __atomic_load_n((struct vm_object **)&vn->data, __ATOMIC_ACQUIRE);
+    return o ? vmobj_read(o, buf, len, off) : 0;
 }
 
 static struct vm_object *ramfs_vmobject(struct vnode *vn)
 {
     if (vn->type != VREG) return NULL;
-    if (!vn->data) vn->data = vmobj_new(0);
-    return vn->data;
+    struct vm_object *o = __atomic_load_n((struct vm_object **)&vn->data, __ATOMIC_ACQUIRE);
+    if (o) return o;
+    struct vm_object *n = vmobj_new(0), *none = NULL;
+    if (!n) return NULL;
+    if (__atomic_compare_exchange_n((struct vm_object **)&vn->data, &none, n, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return n;
+    vmobj_put(n);                                       /* another CPU made it first */
+    return none;
 }
 
 static ssize_t ramfs_write(struct vnode *vn, const void *buf, size_t len, uint64_t off)
 {
     struct vm_object *o = ramfs_vmobject(vn);
     if (!o) return -ENOSPC;
-    if (o->seals & 0x0008 && len) return -EPERM;        /* F_SEAL_WRITE */
-    if ((o->seals & 0x0004) && off + len > o->size) return -EPERM;    /* F_SEAL_GROW */
-    ssize_t n = vmobj_write(o, buf, len, off);
+    kmutex_lock(&o->wlock);                             /* the end holds still for O_APPEND */
+    ssize_t n;
+    if (off == VFS_APPEND) off = o->size;
+    if (o->seals & 0x0008 && len) n = -EPERM;           /* F_SEAL_WRITE */
+    else if ((o->seals & 0x0004) && off + len > o->size) n = -EPERM;   /* F_SEAL_GROW */
+    else n = vmobj_write(o, buf, len, off);
     if (n > 0) vn->size = o->size;
+    kmutex_unlock(&o->wlock);
     return n;
 }
 
@@ -923,15 +955,18 @@ static int ramfs_truncate(struct vnode *vn, uint64_t size)
 {
     struct vm_object *o = ramfs_vmobject(vn);
     if (!o) return -ENOMEM;
-    if ((o->seals & 0x0002) && size < o->size) return -EPERM;   /* F_SEAL_SHRINK */
-    if ((o->seals & 0x0004) && size > o->size) return -EPERM;   /* F_SEAL_GROW */
-    int r = vmobj_truncate(o, size);
+    kmutex_lock(&o->wlock);
+    int r;
+    if ((o->seals & 0x0002) && size < o->size) r = -EPERM;      /* F_SEAL_SHRINK */
+    else if ((o->seals & 0x0004) && size > o->size) r = -EPERM; /* F_SEAL_GROW */
+    else r = vmobj_truncate(o, size);
     if (!r) vn->size = size;
+    kmutex_unlock(&o->wlock);
     return r;
 }
 
 const struct vnode_ops ramfs_ops = { .read = ramfs_read, .write = ramfs_write, .size = ramfs_size,
-                                     .truncate = ramfs_truncate, .vmobject = ramfs_vmobject };
+                                     .truncate = ramfs_truncate, .vmobject = ramfs_vmobject, .nolock = true };
 
 /* in-memory symbolic links: the target string in vn->data */
 static int ramfs_readlink(struct vnode *vn, char *buf, size_t size)

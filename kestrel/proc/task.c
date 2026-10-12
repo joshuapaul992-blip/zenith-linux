@@ -615,27 +615,40 @@ void sleep_on_until(void *chan, uint64_t deadline_ms)
 }
 
 /* Mutexes are taken with and without the big kernel lock (an address
- * space's, by mmap and by faults): one spinlock makes taking one atomic. */
+ * space's, a file's position, a volume's). A free mutex is taken with one
+ * locked exchange; kmutex_spin orders waiting against releasing, and a
+ * release wakes only a mutex someone sleeps on. */
 static struct spinlock kmutex_spin;
 
 void kmutex_lock(struct kmutex *m)
 {
+    struct tcb *none = NULL;
+    if (__atomic_compare_exchange_n(&m->owner, &none, cur, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        m->depth = 1;                           /* free: taken without the spinlock */
+        return;
+    }
+    if (none == cur) { m->depth++; return; }    /* ours already: only we change it */
     uint64_t f = spin_lock_irqsave(&kmutex_spin);
-    if (m->owner == cur) { m->depth++; spin_unlock_irqrestore(&kmutex_spin, f); return; }
-    while (m->owner) sleep_on_locked(m, &kmutex_spin);
-    __atomic_store_n(&m->owner, cur, __ATOMIC_RELEASE);
+    m->waiters++;
+    for (;;) {
+        none = NULL;
+        if (__atomic_compare_exchange_n(&m->owner, &none, cur, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
+        sleep_on_locked(m, &kmutex_spin);
+    }
+    m->waiters--;
     m->depth = 1;
     spin_unlock_irqrestore(&kmutex_spin, f);
 }
 
 void kmutex_unlock(struct kmutex *m)
 {
-    uint64_t f = spin_lock_irqsave(&kmutex_spin);
     if (m->owner != cur) panic("kmutex_unlock: not the owner (pid %d)", cur->pid);
-    if (--m->depth == 0) {
-        __atomic_store_n(&m->owner, NULL, __ATOMIC_RELEASE);
-        wakeup_waiters(m);                      /* nobody polls a mutex */
-    }
+    if (--m->depth > 0) return;
+    /* A waiter counts itself and re-checks the owner under kmutex_spin, so
+     * a release under it either is seen or is followed by the wakeup. */
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
+    __atomic_store_n(&m->owner, NULL, __ATOMIC_RELEASE);
+    if (m->waiters) wakeup_waiters(m);          /* nobody polls a mutex */
     spin_unlock_irqrestore(&kmutex_spin, f);
 }
 

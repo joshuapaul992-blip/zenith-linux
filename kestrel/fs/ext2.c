@@ -115,10 +115,12 @@
 #define RAW_INODE     256                   /* bytes of the on-disk inode kept */
 #define RA_PAGES      32                    /* a page cache miss reads up to 128 KiB */
 
-static inline uint16_t g16(const uint8_t *p) { uint16_t v; memcpy(&v, p, 2); return v; }
-static inline uint32_t g32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
-static inline void p16(uint8_t *p, uint16_t v) { memcpy(p, &v, 2); }
-static inline void p32(uint8_t *p, uint32_t v) { memcpy(p, &v, 4); }
+/* One load or store each (the kernel is -ffreestanding: a plain memcpy
+ * would be the byte loop in lib/string.c) */
+static inline uint16_t g16(const uint8_t *p) { uint16_t v; __builtin_memcpy(&v, p, 2); return v; }
+static inline uint32_t g32(const uint8_t *p) { uint32_t v; __builtin_memcpy(&v, p, 4); return v; }
+static inline void p16(uint8_t *p, uint16_t v) { __builtin_memcpy(p, &v, 2); }
+static inline void p32(uint8_t *p, uint32_t v) { __builtin_memcpy(p, &v, 4); }
 
 /* ---- the volume ------------------------------------------------------------------ */
 struct buf {
@@ -134,7 +136,7 @@ struct e2ino {
     uint32_t ino;
     int      refs;                          /* vnodes */
     struct pcache *pc;                      /* regular files: cached pages, once read */
-    uint8_t  raw[RAW_INODE];
+    uint8_t  raw[RAW_INODE] __attribute__((aligned(8)));    /* the size halves load whole */
     struct e2ino *next;
 };
 
@@ -325,20 +327,30 @@ static struct e2ino *iget(struct e2fs *fs, uint32_t ino)
 
 static uint64_t i_size(struct e2ino *e)
 {
-    uint64_t s = g32(e->raw + I_SIZE);
-    if ((g16(e->raw + I_MODE) & S_IFMT) == S_IFREG) s |= (uint64_t)g32(e->raw + I_SIZE_HIGH) << 32;
+    uint64_t s = __atomic_load_n((uint32_t *)(e->raw + I_SIZE), __ATOMIC_ACQUIRE);
+    if ((g16(e->raw + I_MODE) & S_IFMT) == S_IFREG)
+        s |= (uint64_t)__atomic_load_n((uint32_t *)(e->raw + I_SIZE_HIGH), __ATOMIC_ACQUIRE) << 32;
     return s;
 }
 
+/* fs->lock held. e2_size reads the size without it: the two halves are
+ * stored so that a mix of old and new is at least 2 GiB, where it takes
+ * the lock (the high half first when growing, the low half first when
+ * shrinking). */
 static void set_size(struct e2fs *fs, struct e2ino *e, uint64_t s)
 {
-    p32(e->raw + I_SIZE, (uint32_t)s);
-    if ((g16(e->raw + I_MODE) & S_IFMT) == S_IFREG) {
-        p32(e->raw + I_SIZE_HIGH, (uint32_t)(s >> 32));
-        if ((s >> 31) && !(g32(fs->sb + SB_FEATURE_RO) & RO_LARGE_FILE)) {
-            p32(fs->sb + SB_FEATURE_RO, g32(fs->sb + SB_FEATURE_RO) | RO_LARGE_FILE);
-            fs->sb_dirty = true;
-        }
+    uint32_t *lo = (uint32_t *)(e->raw + I_SIZE), *hi = (uint32_t *)(e->raw + I_SIZE_HIGH);
+    if ((g16(e->raw + I_MODE) & S_IFMT) != S_IFREG) { __atomic_store_n(lo, (uint32_t)s, __ATOMIC_RELEASE); return; }
+    if (s > i_size(e)) {
+        __atomic_store_n(hi, (uint32_t)(s >> 32), __ATOMIC_RELEASE);
+        __atomic_store_n(lo, (uint32_t)s, __ATOMIC_RELEASE);
+    } else {
+        __atomic_store_n(lo, (uint32_t)s, __ATOMIC_RELEASE);
+        __atomic_store_n(hi, (uint32_t)(s >> 32), __ATOMIC_RELEASE);
+    }
+    if ((s >> 31) && !(g32(fs->sb + SB_FEATURE_RO) & RO_LARGE_FILE)) {
+        p32(fs->sb + SB_FEATURE_RO, g32(fs->sb + SB_FEATURE_RO) | RO_LARGE_FILE);
+        fs->sb_dirty = true;
     }
 }
 
@@ -671,7 +683,11 @@ static int fill_blocks(struct e2fs *fs, struct e2ino *e, uint64_t idx, const uin
 /* Page `idx` of the file, referenced for the caller; fs->lock held. */
 static int getpage_locked(struct e2fs *fs, struct e2ino *e, uint64_t idx, uint64_t *out)
 {
-    if (!e->pc && !(e->pc = pcache_new())) return -ENOMEM;
+    if (!e->pc) {                                       /* e2_getpage looks without fs->lock */
+        struct pcache *pc = pcache_new();
+        if (!pc) return -ENOMEM;
+        __atomic_store_n(&e->pc, pc, __ATOMIC_RELEASE);
+    }
     uint64_t p = pcache_lookup(e->pc, idx, true);
     if (p) { *out = p; return 0; }
     if (idx * PAGE_SIZE >= i_size(e)) {                 /* past the end: zeros, not cached */
@@ -718,7 +734,8 @@ static int e2_getpage(struct vnode *vn, uint64_t idx, bool io, uint64_t *phys)
 {
     struct e2ino *e = ino_of(vn);
     if (!io) {                                          /* no I/O, no volume lock */
-        *phys = e->pc ? pcache_lookup(e->pc, idx, false) : 0;
+        struct pcache *pc = __atomic_load_n(&e->pc, __ATOMIC_ACQUIRE);
+        *phys = pc ? pcache_lookup(pc, idx, false) : 0;
         return 0;
     }
     struct e2fs *fs = fs_of(vn);
@@ -792,13 +809,25 @@ static ssize_t e2_write(struct vnode *vn, const void *buf, size_t len, uint64_t 
     if (fs->rdonly) return -EROFS;
     kmutex_lock(&fs->lock);
     struct e2ino *e = ino_of(vn);
+    if (off == VFS_APPEND) off = i_size(e);
     ssize_t r = e2_write_locked(fs, e, buf, len, off);
     if (r > 0) { touch(vn, e, true); inode_write(fs, e); vn->blocks = g32(e->raw + I_BLOCKS); }
     kmutex_unlock(&fs->lock);
     return r;
 }
 
-static uint64_t e2_size(struct vnode *vn) { return i_size(ino_of(vn)); }
+static uint64_t e2_size(struct vnode *vn)
+{
+    struct e2ino *e = ino_of(vn);
+    uint64_t s = i_size(e);                             /* low half, then high (set_size) */
+    if (s >> 31) {                                      /* maybe mixed: ask under the lock */
+        struct e2fs *fs = fs_of(vn);
+        kmutex_lock(&fs->lock);
+        s = i_size(e);
+        kmutex_unlock(&fs->lock);
+    }
+    return s;
+}
 
 static int e2_truncate(struct vnode *vn, uint64_t size)
 {
@@ -852,7 +881,13 @@ static struct vnode *make_vnode(struct e2fs *fs, struct e2ino *e, const char *na
     return vn;
 }
 
-static void e2_getattr(struct vnode *vn) { fill_vnode(vn, ino_of(vn)); }
+static void e2_getattr(struct vnode *vn)
+{
+    struct e2fs *fs = fs_of(vn);
+    kmutex_lock(&fs->lock);                             /* fstat runs without the big lock */
+    fill_vnode(vn, ino_of(vn));
+    kmutex_unlock(&fs->lock);
+}
 
 static void release_inode(struct e2fs *fs, struct e2ino *e)
 {
@@ -1252,6 +1287,7 @@ out:
 static const struct vnode_ops e2_file_ops = {
     .read = e2_read, .write = e2_write, .size = e2_size, .truncate = e2_truncate, .getpage = e2_getpage,
     .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
+    .nolock = true,                                     /* fs->lock; block I/O takes the big lock itself */
 };
 static const struct vnode_ops e2_dir_ops = {
     .refresh = e2_refresh, .create = e2_create, .link = e2_link, .remove = e2_remove, .rename = e2_rename,

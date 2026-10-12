@@ -14,6 +14,8 @@
 #include <kernel/mm.h>
 #include <kernel/cpu.h>
 #include <kernel/string.h>
+#include <kernel/spinlock.h>
+#include <kernel/smp.h>
 
 #define NONBLOCK_FLAG   04000
 #define CLOEXEC_FLAG    02000000
@@ -45,6 +47,11 @@ struct inotify {
     bool            overflowed;
 };
 
+/* in_lock covers every instance's watches and queue, the instance list and
+ * nwatches. Writes of regular files report IN_MODIFY without the big lock;
+ * the names and parents of vnodes still need it (renames), so only an
+ * event someone watches takes it. */
+static struct spinlock in_lock;
 static struct inotify *instances;
 static int nwatches;
 
@@ -89,7 +96,7 @@ static void drop_watch(struct inotify *in, struct watch **pp)
 void inotify_event(struct vnode *vn, uint32_t mask, const char *name, uint32_t cookie)
 {
     if (!nwatches || !vn) return;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     for (struct inotify *in = instances; in; in = in->next) {
         for (struct watch **pp = &in->watches; *pp; ) {
             struct watch *w = *pp;
@@ -100,7 +107,19 @@ void inotify_event(struct vnode *vn, uint32_t mask, const char *name, uint32_t c
             pp = &w->next;
         }
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&in_lock, fl);
+}
+
+/* Is vn, or vn2, watched at all? */
+static bool watched(struct vnode *vn, struct vnode *vn2)
+{
+    bool r = false;
+    uint64_t fl = spin_lock_irqsave(&in_lock);
+    for (struct inotify *in = instances; in && !r; in = in->next)
+        for (struct watch *w = in->watches; w && !r; w = w->next)
+            r = w->vn == vn || w->vn == vn2;
+    spin_unlock_irqrestore(&in_lock, fl);
+    return r;
 }
 
 /* Something happened to vn itself: its own watches, and its directory's
@@ -108,40 +127,45 @@ void inotify_event(struct vnode *vn, uint32_t mask, const char *name, uint32_t c
 void inotify_self(struct vnode *vn, uint32_t mask)
 {
     if (!nwatches || !vn) return;
+    if (!watched(vn, __atomic_load_n(&vn->parent, __ATOMIC_RELAXED))) return;     /* only compared */
+    bkl_enter();                                        /* vn->parent and vn->name hold still */
     uint32_t dir = vn->type == VDIR ? IN_ISDIR : 0;
     inotify_event(vn, mask | dir, NULL, 0);
     if (vn->parent && vn->parent != vn) inotify_event(vn->parent, mask | dir, vn->name, 0);
+    bkl_exit();
 }
 
 void inotify_vnode_gone(struct vnode *vn)
 {
     if (!nwatches) return;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     for (struct inotify *in = instances; in; in = in->next)
         for (struct watch **pp = &in->watches; *pp; ) {
             if ((*pp)->vn == vn) drop_watch(in, pp);
             else pp = &(*pp)->next;
         }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&in_lock, fl);
 }
 
 uint32_t inotify_cookie(void)
 {
     static uint32_t c;
-    return ++c ? c : ++c;
+    uint32_t r;
+    while (!(r = __atomic_add_fetch(&c, 1, __ATOMIC_RELAXED))) ;
+    return r;
 }
 
 /* ---- the descriptor ------------------------------------------------------------- */
 static ssize_t in_read(struct file *f, void *buf, size_t len)
 {
     struct inotify *in = f->vn->data;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     while (!in->head) {
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(in);
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&in_lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&in_lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(in, &in_lock);
     }
-    if (ev_size(in->head) > len) { irq_restore(fl); return -EINVAL; }   /* not even one fits */
+    if (ev_size(in->head) > len) { spin_unlock_irqrestore(&in_lock, fl); return -EINVAL; }   /* not even one fits */
     size_t n = 0;
     uint8_t *out = buf;
     while (in->head && n + ev_size(in->head) <= len) {
@@ -155,7 +179,7 @@ static ssize_t in_read(struct file *f, void *buf, size_t len)
         kfree(e);
     }
     if (!in->head) in->overflowed = false;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&in_lock, fl);
     return (ssize_t)n;
 }
 
@@ -177,12 +201,12 @@ static int in_ioctl(struct file *f, unsigned long req, void *arg)
 static void in_release(struct file *f)
 {
     struct inotify *in = f->vn->data;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     for (struct inotify **pp = &instances; *pp; pp = &(*pp)->next)
         if (*pp == in) { *pp = in->next; break; }
     while (in->watches) { struct watch *w = in->watches; in->watches = w->next; kfree(w); nwatches--; }
     while (in->head) { struct ino_ev *e = in->head; in->head = e->next; kfree(e); }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&in_lock, fl);
     kfree(in);
 }
 
@@ -203,10 +227,10 @@ int inotify_create(int flags, struct file **out)
     in->next_wd = 1;
     *out = vfs_file_new(&in->vn, O_RDONLY | (flags & NONBLOCK_FLAG ? O_NONBLOCK : 0));
     if (!*out) { kfree(in); return -ENOMEM; }
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     in->next = instances;
     instances = in;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&in_lock, fl);
     return 0;
 }
 
@@ -220,25 +244,25 @@ int inotify_add(struct file *f, struct vnode *vn, uint32_t mask)
     uint32_t events = mask & IN_ALL_EVENTS;
     if (!events) return -EINVAL;
     if ((mask & IN_MASK_ADD) && (mask & IN_MASK_CREATE)) return -EINVAL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     for (struct watch *w = in->watches; w; w = w->next)
         if (w->vn == vn) {
-            if (mask & IN_MASK_CREATE) { irq_restore(fl); return -EEXIST; }
+            if (mask & IN_MASK_CREATE) { spin_unlock_irqrestore(&in_lock, fl); return -EEXIST; }
             w->mask = (mask & IN_MASK_ADD) ? w->mask | events : events;
             w->mask |= mask & IN_ONESHOT;
-            irq_restore(fl);
+            spin_unlock_irqrestore(&in_lock, fl);
             return w->wd;
         }
-    if (nwatches >= WATCHES_MAX) { irq_restore(fl); return -ENOSPC; }
+    if (nwatches >= WATCHES_MAX) { spin_unlock_irqrestore(&in_lock, fl); return -ENOSPC; }
     struct watch *w = kzalloc(sizeof *w);
-    if (!w) { irq_restore(fl); return -ENOMEM; }
+    if (!w) { spin_unlock_irqrestore(&in_lock, fl); return -ENOMEM; }
     w->vn = vn;
     w->wd = in->next_wd++;
     w->mask = events | (mask & IN_ONESHOT);
     w->next = in->watches;
     in->watches = w;
     nwatches++;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&in_lock, fl);
     return w->wd;
 }
 
@@ -246,9 +270,9 @@ int inotify_rm(struct file *f, int wd)
 {
     if (!inotify_is(f)) return -EINVAL;
     struct inotify *in = f->vn->data;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&in_lock);
     for (struct watch **pp = &in->watches; *pp; pp = &(*pp)->next)
-        if ((*pp)->wd == wd) { drop_watch(in, pp); irq_restore(fl); return 0; }
-    irq_restore(fl);
+        if ((*pp)->wd == wd) { drop_watch(in, pp); spin_unlock_irqrestore(&in_lock, fl); return 0; }
+    spin_unlock_irqrestore(&in_lock, fl);
     return -EINVAL;
 }

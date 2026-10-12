@@ -9,6 +9,7 @@
 #include <kernel/posix.h>
 #include <kernel/cpu.h>
 #include <kernel/task.h>
+#include <kernel/smp.h>
 
 #define BLK_MAJOR       259             /* "blkext", as on Linux */
 #define BOUNCE_MAX      (64u * 1024)
@@ -72,7 +73,47 @@ static void disk_lock(struct blkdev *d)
 }
 static void disk_unlock(struct blkdev *d) { d->io_busy = false; io_wake(d); }
 
+/* The disk drivers (and the xHCI one, which USB input shares) still
+ * expect the big kernel lock: a caller without it (a file read that missed
+ * the page cache) takes it for the request. A request sleeps while the
+ * device works, and the lock is let go meanwhile. */
+static bool io_lock(void)
+{
+    if (bkl_depth()) return false;
+    bkl_enter();
+    return true;
+}
+static void io_unlock(bool took) { if (took) bkl_exit(); }
+
+static int read_locked(struct blkdev *b, uint64_t lba, uint32_t count, void *buf);
+static int write_locked(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf);
+static int flush_locked(struct blkdev *b);
+
 int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
+{
+    bool took = io_lock();
+    int r = read_locked(b, lba, count, buf);
+    io_unlock(took);
+    return r;
+}
+
+int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
+{
+    bool took = io_lock();
+    int r = write_locked(b, lba, count, buf);
+    io_unlock(took);
+    return r;
+}
+
+int blk_flush(struct blkdev *b)
+{
+    bool took = io_lock();
+    int r = flush_locked(b);
+    io_unlock(took);
+    return r;
+}
+
+static int read_locked(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
 {
     if (!b || !buf) return -EINVAL;
     if (count == 0) return 0;
@@ -102,7 +143,7 @@ int blk_read(struct blkdev *b, uint64_t lba, uint32_t count, void *buf)
     return rc;
 }
 
-int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
+static int write_locked(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
 {
     if (!b || !buf) return -EINVAL;
     if (count == 0) return 0;
@@ -127,7 +168,7 @@ int blk_write(struct blkdev *b, uint64_t lba, uint32_t count, const void *buf)
     return rc;
 }
 
-int blk_flush(struct blkdev *b)
+static int flush_locked(struct blkdev *b)
 {
     struct blkdev *disk = blk_disk_of(b);
     if (!disk || !disk->ops->flush) return 0;

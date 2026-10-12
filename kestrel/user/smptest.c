@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <poll.h>
 
@@ -438,6 +439,156 @@ static int pipe_poll_round(void)
     return us_errors;
 }
 
+/* ---- regular files: one open file shared by several CPUs ---------------------------- */
+#define RF_THREADS  4
+#define RF_RECS     1500                /* records per thread */
+#define RF_REC      64
+static const char *rf_path;
+static int rf_fd;
+static volatile int rf_errors;
+static const char *volatile rf_why;           /* the first failure */
+static volatile long rf_got, rf_at;
+#define RF_FAIL(what, got, at) do { if (!rf_errors) { rf_why = (what); rf_got = (long)(got); rf_at = (long)(at); } rf_errors++; } while (0)
+
+static void rf_fill(unsigned char *r, int t, int seq)
+{
+    memset(r, 0, RF_REC);
+    r[0] = 0xA5; r[1] = (unsigned char)t; r[2] = (unsigned char)seq; r[3] = (unsigned char)(seq >> 8);
+    for (int i = 4; i < RF_REC; i++) r[i] = (unsigned char)(t * 31 + seq * 7 + i);
+}
+static int rf_ok(const unsigned char *r, int *t, int *seq)
+{
+    if (r[0] != 0xA5 || r[1] >= RF_THREADS) return 0;
+    *t = r[1]; *seq = r[2] | r[3] << 8;
+    if (*seq >= RF_RECS) return 0;
+    unsigned char e[RF_REC];
+    rf_fill(e, *t, *seq);
+    return !memcmp(e, r, RF_REC);
+}
+static void *rf_writer(void *arg)             /* write() on the shared descriptor */
+{
+    int t = (int)(intptr_t)arg;
+    unsigned char r[RF_REC];
+    for (int i = 0; i < RF_RECS; i++) {
+        rf_fill(r, t, i);
+        { ssize_t n = write(rf_fd, r, RF_REC); if (n != RF_REC) RF_FAIL("write", n < 0 ? -errno : n, i); }
+        if (i % 500 == 250 && fsync(rf_fd)) RF_FAIL("fsync", -errno, i);
+    }
+    return NULL;
+}
+static void *rf_appender(void *arg)           /* write() with O_APPEND, each on its own descriptor */
+{
+    int t = (int)(intptr_t)arg;
+    int fd = open(rf_path, O_WRONLY | O_APPEND);
+    if (fd < 0) { RF_FAIL("open O_APPEND", -errno, 0); return NULL; }
+    unsigned char r[RF_REC];
+    for (int i = 0; i < RF_RECS; i++) {
+        rf_fill(r, t, i);
+        { ssize_t n = write(fd, r, RF_REC); if (n != RF_REC) RF_FAIL("append write", n < 0 ? -errno : n, i); }
+    }
+    close(fd);
+    return NULL;
+}
+static unsigned char rf_seen[RF_THREADS][RF_RECS];
+static void *rf_reader(void *arg)             /* read() on the shared descriptor */
+{
+    (void)arg;
+    unsigned char r[RF_REC];
+    for (;;) {
+        ssize_t n = read(rf_fd, r, RF_REC);
+        if (n == 0) break;
+        int t, seq;
+        if (n != RF_REC || !rf_ok(r, &t, &seq)) { RF_FAIL(n != RF_REC ? "read: short" : "read: bad record", n < 0 ? -errno : n, lseek(rf_fd, 0, SEEK_CUR)); break; }
+        __atomic_add_fetch(&rf_seen[t][seq], 1, __ATOMIC_RELAXED);
+        { off_t o = lseek(rf_fd, 0, SEEK_CUR); if (o % RF_REC) RF_FAIL("lseek mid-record", o, 0); }      /* never mid-record */
+    }
+    return NULL;
+}
+static void *rf_pwriter(void *arg)            /* pwrite() of a region of its own */
+{
+    int t = (int)(intptr_t)arg;
+    unsigned char r[RF_REC];
+    for (int i = 0; i < RF_RECS; i++) {
+        rf_fill(r, t, i);
+        { ssize_t n = pwrite(rf_fd, r, RF_REC, ((off_t)t * RF_RECS + i) * RF_REC); if (n != RF_REC) RF_FAIL("pwrite", n < 0 ? -errno : n, i); }
+    }
+    return NULL;
+}
+static volatile int rf_stop;
+static void *rf_statter(void *arg)            /* fstat as the file grows: never shrinks */
+{
+    (void)arg;
+    off_t last = 0;
+    while (!rf_stop) {
+        struct stat st;
+        if (fstat(rf_fd, &st) || st.st_size < last || st.st_size % RF_REC) { RF_FAIL("fstat size", st.st_size, last); break; }
+        last = st.st_size;
+        unsigned char r[RF_REC];
+        if (last) { ssize_t n = pread(rf_fd, r, RF_REC, last - RF_REC); if (n != RF_REC) RF_FAIL("pread of the last record", n < 0 ? -errno : n, last); }
+    }
+    return NULL;
+}
+
+/* The whole file: every thread's every record exactly once, anywhere if
+ * !in_place, else at its own place. */
+static int rf_check(int in_place)
+{
+    int errs = 0;
+    struct stat st;
+    if (fstat(rf_fd, &st) || st.st_size != (off_t)RF_THREADS * RF_RECS * RF_REC) return 1;
+    memset(rf_seen, 0, sizeof rf_seen);
+    static unsigned char buf[RF_THREADS * RF_RECS * RF_REC];
+    if (pread(rf_fd, buf, sizeof buf, 0) != (ssize_t)sizeof buf) return 1;
+    for (int k = 0; k < RF_THREADS * RF_RECS; k++) {
+        int t, seq;
+        if (!rf_ok(buf + (size_t)k * RF_REC, &t, &seq)) { errs++; continue; }
+        if (in_place && k != t * RF_RECS + seq) errs++;
+        rf_seen[t][seq]++;
+    }
+    for (int t = 0; t < RF_THREADS; t++)
+        for (int i = 0; i < RF_RECS; i++) if (rf_seen[t][i] != 1) errs++;
+    return errs;
+}
+
+static int file_round(const char *path)
+{
+    pthread_t w[RF_THREADS], x;
+    int bad = 0;
+    rf_path = path;
+    rf_errors = 0;
+    /* 1: write() through one descriptor, with fsync and fstat alongside */
+    if ((rf_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644)) < 0) return 1;
+    rf_stop = 0;
+    pthread_create(&x, NULL, rf_statter, NULL);
+    for (int i = 0; i < RF_THREADS; i++) pthread_create(&w[i], NULL, rf_writer, (void *)(intptr_t)i);
+    for (int i = 0; i < RF_THREADS; i++) pthread_join(w[i], NULL);
+    rf_stop = 1;
+    pthread_join(x, NULL);
+    if (rf_check(0)) { printf("  FAIL detail: shared write(): records lost or torn\n"); bad++; }
+    /* 2: read() through the same descriptor: each record by exactly one thread */
+    memset(rf_seen, 0, sizeof rf_seen);
+    lseek(rf_fd, 0, SEEK_SET);
+    for (int i = 0; i < RF_THREADS; i++) pthread_create(&w[i], NULL, rf_reader, NULL);
+    for (int i = 0; i < RF_THREADS; i++) pthread_join(w[i], NULL);
+    for (int t = 0; t < RF_THREADS; t++)
+        for (int i = 0; i < RF_RECS; i++)
+            if (rf_seen[t][i] != 1) { printf("  FAIL detail: shared read(): a record read %d times\n", rf_seen[t][i]); bad++; t = RF_THREADS; break; }
+    /* 3: O_APPEND from four descriptors */
+    if (ftruncate(rf_fd, 0)) bad++;
+    for (int i = 0; i < RF_THREADS; i++) pthread_create(&w[i], NULL, rf_appender, (void *)(intptr_t)i);
+    for (int i = 0; i < RF_THREADS; i++) pthread_join(w[i], NULL);
+    if (rf_check(0)) { printf("  FAIL detail: O_APPEND: records lost or torn\n"); bad++; }
+    /* 4: pwrite() of separate regions */
+    if (ftruncate(rf_fd, 0)) bad++;
+    for (int i = 0; i < RF_THREADS; i++) pthread_create(&w[i], NULL, rf_pwriter, (void *)(intptr_t)i);
+    for (int i = 0; i < RF_THREADS; i++) pthread_join(w[i], NULL);
+    if (rf_check(1)) { printf("  FAIL detail: pwrite(): records lost or misplaced\n"); bad++; }
+    close(rf_fd);
+    unlink(path);
+    if (rf_errors) printf("  FAIL detail: %d call(s) failed; first: %s gave %ld at %ld\n", rf_errors, rf_why, rf_got, rf_at);
+    return bad + rf_errors;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -463,8 +614,17 @@ static void *churn(void *arg)
     return NULL;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 2 && !strcmp(argv[1], "files")) {          /* smptest files N: only the file rounds */
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) {
+            CHECK(file_round("/var/tmp/smptest.dat") == 0, "ext2 file round");
+            CHECK(file_round("/tmp/smptest.dat") == 0, "tmpfs file round");
+        }
+        printf("smptest files: %d failure(s)\n", failures);
+        return failures ? 1 : 0;
+    }
     setvbuf(stdout, NULL, _IONBF, 0);
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     printf("smptest: pid %d, %ld CPU(s) online\n", getpid(), n);
@@ -522,6 +682,12 @@ int main(void)
     int ebad = 0;
     for (int r = 0; r < 2; r++) ebad += epoll_round();
     CHECK(ebad == 0, "4 sockets x 512 KiB through edge-triggered epoll, read to EAGAIN (2 rounds)");
+
+    printf("regular files shared by several CPUs:\n");
+    CHECK(file_round("/var/tmp/smptest.dat") == 0,
+          "ext2: 4 threads x 1500 records by write(), read(), O_APPEND and pwrite(), fstat and fsync alongside");
+    CHECK(file_round("/tmp/smptest.dat") == 0,
+          "tmpfs: 4 threads x 1500 records by write(), read(), O_APPEND and pwrite(), fstat alongside");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

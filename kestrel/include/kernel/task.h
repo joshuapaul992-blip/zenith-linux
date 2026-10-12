@@ -7,6 +7,7 @@
 #include <stdbool.h>
 #include <kernel/kstat.h>
 #include <kernel/spinlock.h>
+#include <kernel/kmutex.h>
 
 #define MAX_TASKS       512             /* threads included */
 #define KSTACK_SIZE     (16 * 1024)
@@ -187,16 +188,6 @@ void        sched_tick_boot_fast(void);     /* the boot CPU's tick without the l
 void        sched_alarms(void);             /* due interval timers (big lock held)      */
 void        sched_alarm_armed(uint64_t at); /* ITIMER_REAL set to time_ms() `at`        */
 void        sched_idle_loop(void) __attribute__((noreturn));
-
-/* A sleeping, recursive mutex: the owner may lock it again (a page fault
- * inside a memory-management call); others sleep until it is free. */
-struct kmutex {
-    struct tcb *owner;
-    int         depth;
-};
-void        kmutex_lock(struct kmutex *m);
-void        kmutex_unlock(struct kmutex *m);
-bool        kmutex_held(const struct kmutex *m);   /* by the calling task */
 
 void        sleep_on(void *chan);       /* call with interrupts disabled */
 /* sleep_on() for code under spinlock l (taken with interrupts off): the

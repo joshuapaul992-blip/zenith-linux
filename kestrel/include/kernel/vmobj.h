@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <kernel/posix.h>
+#include <kernel/spinlock.h>
+#include <kernel/kmutex.h>
 
 struct vm_object {
     int       refs;             /* holders: vnodes, memfds, mappings (atomic) */
@@ -20,6 +22,8 @@ struct vm_object {
     uint64_t  npages;           /* capacity of pages[]                        */
     uint64_t *pages;            /* physical addresses, 0 = not yet allocated  */
     uint32_t  seals;            /* memfd F_SEAL_*                              */
+    struct spinlock lock;       /* pages[], npages and size                    */
+    struct kmutex   wlock;      /* writers and truncates, one at a time        */
 };
 
 #define VMOBJ_MAX_SIZE  (1ull << 36)                /* 64 GiB: refuse anything larger */

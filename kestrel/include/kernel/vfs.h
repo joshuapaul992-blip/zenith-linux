@@ -17,6 +17,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <kernel/posix.h>
+#include <kernel/kmutex.h>
 
 #define VFS_NAME_MAX 256              /* a name, with its NUL (Linux NAME_MAX 255) */
 #define VFS_PATH_MAX 1024             /* a path given to a call, with its NUL */
@@ -147,9 +148,14 @@ struct mount {
 };
 
 struct epitem;
+/* The `off` a write op gets for an O_APPEND write of a regular file: the
+ * file's end, which the file system reads under its own lock. */
+#define VFS_APPEND UINT64_MAX
+
 struct file {
     struct vnode *vn;
     uint64_t      off;
+    struct kmutex pos_lock;         /* off, across a read or write of a regular file */
     int           flags;
     int           refcnt;
     struct epitem *ep_links;        /* epoll sets watching this file (fs/epoll.c) */

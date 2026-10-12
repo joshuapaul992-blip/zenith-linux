@@ -74,7 +74,8 @@ static struct file *fget(int fd)
 }
 
 /* Is fd a file that does without the kernel lock: a unix socket, a pipe,
- * an eventfd (the dispatcher's guess; fget makes sure)? */
+ * an eventfd, a regular file on ext2 or tmpfs (the dispatcher's guess;
+ * fget makes sure)? */
 static bool fd_nolock(uint64_t fd)
 {
     if (fd >= MAX_FDS) return false;
@@ -3086,8 +3087,12 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_getuid:         case SYS_geteuid:        case SYS_getgid:        case SYS_getegid:
     case SYS_sched_getaffinity:
         return true;
-    /* data through a unix socket, a pipe or an eventfd (each has its own lock) */
+    /* data through a file that locks itself: a unix socket, a pipe, an
+     * eventfd, an ext2 or tmpfs file (the file system's lock, and the
+     * file's position lock) */
     case SYS_read: case SYS_write: case SYS_readv: case SYS_writev:
+    case SYS_pread64: case SYS_pwrite64: case SYS_lseek:
+    case SYS_fstat: case SYS_fsync: case SYS_fdatasync:
     case SYS_recvmsg: case SYS_sendmsg: case SYS_recvfrom: case SYS_sendto:
         return fd_nolock(f->rdi);
     /* waiting on descriptors: fget takes the kernel lock at the first file
@@ -3095,8 +3100,8 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
     case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
     case SYS_epoll_wait: case SYS_epoll_pwait:
         return true;
-    /* the address space: mm->lock (mm/vm.c). A file mapping takes the big
-     * lock in fget, MAP_POPULATE in sys_mmap. */
+    /* the address space: mm->lock (mm/vm.c). Mapping a file that needs the
+     * big lock takes it in fget, MAP_POPULATE in sys_mmap. */
     case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_brk:
     case SYS_madvise: case SYS_mremap:
         return true;
