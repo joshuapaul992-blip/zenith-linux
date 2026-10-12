@@ -23,6 +23,9 @@ size_t klog_size(void);
 
 __attribute__((noreturn, format(printf, 1, 2)))
 void panic(const char *fmt, ...);
+/* Called once by panic() with its message, interrupts off, before the
+ * machine halts (the Linux KPI's panic notifiers: pvpanic). */
+void panic_set_hook(void (*fn)(const char *msg));
 
 #define KASSERT(x) do { if (!(x)) panic("assertion failed: %s (%s:%d)", #x, __FILE__, __LINE__); } while (0)
 

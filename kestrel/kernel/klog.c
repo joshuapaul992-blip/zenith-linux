@@ -64,6 +64,10 @@ void kprintf(const char *fmt, ...)
     else con_write(&g_con, buf, (size_t)n);
 }
 
+static void (*panic_hook)(const char *msg);
+
+void panic_set_hook(void (*fn)(const char *msg)) { panic_hook = fn; }
+
 void panic(const char *fmt, ...)
 {
     cli();
@@ -76,6 +80,10 @@ void panic(const char *fmt, ...)
     serial_write("\n*** KERNEL PANIC: ");
     serial_write(buf);
     serial_write("\n");
+
+    void (*hook)(const char *) = panic_hook;
+    panic_hook = NULL;          /* once: a panic inside the hook goes straight on */
+    if (hook) hook(buf);
 
     if (g_fb.ready) {
         int w = 900, h = 120, x = ((int)g_fb.width - w) / 2, y = ((int)g_fb.height - h) / 2;
