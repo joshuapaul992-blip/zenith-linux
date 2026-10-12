@@ -3,7 +3,8 @@
  *
  *  See include/kernel/kinput.h. The producers run in interrupt context (IRQ1
  *  for PS/2, the timer-driven xHCI poll for USB); the queue is a ring of
- *  fixed-size records protected by disabling interrupts on the reader side.
+ *  fixed-size records guarded by a spinlock (qlock), so the display server
+ *  reads and polls the device without the big kernel lock.
  * ============================================================================= */
 #include <kernel/process.h>
 #include <kernel/kinput.h>
@@ -14,10 +15,12 @@
 #include <kernel/time.h>
 #include <kernel/klog.h>
 #include <kernel/uvm.h>
+#include <kernel/spinlock.h>
 
 #define QLEN 1024                       /* events; ~170 mouse reports of slack */
 
 static struct kinput_event q[QLEN];
+static struct spinlock qlock;           /* q, q_head, q_tail, the grab */
 static volatile uint32_t q_head, q_tail;
 static volatile bool grabbed;
 static struct file *grab_file;          /* the open file holding the grab */
@@ -29,10 +32,14 @@ bool kinput_grabbed(void) { return grabbed; }
 
 static void push(uint16_t type, uint16_t code, int32_t value)
 {
+    uint64_t fl = spin_lock_irqsave(&qlock);
     uint32_t next = (q_head + 1) % QLEN;
-    if (next == q_tail) { dropped++; return; }
-    q[q_head] = (struct kinput_event){ time_us(), type, code, value };
-    q_head = next;
+    if (next == q_tail) dropped++;
+    else {
+        q[q_head] = (struct kinput_event){ time_us(), type, code, value };
+        q_head = next;
+    }
+    spin_unlock_irqrestore(&qlock, fl);
 }
 
 static void commit(void) { wakeup(&q); }
@@ -118,17 +125,17 @@ static ssize_t kinput_fread(struct file *f, void *buf, size_t len)
     if (len < sizeof(struct kinput_event)) return -EINVAL;
     size_t max = len / sizeof(struct kinput_event), n = 0;
     struct kinput_event *out = buf;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&qlock);
     while (q_head == q_tail) {
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(&q);
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&qlock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&qlock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(&q, &qlock);
     }
     while (n < max && q_tail != q_head) {
         out[n++] = q[q_tail];
         q_tail = (q_tail + 1) % QLEN;
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&qlock, fl);
     return (ssize_t)(n * sizeof(struct kinput_event));
 }
 
@@ -141,7 +148,7 @@ static int kinput_poll(struct file *f, int events)
 
 static void set_grab(struct file *f, bool on)
 {
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&qlock);
     if (on) {
         q_head = q_tail = 0;
         mouse_buttons = 0;
@@ -152,7 +159,7 @@ static void set_grab(struct file *f, bool on)
         grabbed = false;
         grab_file = NULL;
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&qlock, fl);
     kprintf("kinput: %s by pid %d\n", on ? "grabbed" : "released", current_task()->pid);
     if (dropped) { kprintf("kinput: %u event(s) dropped (queue full)\n", dropped); dropped = 0; }
 }
@@ -181,6 +188,7 @@ static void kinput_release(struct file *f)
 
 static const struct vnode_ops kinput_ops = {
     .fread = kinput_fread, .poll = kinput_poll, .fioctl = kinput_ioctl, .release = kinput_release,
+    .nolock = true,
 };
 
 void kinput_init(void)
