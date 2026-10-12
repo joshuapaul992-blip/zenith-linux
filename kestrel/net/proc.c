@@ -96,6 +96,7 @@ void net_proc_init(void)
 {
     struct vnode *proc;
     if (vfs_lookup("/proc", &proc) < 0) return;
+    vfs_vnode_put(proc);                                /* a mount's root: never freed */
     struct vnode *d = pseudo_dir(proc, "net");
     pseudo_file(d, "dev", gen_dev, NULL);
     pseudo_file(d, "route", gen_route, NULL);

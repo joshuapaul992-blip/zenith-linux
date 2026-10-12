@@ -25,6 +25,69 @@ struct vnode *vfs_root(void) { return root; }
 struct mount *vfs_mounts(void) { return mounts; }
 
 /* ======================================================================= */
+/*  the tree's lock and node references                                      */
+/* ======================================================================= */
+
+/* One reader-writer lock guards the tree: the directories' child lists,
+ * names and parents, mount points, and working directories. Lookups,
+ * stat, readlink and getdents hold it shared, so they run on several CPUs
+ * at once and without the big kernel lock; creating, removing and renaming
+ * hold it exclusively. A task may take it again while it holds it (the
+ * count is per task), but never exclusively inside a shared hold.
+ *
+ * Order: the tree's lock, then a file system's own lock (ext2's volume
+ * mutex), then the big kernel lock. A task holding the big lock that has
+ * to wait for the tree sleeps, which gives the big lock up, so the
+ * opposite order does not deadlock. */
+static struct krwlock tree;
+
+void vfs_tree_lock(bool excl)
+{
+    struct tcb *t = current_task();
+    if (!t) return;                                     /* early boot: one thread */
+    if (t->vfs_depth++) {
+        if (excl && !t->vfs_excl) panic("vfs: the tree's lock taken exclusively inside a shared hold");
+        return;
+    }
+    t->vfs_excl = excl;
+    if (excl) krw_wlock(&tree); else krw_rlock(&tree);
+}
+
+void vfs_tree_unlock(void)
+{
+    struct tcb *t = current_task();
+    if (!t || --t->vfs_depth) return;
+    if (t->vfs_excl) krw_wunlock(&tree); else krw_runlock(&tree);
+    t->vfs_excl = false;
+}
+
+static bool tree_excl(void) { struct tcb *t = current_task(); return !t || t->vfs_excl; }
+
+/* A node's `refs` counts open files, lookups in progress and working
+ * directories. VN_GONE is set in it when the node leaves the tree; the node
+ * is freed when both are true: no reference left and out of the tree. */
+#define VN_GONE (1 << 30)
+
+static void node_destroy(struct vnode *vn);
+
+void vfs_vnode_get(struct vnode *vn)
+{
+    if (vn) __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
+}
+
+/* Drop a reference; true if it was the last one of a node out of the tree
+ * (the caller frees it with node_destroy). */
+static bool vnode_unref(struct vnode *vn)
+{
+    return vn && __atomic_sub_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL) == VN_GONE;
+}
+
+void vfs_vnode_put(struct vnode *vn)
+{
+    if (vnode_unref(vn)) node_destroy(vn);
+}
+
+/* ======================================================================= */
 /*  node management                                                          */
 /* ======================================================================= */
 
@@ -36,13 +99,17 @@ struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uin
     strlcpy(vn->name, name, sizeof vn->name);
     vn->type  = t;
     vn->mode  = mode | (t == VDIR ? S_IFDIR : t == VCHR ? S_IFCHR : t == VSOCK ? S_IFSOCK : S_IFREG);
-    vn->ino   = next_ino++;
+    vn->ino   = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);
     vn->ops   = ops;
     vn->fs    = fs;
     vn->mtime = (uint64_t)time_realtime_sec();
     return vn;
 }
 
+/* Append child to dir. Callers hold the tree's lock exclusively, or run at
+ * boot, or (a directory's refresh, see vnode_ops) hold it shared and are the
+ * only task adding to that directory: lookups on other CPUs may be walking
+ * the list, so the new node is complete before it is linked in. */
 void vfs_node_add(struct vnode *dir, struct vnode *child)
 {
     child->parent = dir;
@@ -51,8 +118,11 @@ void vfs_node_add(struct vnode *dir, struct vnode *child)
     child->dpos = dir->dnext++;                         /* stable while others come and go */
     struct vnode **pp = &dir->children;         /* append: keeps creation order */
     while (*pp) pp = &(*pp)->sibling;
-    *pp = child;
+    __atomic_store_n(pp, child, __ATOMIC_RELEASE);
 }
+
+static struct vnode *first_child(struct vnode *dir) { return __atomic_load_n(&dir->children, __ATOMIC_ACQUIRE); }
+static struct vnode *next_child(struct vnode *c) { return __atomic_load_n(&c->sibling, __ATOMIC_ACQUIRE); }
 
 static void node_remove(struct vnode *dir, struct vnode *child)
 {
@@ -65,24 +135,29 @@ struct vnode *vfs_mkfs(const char *fstype, uint32_t flags, struct mount **out)
     struct mount *m = kzalloc(sizeof *m);
     strlcpy(m->fstype, fstype, sizeof m->fstype);
     m->flags = flags;
-    m->dev = next_dev++;
+    m->dev = __atomic_fetch_add(&next_dev, 1, __ATOMIC_RELAXED);
     m->root = vfs_node_new(m, "", VDIR, 0755, &ramfs_ops);
     *out = m;
     return m->root;
 }
 
+#define WALK_FOLLOW 1           /* follow a symbolic link in the last component */
+#define WALK_PARENT 2           /* stop before the last component, return its name */
+static int walk(struct vnode *base, const char *path, int flags, struct vnode **out, char *last);
+
 int vfs_mount(struct mount *m, const char *path)
 {
+    vfs_tree_lock(true);
     if (!root) {                                    /* the root filesystem */
         root = m->root;
         root->parent = root;
         strlcpy(m->path, "/", sizeof m->path);
     } else {
         struct vnode *dir;
-        int r = vfs_lookup(path, &dir);
-        if (r < 0) return r;
-        if (dir->type != VDIR) return -ENOTDIR;
-        if (dir->mounted) return -EBUSY;
+        int r = walk(NULL, path, WALK_FOLLOW, &dir, NULL);
+        if (r < 0) { vfs_tree_unlock(); return r; }
+        if (dir->type != VDIR) { vfs_tree_unlock(); return -ENOTDIR; }
+        if (dir->mounted) { vfs_tree_unlock(); return -EBUSY; }
         dir->mounted = m->root;
         m->covered = dir;
         m->root->parent = dir->parent;
@@ -92,6 +167,7 @@ int vfs_mount(struct mount *m, const char *path)
     struct mount **pp = &mounts;
     while (*pp) pp = &(*pp)->next;
     *pp = m;
+    vfs_tree_unlock();
     kprintf("vfs: mounted %-6s on %s%s\n", m->fstype, m->path, (m->flags & MNT_RDONLY) ? " (ro)" : "");
     return 0;
 }
@@ -100,39 +176,91 @@ int vfs_mount(struct mount *m, const char *path)
 /*  path resolution                                                          */
 /* ======================================================================= */
 
+/* The working directory. Under the tree's lock: chdir changes it
+ * exclusively, so it holds still while the lock is held. */
 static struct vnode *cwd_node(void)
 {
     struct tcb *t = current_task();
     return (t && t->fs && t->fs->cwd) ? t->fs->cwd : root;
 }
 
-static struct vnode *child_named(struct vnode *dir, const char *name)
+struct vnode *vfs_cwd_get(struct fs_struct *fs)
 {
-    if (dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
-    for (struct vnode *c = dir->children; c; c = c->sibling)
-        if (strcmp(c->name, name) == 0) return c->mounted ? c->mounted : c;
-    return NULL;
+    vfs_tree_lock(false);
+    struct vnode *vn = fs && fs->cwd ? fs->cwd : root;
+    vfs_vnode_get(vn);
+    vfs_tree_unlock();
+    return vn;
+}
+
+/* Make vn (a directory) the calling task's working directory. */
+void vfs_set_cwd(struct vnode *vn)
+{
+    struct tcb *t = current_task();
+    if (!t || !t->fs) return;
+    vfs_vnode_get(vn);
+    vfs_tree_lock(true);
+    struct vnode *old = t->fs->cwd;
+    t->fs->cwd = vn;
+    vfs_tree_unlock();
+    vfs_vnode_put(old);
+}
+
+#define TREE_RETRY (-4095)      /* a directory needs the exclusive lock to refresh */
+
+/* Bring dir's children up to date (see vnode_ops.refresh). TREE_RETRY:
+ * the caller holds the lock shared and must start over exclusively. A
+ * caller inside someone else's shared hold makes do with the list as it is. */
+static int refresh(struct vnode *dir)
+{
+    if (!dir->ops || !dir->ops->refresh) return 0;
+    if (dir->ops->stale) {
+        if (!dir->ops->stale(dir)) return 0;
+        if (!tree_excl()) return current_task()->vfs_depth > 1 ? 0 : TREE_RETRY;
+    }
+    dir->ops->refresh(dir);
+    return 0;
+}
+
+/* The entry `name` of dir, after a refresh: a mount point as the mounted
+ * root (cross), or as the covered directory itself. */
+static int find(struct vnode *dir, const char *name, bool cross, struct vnode **out)
+{
+    int r = refresh(dir);
+    if (r < 0) return r;
+    for (struct vnode *c = first_child(dir); c; c = next_child(c))
+        if (strcmp(c->name, name) == 0) { *out = cross && c->mounted ? c->mounted : c; return 0; }
+    return -ENOENT;
+}
+
+/* find() where the lock is held exclusively (no TREE_RETRY): NULL if none. */
+static struct vnode *entry_named(struct vnode *dir, const char *name)
+{
+    struct vnode *c;
+    return find(dir, name, false, &c) == 0 ? c : NULL;
 }
 
 /* The target of symbolic link vn into buf (NUL-terminated); its length. */
 static int link_target(struct vnode *vn, char *buf, size_t size)
 {
     if (vn->type != VLNK || !vn->ops || !vn->ops->readlink) return -EINVAL;
+    bool bkl = !vn->ops->nolock && !bkl_depth();        /* /proc's links read other processes */
+    if (bkl) bkl_enter();
     int n = vn->ops->readlink(vn, buf, size - 1);
+    if (bkl) bkl_exit();
     if (n < 0) return n;
     buf[n] = 0;
     return n;
 }
 
-#define WALK_FOLLOW 1           /* follow a symbolic link in the last component */
-#define WALK_PARENT 2           /* stop before the last component, return its name */
 
-/* Resolve `path` from `base` (NULL: the cwd). WALK_PARENT: return the
- * directory holding the last component in *out and copy that component into
- * `last` (VFS_NAME_MAX bytes); the last component itself is not looked up.
- * Symbolic links in the middle of the path are always followed: the rest of
- * the path is appended to the link's target and the walk goes on from "/"
- * or from the link's directory. */
+/* Resolve `path` from `base` (NULL: the cwd), with the tree's lock held.
+ * WALK_PARENT: return the directory holding the last component in *out and
+ * copy that component into `last` (VFS_NAME_MAX bytes); the last component
+ * itself is not looked up. Symbolic links in the middle of the path are
+ * always followed: the rest of the path is appended to the link's target
+ * and the walk goes on from "/" or from the link's directory. The node
+ * found has no reference of its own: it holds still while the lock is held. */
 static int walk(struct vnode *base, const char *path, int flags, struct vnode **out, char *last)
 {
     if (!path || !*path) return -ENOENT;
@@ -170,9 +298,14 @@ static int walk(struct vnode *base, const char *path, int flags, struct vnode **
             goto out;
         }
         if (!strcmp(comp, ".")) { p = e; continue; }
-        if (!strcmp(comp, "..")) { vn = vn->parent ? vn->parent : root; p = e; continue; }
-        struct vnode *c = child_named(vn, comp);
-        if (!c) { r = -ENOENT; goto out; }
+        if (!strcmp(comp, "..")) {
+            if (vn->unlinked) { r = -ENOENT; goto out; }    /* a removed directory has no parent */
+            vn = vn->parent ? vn->parent : root;
+            p = e;
+            continue;
+        }
+        struct vnode *c;
+        if ((r = find(vn, comp, true, &c)) < 0) goto out;
         if (c->type == VLNK && (!is_last || slash || (flags & WALK_FOLLOW))) {
             if (++links > VFS_MAX_SYMLINKS) { r = -ELOOP; goto out; }
             int tl = link_target(c, tmp, VFS_PATH_MAX);
@@ -195,15 +328,44 @@ out:
     return r;
 }
 
-int vfs_lookup_at(struct vnode *base, const char *path, bool follow, struct vnode **out)
+/* walk() under the tree's lock: shared (exclusive if excl), or exclusive
+ * after all if a directory on the way asks for it to refresh (/proc). The
+ * lock is held on return, whatever the result. */
+static int walk_locked(struct vnode *base, const char *path, int flags, struct vnode **out, char *last, bool excl)
 {
-    return walk(base, path, follow ? WALK_FOLLOW : 0, out, NULL);
+    for (;;) {
+        vfs_tree_lock(excl);
+        int r = walk(base, path, flags, out, last);
+        if (r != TREE_RETRY) return r;
+        vfs_tree_unlock();
+        excl = true;
+    }
 }
 
-int vfs_lookup(const char *path, struct vnode **out) { return walk(NULL, path, WALK_FOLLOW, out, NULL); }
-
-int vfs_path_of(struct vnode *vn, char *buf, size_t size)
+/* Look a path up and take a reference on the node (vfs_vnode_put). */
+static int lookup_ref(struct vnode *base, const char *path, int flags, struct vnode **out)
 {
+    int r = walk_locked(base, path, flags, out, NULL, false);
+    if (r == 0) vfs_vnode_get(*out);
+    vfs_tree_unlock();
+    return r;
+}
+
+int vfs_lookup_at(struct vnode *base, const char *path, bool follow, struct vnode **out)
+{
+    return lookup_ref(base, path, follow ? WALK_FOLLOW : 0, out);
+}
+
+int vfs_lookup(const char *path, struct vnode **out) { return lookup_ref(NULL, path, WALK_FOLLOW, out); }
+
+/* vn's absolute path, with the tree's lock held. A node out of the tree
+ * (unlinked, or a memfd) is "/name (deleted)", as on Linux. */
+static int path_of(struct vnode *vn, char *buf, size_t size)
+{
+    if (vn && vn->unlinked) {
+        int n = snprintf(buf, size, "/%s (deleted)", vn->name);
+        return n < 0 || (size_t)n >= size ? -ERANGE : 0;
+    }
     const char *parts[128]; int n = 0;
     while (vn && vn != root && n < 128) { parts[n++] = vn->name; vn = vn->parent; }
     size_t pos = 0;
@@ -218,8 +380,17 @@ int vfs_path_of(struct vnode *vn, char *buf, size_t size)
     return 0;
 }
 
+int vfs_path_of(struct vnode *vn, char *buf, size_t size)
+{
+    vfs_tree_lock(false);
+    int r = path_of(vn, buf, size);
+    vfs_tree_unlock();
+    return r;
+}
+
 static int check_writable_dir(struct vnode *dir)
 {
+    if (dir->unlinked) return -ENOENT;                  /* nothing is made in a removed directory */
     if (dir->fs->flags & MNT_RDONLY) return -EROFS;
     if (dir->fs->flags & MNT_NOCREATE) return -EPERM;
     return 0;
@@ -228,7 +399,8 @@ static int check_writable_dir(struct vnode *dir)
 static const struct vnode_ops ramfs_link_ops;
 
 /* A new entry `name` in `dir`: through the file system's create operation
- * if it has one, else an in-memory node. Owned by the caller's uid/gid. */
+ * if it has one, else an in-memory node. Owned by the caller's uid/gid.
+ * The tree's lock is held exclusively. */
 static int create_node(struct vnode *dir, const char *name, enum vtype t, uint32_t mode, const char *target,
                        struct vnode **out)
 {
@@ -263,15 +435,22 @@ static int setattr(struct vnode *vn)
     return r;
 }
 
+static mode_t umask_of_caller(void)
+{
+    struct tcb *t = current_task();
+    return t && t->fs ? t->fs->umask : 022;
+}
+
 int vfs_mkdir_at(struct vnode *base, const char *path, mode_t mode)
 {
     struct vnode *parent, *d; char name[VFS_NAME_MAX];
-    int r = walk(base, path, WALK_PARENT, &parent, name);
-    if (r < 0) return r;
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return -EEXIST;
-    if (child_named(parent, name)) return -EEXIST;
-    struct tcb *t = current_task();
-    return create_node(parent, name, VDIR, mode & 07777 & ~(t && t->fs ? t->fs->umask : 022), NULL, &d);
+    int r = walk_locked(base, path, WALK_PARENT, &parent, name, true);
+    if (r == 0) {
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || entry_named(parent, name)) r = -EEXIST;
+        else r = create_node(parent, name, VDIR, mode & 07777 & ~umask_of_caller(), NULL, &d);
+    }
+    vfs_tree_unlock();
+    return r;
 }
 
 int vfs_mkdir(const char *path, mode_t mode) { return vfs_mkdir_at(NULL, path, mode); }
@@ -281,19 +460,29 @@ int vfs_symlink_at(const char *target, struct vnode *base, const char *path)
     struct vnode *parent, *l; char name[VFS_NAME_MAX];
     if (!target || !*target) return -ENOENT;
     if (strlen(target) >= VFS_PATH_MAX) return -ENAMETOOLONG;
-    int r = walk(base, path, WALK_PARENT, &parent, name);
-    if (r < 0) return r;
-    if (!strcmp(name, ".") || !strcmp(name, "..") || child_named(parent, name)) return -EEXIST;
-    return create_node(parent, name, VLNK, 0777, target, &l);
+    int r = walk_locked(base, path, WALK_PARENT, &parent, name, true);
+    if (r == 0) {
+        if (!strcmp(name, ".") || !strcmp(name, "..") || entry_named(parent, name)) r = -EEXIST;
+        else r = create_node(parent, name, VLNK, 0777, target, &l);
+    }
+    vfs_tree_unlock();
+    return r;
 }
 
 int vfs_readlink_at(struct vnode *base, const char *path, char *buf, size_t size)
 {
     struct vnode *vn;
-    int r = walk(base, path, 0, &vn, NULL);
+    int r = lookup_ref(base, path, 0, &vn);
     if (r < 0) return r;
-    if (vn->type != VLNK || !vn->ops || !vn->ops->readlink) return -EINVAL;
-    return vn->ops->readlink(vn, buf, size);
+    if (vn->type != VLNK || !vn->ops || !vn->ops->readlink) r = -EINVAL;
+    else {
+        bool bkl = !vn->ops->nolock && !bkl_depth();
+        if (bkl) bkl_enter();
+        r = vn->ops->readlink(vn, buf, size);
+        if (bkl) bkl_exit();
+    }
+    vfs_vnode_put(vn);
+    return r;
 }
 
 /* A socket's name in the file system: a node with no operations that
@@ -301,25 +490,18 @@ int vfs_readlink_at(struct vnode *base, const char *path, char *buf, size_t size
 int vfs_mksock(const char *path, mode_t mode, struct vnode **out)
 {
     struct vnode *parent; char name[VFS_NAME_MAX];
-    int r = walk(NULL, path, WALK_PARENT, &parent, name);
-    if (r < 0) return r;
-    if (child_named(parent, name)) return -EADDRINUSE;
-    if ((r = check_writable_dir(parent)) < 0) return r;
-    struct vnode *s = vfs_node_new(parent->fs, name, VSOCK, mode & 0777, NULL);
-    if (!s) return -ENOMEM;
-    vfs_node_add(parent, s);                            /* in memory only, also on a disk */
-    *out = s;
-    inotify_event(parent, IN_CREATE, name, 0);
-    return 0;
-}
-
-/* Find the entry `name` in `dir` (the covered node, not a mount root). */
-static struct vnode *entry_named(struct vnode *dir, const char *name)
-{
-    if (dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
-    for (struct vnode *c = dir->children; c; c = c->sibling)
-        if (strcmp(c->name, name) == 0) return c;
-    return NULL;
+    int r = walk_locked(NULL, path, WALK_PARENT, &parent, name, true);
+    if (r == 0 && entry_named(parent, name)) r = -EADDRINUSE;
+    if (r == 0) r = check_writable_dir(parent);
+    struct vnode *s = NULL;
+    if (r == 0 && !(s = vfs_node_new(parent->fs, name, VSOCK, mode & 0777, NULL))) r = -ENOMEM;
+    if (r == 0) {
+        vfs_node_add(parent, s);                        /* in memory only, also on a disk */
+        *out = s;
+        inotify_event(parent, IN_CREATE, name, 0);
+    }
+    vfs_tree_unlock();
+    return r;
 }
 
 static void node_destroy(struct vnode *vn)
@@ -331,15 +513,14 @@ static void node_destroy(struct vnode *vn)
     kfree(vn);
 }
 
-/* A node leaves the tree. Like Linux, a file that is still open stays alive
- * (reads, writes and mappings keep working) until its last close. */
+/* A node leaves the tree (the lock is held exclusively). Like Linux, a file
+ * that is still open stays alive (reads, writes and mappings keep working)
+ * until its last close; so does a lookup's or a working directory's node. */
 static void node_free(struct vnode *vn)
 {
-    uint64_t f = irq_save();
     vn->unlinked = true;
-    bool now = __atomic_load_n(&vn->refs, __ATOMIC_ACQUIRE) == 0;
-    irq_restore(f);
-    if (now) node_destroy(vn);
+    vn->parent = NULL;
+    if ((__atomic_fetch_or(&vn->refs, VN_GONE, __ATOMIC_ACQ_REL) & ~VN_GONE) == 0) node_destroy(vn);
 }
 
 static int remove_node(struct vnode *dir, struct vnode *vn)
@@ -359,19 +540,21 @@ static int remove_node(struct vnode *dir, struct vnode *vn)
 int vfs_unlink_at(struct vnode *base, const char *path)
 {
     struct vnode *parent; char name[VFS_NAME_MAX];
-    int r = walk(base, path, WALK_PARENT, &parent, name);
-    if (r < 0) return r;
-    struct vnode *vn = entry_named(parent, name);
-    if (!vn) return -ENOENT;
-    if (vn->type == VDIR) return -EISDIR;
-    if ((r = check_writable_dir(parent)) < 0) return r;
-    return remove_node(parent, vn);
+    int r = walk_locked(base, path, WALK_PARENT, &parent, name, true);
+    if (r == 0) {
+        struct vnode *vn = entry_named(parent, name);
+        if (!vn) r = -ENOENT;
+        else if (vn->type == VDIR) r = -EISDIR;
+        else if ((r = check_writable_dir(parent)) == 0) r = remove_node(parent, vn);
+    }
+    vfs_tree_unlock();
+    return r;
 }
 
 int vfs_unlink(const char *path) { return vfs_unlink_at(NULL, path); }
 
 /* rmdir(2): empty directories only, never a mount point or "." */
-int vfs_rmdir_at(struct vnode *base, const char *path)
+static int rmdir_locked(struct vnode *base, const char *path)
 {
     struct vnode *parent; char name[VFS_NAME_MAX];
     int r = walk(base, path, WALK_PARENT, &parent, name);
@@ -382,19 +565,32 @@ int vfs_rmdir_at(struct vnode *base, const char *path)
     if (!vn) return -ENOENT;
     if (vn->type != VDIR) return -ENOTDIR;
     if (vn->mounted) return -EBUSY;
-    if (vn->ops && vn->ops->refresh) vn->ops->refresh(vn);
+    refresh(vn);
     if (vn->children) return -ENOTEMPTY;
     if ((r = check_writable_dir(parent)) < 0) return r;
     struct tcb *t = current_task();
-    if ((r = remove_node(parent, vn)) < 0) return r;
-    if (t && t->fs && t->fs->cwd == vn) t->fs->cwd = parent;    /* don't leave a dangling cwd */
-    return 0;
+    vfs_vnode_get(vn);
+    if ((r = remove_node(parent, vn)) == 0 && t && t->fs && t->fs->cwd == vn) {
+        vfs_vnode_get(parent);                          /* don't leave the caller in a removed directory */
+        t->fs->cwd = parent;
+        vfs_vnode_put(vn);                              /* the working directory's reference */
+    }
+    vfs_vnode_put(vn);
+    return r;
+}
+
+int vfs_rmdir_at(struct vnode *base, const char *path)
+{
+    vfs_tree_lock(true);
+    int r = rmdir_locked(base, path);
+    vfs_tree_unlock();
+    return r;
 }
 
 int vfs_rmdir(const char *path) { return vfs_rmdir_at(NULL, path); }
 
 /* rename(2) within one mounted file system; -EXDEV across mounts. */
-int vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, const char *to)
+static int rename_locked(struct vnode *obase, const char *from, struct vnode *nbase, const char *to)
 {
     struct vnode *op, *np; char oname[VFS_NAME_MAX], nname[VFS_NAME_MAX];
     int r = walk(obase, from, WALK_PARENT, &op, oname);
@@ -417,7 +613,7 @@ int vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, co
         if (old->type == VDIR && vn->type != VDIR) return -EISDIR;
         if (old->type != VDIR && vn->type == VDIR) return -ENOTDIR;
         if (old->type == VDIR) {
-            if (old->ops && old->ops->refresh) old->ops->refresh(old);
+            refresh(old);
             if (old->children) return -ENOTEMPTY;
         }
     }
@@ -433,17 +629,25 @@ int vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, co
     return 0;
 }
 
+int vfs_rename_at(struct vnode *obase, const char *from, struct vnode *nbase, const char *to)
+{
+    vfs_tree_lock(true);
+    int r = rename_locked(obase, from, nbase, to);
+    vfs_tree_unlock();
+    return r;
+}
+
 int vfs_rename(const char *from, const char *to) { return vfs_rename_at(NULL, from, NULL, to); }
 
 /* link(2): a second name for a file, on file systems that have it. */
-int vfs_link_at(struct vnode *obase, const char *from, bool follow, struct vnode *nbase, const char *to)
+static int link_locked(struct vnode *obase, const char *from, bool follow, struct vnode *nbase, const char *to)
 {
     struct vnode *vn, *parent, *nv; char name[VFS_NAME_MAX];
     int r = walk(obase, from, follow ? WALK_FOLLOW : 0, &vn, NULL);
     if (r < 0) return r;
     if (vn->type == VDIR) return -EPERM;
     if ((r = walk(nbase, to, WALK_PARENT, &parent, name)) < 0) return r;
-    if (!strcmp(name, ".") || !strcmp(name, "..") || child_named(parent, name)) return -EEXIST;
+    if (!strcmp(name, ".") || !strcmp(name, "..") || entry_named(parent, name)) return -EEXIST;
     if (parent->fs != vn->fs) return -EXDEV;
     if ((r = check_writable_dir(parent)) < 0) return r;
     if (!parent->ops || !parent->ops->link) return -EPERM;  /* the in-memory tree: one name per node */
@@ -455,11 +659,20 @@ int vfs_link_at(struct vnode *obase, const char *from, bool follow, struct vnode
     return 0;
 }
 
+int vfs_link_at(struct vnode *obase, const char *from, bool follow, struct vnode *nbase, const char *to)
+{
+    vfs_tree_lock(true);
+    int r = link_locked(obase, from, follow, nbase, to);
+    vfs_tree_unlock();
+    return r;
+}
+
+/* The node of a path for an attribute change, with a reference. */
 static int attr_target(struct vnode *base, const char *path, bool follow, struct vnode **out)
 {
-    int r = walk(base, path, follow ? WALK_FOLLOW : 0, out, NULL);
+    int r = lookup_ref(base, path, follow ? WALK_FOLLOW : 0, out);
     if (r < 0) return r;
-    if ((*out)->fs && ((*out)->fs->flags & MNT_RDONLY)) return -EROFS;
+    if ((*out)->fs && ((*out)->fs->flags & MNT_RDONLY)) { vfs_vnode_put(*out); return -EROFS; }
     return 0;
 }
 
@@ -490,21 +703,30 @@ int vfs_chmod_at(struct vnode *base, const char *path, bool follow, mode_t mode)
 {
     struct vnode *vn;
     int r = attr_target(base, path, follow, &vn);
-    return r < 0 ? r : vfs_chmod_vn(vn, mode);
+    if (r < 0) return r;
+    r = vfs_chmod_vn(vn, mode);
+    vfs_vnode_put(vn);
+    return r;
 }
 
 int vfs_chown_at(struct vnode *base, const char *path, bool follow, int uid, int gid)
 {
     struct vnode *vn;
     int r = attr_target(base, path, follow, &vn);
-    return r < 0 ? r : vfs_chown_vn(vn, uid, gid);
+    if (r < 0) return r;
+    r = vfs_chown_vn(vn, uid, gid);
+    vfs_vnode_put(vn);
+    return r;
 }
 
 int vfs_utime_at(struct vnode *base, const char *path, bool follow, int64_t mtime)
 {
     struct vnode *vn;
     int r = attr_target(base, path, follow, &vn);
-    return r < 0 ? r : vfs_utime_vn(vn, mtime);
+    if (r < 0) return r;
+    r = vfs_utime_vn(vn, mtime);
+    vfs_vnode_put(vn);
+    return r;
 }
 
 int vfs_chmod(const char *path, mode_t mode) { return vfs_chmod_at(NULL, path, true, mode); }
@@ -517,8 +739,12 @@ static uint64_t node_size(struct vnode *vn)
     return vn->ops && vn->ops->size ? vn->ops->size(vn) : vn->size;
 }
 
+/* Generated files' sizes and devices' read other kernel state: those take
+ * the big lock (a file system's own operations lock themselves). */
 void vfs_fill_stat(struct vnode *vn, struct stat *st)
 {
+    bool bkl = vn->ops && !vn->ops->nolock && (vn->ops->getattr || vn->ops->size) && !bkl_depth();
+    if (bkl) bkl_enter();
     if (vn->ops && vn->ops->getattr) vn->ops->getattr(vn);
     memset(st, 0, sizeof *st);
     st->st_dev = vn->fs ? vn->fs->dev : 0;
@@ -534,14 +760,16 @@ void vfs_fill_stat(struct vnode *vn, struct stat *st)
     st->st_mtim.tv_sec = (int64_t)vn->mtime;
     st->st_atim.tv_sec = (int64_t)(vn->atime ? vn->atime : vn->mtime);
     st->st_ctim.tv_sec = (int64_t)(vn->ctime ? vn->ctime : vn->mtime);
+    if (bkl) bkl_exit();
 }
 
 int vfs_stat_at(struct vnode *base, const char *path, bool follow, struct stat *st)
 {
     struct vnode *vn;
-    int r = walk(base, path, follow ? WALK_FOLLOW : 0, &vn, NULL);
+    int r = lookup_ref(base, path, follow ? WALK_FOLLOW : 0, &vn);
     if (r < 0) return r;
     vfs_fill_stat(vn, st);
+    vfs_vnode_put(vn);
     return 0;
 }
 
@@ -552,12 +780,19 @@ int vfs_chdir(const char *path)
     struct vnode *vn;
     int r = vfs_lookup(path, &vn);
     if (r < 0) return r;
-    if (vn->type != VDIR) return -ENOTDIR;
-    if (current_task()->fs) current_task()->fs->cwd = vn;
-    return 0;
+    if (vn->type != VDIR) r = -ENOTDIR;
+    else vfs_set_cwd(vn);
+    vfs_vnode_put(vn);
+    return r;
 }
 
-int vfs_getcwd(char *buf, size_t size) { return vfs_path_of(cwd_node(), buf, size); }
+int vfs_getcwd(char *buf, size_t size)
+{
+    vfs_tree_lock(false);
+    int r = path_of(cwd_node(), buf, size);
+    vfs_tree_unlock();
+    return r;
+}
 
 int vfs_statfs(struct vnode *vn, struct kstatfs *st)
 {
@@ -584,28 +819,43 @@ void vfs_sync_all(bool final)
 
 static int open_node(struct vnode *vn, int flags, bool created, struct file **out);
 
+/* Find or create the file to open, with a reference: the tree's lock is
+ * taken shared to look, and exclusively only to create. */
+static int open_target(struct vnode *base, const char *path, int flags, mode_t mode, struct vnode **out, bool *created)
+{
+    int wf = (flags & O_NOFOLLOW) ? 0 : WALK_FOLLOW;
+    bool excl = false;
+    for (;;) {
+        int r = walk_locked(base, path, wf, out, NULL, excl);
+        if (r == 0 && (flags & O_CREAT) && (flags & O_EXCL)) r = -EEXIST;
+        if (r != -ENOENT || !(flags & O_CREAT) || excl) {
+            if (r == -ENOENT && excl) {                 /* still missing, now with the right to create */
+                struct vnode *parent; char name[VFS_NAME_MAX];
+                if ((r = walk(base, path, WALK_PARENT, &parent, name)) == 0) {
+                    if (!strcmp(name, ".") || !strcmp(name, "..")) r = -EISDIR;
+                    else if (entry_named(parent, name)) r = -EEXIST;   /* a dangling symlink: not followed */
+                    else if ((r = create_node(parent, name, VREG, mode & 07777 & ~umask_of_caller(), NULL, out)) == 0)
+                        *created = true;
+                }
+            }
+            if (r == 0) vfs_vnode_get(*out);
+            vfs_tree_unlock();
+            return r;
+        }
+        vfs_tree_unlock();                              /* not there: look again, ready to create */
+        excl = true;
+    }
+}
+
 int vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, struct file **out)
 {
     struct vnode *vn;
-    bool follow = !(flags & O_NOFOLLOW);
-    int r = walk(base, path, follow ? WALK_FOLLOW : 0, &vn, NULL);
     bool created = false;
-
-    if (r == -ENOENT && (flags & O_CREAT)) {
-        struct vnode *parent; char name[VFS_NAME_MAX];
-        if ((r = walk(base, path, WALK_PARENT, &parent, name)) < 0) return r;
-        if (!strcmp(name, ".") || !strcmp(name, "..")) return -EISDIR;
-        if (entry_named(parent, name)) return -EEXIST;  /* a dangling symlink: not followed */
-        struct tcb *t = current_task();
-        if ((r = create_node(parent, name, VREG, mode & 07777 & ~(t && t->fs ? t->fs->umask : 022), NULL, &vn)) < 0)
-            return r;
-        created = true;
-    } else if (r < 0) {
-        return r;
-    } else if ((flags & O_CREAT) && (flags & O_EXCL)) {
-        return -EEXIST;
-    }
-    return open_node(vn, flags, created, out);
+    int r = open_target(base, path, flags, mode, &vn, &created);
+    if (r < 0) return r;
+    r = open_node(vn, flags, created, out);
+    vfs_vnode_put(vn);                                  /* the open file has its own */
+    return r;
 }
 
 /* Open a node already found (/proc/self/fd/N): as open() would, minus creation. */
@@ -634,22 +884,29 @@ static int open_node(struct vnode *vn, int flags, bool created, struct file **ou
     struct tcb *self = current_task();
     if (acc != O_RDONLY && !(vn->mode & 0222) && !created && self && self->uid != 0) return -EACCES;
 
-    if ((flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops && vn->ops->truncate) {
-        if ((r = vn->ops->truncate(vn, 0)) < 0) return r;
+    bool trunc = (flags & O_TRUNC) && vn->type == VREG && acc != O_RDONLY && vn->ops && vn->ops->truncate;
+    /* a device's open, or a truncation, by code that is not known to lock
+     * itself: under the big lock */
+    bool bkl = vn->ops && !vn->ops->nolock && (vn->ops->open || trunc) && !bkl_depth();
+    if (bkl) bkl_enter();
+    if (trunc) {
+        if ((r = vn->ops->truncate(vn, 0)) < 0) goto out;
         vn->mtime = (uint64_t)time_realtime_sec();
     }
     if (vn->ops && vn->ops->open) {
-        int r2 = vn->ops->open(vn, flags, out);
-        if (r2 == 0 && (*out)->vn) __atomic_add_fetch(&(*out)->vn->refs, 1, __ATOMIC_ACQ_REL);
-        return r2;
+        r = vn->ops->open(vn, flags, out);
+        if (r == 0) vfs_vnode_get((*out)->vn);
+        goto out;
     }
-
     struct file *f = kzalloc(sizeof *f);
-    if (!f) return -ENOMEM;
+    if (!f) { r = -ENOMEM; goto out; }
     f->vn = vn; f->flags = flags; f->refcnt = 1;
-    __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
+    vfs_vnode_get(vn);
     *out = f;
-    return 0;
+    r = 0;
+out:
+    if (bkl) bkl_exit();
+    return r;
 }
 
 int vfs_open(const char *path, int flags, mode_t mode, struct file **out)
@@ -719,15 +976,13 @@ off_t vfs_lseek(struct file *f, off_t off, int whence)
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->off
                  : whence == SEEK_END ? (int64_t)node_size(f->vn) : -1;
     if (base < 0 || base + off < 0) return -EINVAL;
-    /* In turn with reads and writes (the position lock), or with getdents
-     * of a directory (the big lock, which getdents still runs under) */
-    bool reg = f->vn->type == VREG, dir = f->vn->type == VDIR;
-    if (reg) kmutex_lock(&f->pos_lock);
-    if (dir) bkl_enter();
+    /* In turn with reads and writes, or with getdents of a directory: the
+     * position lock */
+    bool locked = f->vn->type == VREG || f->vn->type == VDIR;
+    if (locked) kmutex_lock(&f->pos_lock);
     if (whence == SEEK_CUR) base = (int64_t)f->off;
     off_t r = base + off < 0 ? -EINVAL : (off_t)(f->off = (uint64_t)(base + off));
-    if (dir) bkl_exit();
-    if (reg) kmutex_unlock(&f->pos_lock);
+    if (locked) kmutex_unlock(&f->pos_lock);
     return r;
 }
 
@@ -743,13 +998,20 @@ static uint8_t dtype(struct vnode *vn)
     }
 }
 
-/* getdents64: f->off is the index of the next entry ("." = 0, ".." = 1) */
+/* getdents64: f->off is the index of the next entry ("." = 0, ".." = 1).
+ * Under the file's position lock and the tree's lock, shared. */
 int vfs_getdents(struct file *f, void *buf, size_t len)
 {
     struct vnode *dir = f->vn;
     if (dir->type != VDIR) return -ENOTDIR;
-    if (f->off == 0 && dir->ops && dir->ops->refresh) dir->ops->refresh(dir);
+    kmutex_lock(&f->pos_lock);
+    for (bool excl = false;; excl = true) {
+        vfs_tree_lock(excl);
+        if (f->off != 0 || refresh(dir) != TREE_RETRY) break;
+        vfs_tree_unlock();                              /* /proc: changes its list exclusively */
+    }
     size_t pos = 0;
+    int ret = 0;
     for (;;) {
         /* f->off is the dpos of the next entry to return: entries removed
          * or added meanwhile do not make readers skip or repeat others
@@ -759,14 +1021,14 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
         if (idx == 0)      { name = ".";  vn = dir; next = 1; }
         else if (idx == 1) { name = ".."; vn = dir->parent ? dir->parent : dir; next = 2; }
         else {
-            for (vn = dir->children; vn && vn->dpos < idx; vn = vn->sibling) {}
+            for (vn = first_child(dir); vn && vn->dpos < idx; vn = next_child(vn)) {}
             if (!vn) break;
             name = vn->name;
             next = vn->dpos + 1;
         }
         size_t nlen = strlen(name);
         size_t reclen = (offsetof(struct linux_dirent64, d_name) + nlen + 1 + 7) & ~(size_t)7;
-        if (pos + reclen > len) { if (pos == 0) return -EINVAL; break; }
+        if (pos + reclen > len) { if (pos == 0) ret = -EINVAL; break; }
         struct linux_dirent64 *d = (struct linux_dirent64 *)((uint8_t *)buf + pos);
         struct vnode *shown = vn->mounted ? vn->mounted : vn;
         d->d_ino = shown->ino;
@@ -777,7 +1039,9 @@ int vfs_getdents(struct file *f, void *buf, size_t len)
         pos += reclen;
         f->off = next;
     }
-    return (int)pos;
+    vfs_tree_unlock();
+    kmutex_unlock(&f->pos_lock);
+    return ret < 0 ? ret : (int)pos;
 }
 
 int vfs_ioctl(struct file *f, unsigned long req, void *arg)
@@ -866,7 +1130,7 @@ static void vfs_close_last(struct file *f)
     struct vnode *vn = f->vn;
     if (vn && (vn->type == VREG || vn->type == VDIR))
         inotify_self(vn, (f->flags & O_ACCMODE) != O_RDONLY ? IN_CLOSE_WRITE : IN_CLOSE_NOWRITE);
-    bool last = vn && __atomic_sub_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL) == 0 && vn->unlinked;
+    bool last = vnode_unref(vn);                        /* the last reference to an unlinked file */
     if (vn && vn->ops && vn->ops->release) vn->ops->release(f);    /* may free a socket's vnode */
     kfree(f);
     if (last) node_destroy(vn);
@@ -877,11 +1141,13 @@ struct file *vfs_file_new(struct vnode *vn, int flags)
     struct file *f = kzalloc(sizeof *f);
     if (!f) return NULL;
     f->vn = vn; f->flags = flags; f->refcnt = 1;
-    if (vn) __atomic_add_fetch(&vn->refs, 1, __ATOMIC_ACQ_REL);
+    vfs_vnode_get(vn);
     return f;
 }
 
-bool file_nolock(struct file *f) { return f && f->vn && f->vn->ops && f->vn->ops->nolock; }
+/* A node without operations (a /proc or /sys directory, a socket's name)
+ * has nothing that could need the big lock. */
+bool file_nolock(struct file *f) { return f && f->vn && (!f->vn->ops || f->vn->ops->nolock); }
 
 uint64_t vfs_poll_deadline(struct file *f)
 {
@@ -977,7 +1243,7 @@ static int ramfs_readlink(struct vnode *vn, char *buf, size_t size)
     return (int)n;
 }
 
-static const struct vnode_ops ramfs_link_ops = { .readlink = ramfs_readlink };
+static const struct vnode_ops ramfs_link_ops = { .readlink = ramfs_readlink, .nolock = true };   /* fixed text */
 
 /* An open file on a ramfs node that is in no directory (memfd_create):
  * freed with its last close. */
@@ -985,7 +1251,8 @@ struct file *ramfs_anon_file(const char *name, int flags)
 {
     struct vnode *vn = vfs_node_new(root ? root->fs : NULL, name, VREG, 0600, &ramfs_ops);
     if (!vn) return NULL;
-    vn->unlinked = true;
+    vn->unlinked = true;                                /* in no directory: freed with the last close */
+    vn->refs = VN_GONE;
     if (!ramfs_vmobject(vn)) { kfree(vn); return NULL; }
     struct file *f = vfs_file_new(vn, flags);
     if (!f) { node_destroy(vn); return NULL; }
@@ -1069,11 +1336,11 @@ struct vnode *pseudo_file(struct vnode *parent, const char *name, vfs_gen_t gen,
 /* Make directory `dst` show the contents of directory `src` (a bind mount,
  * e.g. /boot/bin on /bin). The source keeps its place in the tree, so ".."
  * inside the bound directory leads to the source's parent. */
-int vfs_bind(const char *src, const char *dst)
+static int bind_locked(const char *src, const char *dst)
 {
     struct vnode *s, *d;
     int r;
-    if ((r = vfs_lookup(src, &s)) < 0 || (r = vfs_lookup(dst, &d)) < 0) return r;
+    if ((r = walk(NULL, src, WALK_FOLLOW, &s, NULL)) < 0 || (r = walk(NULL, dst, WALK_FOLLOW, &d, NULL)) < 0) return r;
     if (s->type != VDIR || d->type != VDIR) return -ENOTDIR;
     if (d->mounted || s == d) return -EBUSY;
     struct mount *m = kzalloc(sizeof *m);
@@ -1092,13 +1359,31 @@ int vfs_bind(const char *src, const char *dst)
     return 0;
 }
 
+int vfs_bind(const char *src, const char *dst)
+{
+    vfs_tree_lock(true);
+    int r = bind_locked(src, dst);
+    vfs_tree_unlock();
+    return r;
+}
+
 /* Make the file system `m` "/". Each mount whose mount point was a
  * directory of the old root moves to the same path in the new one (the
  * directory is made if the new root lacks it); a bind mount whose
  * destination the new root already has is dropped (its own /bin wins over
  * /boot/bin). Working directories in the old root move to the new one.
  * The old root's nodes stay allocated: open files on them keep working. */
+static int pivot_locked(struct mount *m);
+
 int vfs_pivot_root(struct mount *m)
+{
+    vfs_tree_lock(true);
+    int r = pivot_locked(m);
+    vfs_tree_unlock();
+    return r;
+}
+
+static int pivot_locked(struct mount *m)
 {
     struct mount *oldm = root->fs;
     root = m->root;
@@ -1116,12 +1401,12 @@ int vfs_pivot_root(struct mount *m)
         if (!mt->covered || mt->covered->fs != oldm) { pp = &mt->next; continue; }
         bool bind = !strcmp(mt->fstype, "bind");
         struct vnode *d;
-        int r = vfs_lookup(mt->path, &d);
+        int r = walk(NULL, mt->path, WALK_FOLLOW, &d, NULL);
         if (r == 0 && bind) {
             kprintf("vfs: %s: the new root has its own, bind dropped\n", mt->path);
             goto drop;
         }
-        if (r == -ENOENT && (r = vfs_mkdir(mt->path, 0755)) == 0) r = vfs_lookup(mt->path, &d);
+        if (r == -ENOENT && (r = vfs_mkdir(mt->path, 0755)) == 0) r = walk(NULL, mt->path, WALK_FOLLOW, &d, NULL);
         if (r < 0 || d->type != VDIR || d->mounted || d == root) {
             kprintf("vfs: %s cannot move to the new root (%d): no longer reachable\n", mt->path, r);
             goto drop;
@@ -1139,7 +1424,12 @@ drop:
     }
     for (int i = 0; i < MAX_TASKS; i++) {               /* nothing may stay behind in the old tree */
         struct tcb *t = task_slot(i);
-        if (t && t->fs && t->fs->cwd && t->fs->cwd->fs == oldm) t->fs->cwd = root;
+        if (t && t->fs && t->fs->cwd && t->fs->cwd->fs == oldm) {
+            struct vnode *old = t->fs->cwd;
+            vfs_vnode_get(root);
+            t->fs->cwd = root;
+            vfs_vnode_put(old);
+        }
     }
     return 0;
 }
@@ -1160,7 +1450,7 @@ void vfs_init(void)
     };
     for (size_t i = 0; i < sizeof dirs / sizeof *dirs; i++) vfs_mkdir(dirs[i], 0755);
     struct vnode *tmp;
-    if (vfs_lookup("/tmp", &tmp) == 0) tmp->mode |= 01777;
+    if (vfs_lookup("/tmp", &tmp) == 0) { tmp->mode |= 01777; vfs_vnode_put(tmp); }
 
     devfs_init("/dev");
     struct mount *shm;                                  /* POSIX shared memory: a plain ramfs */

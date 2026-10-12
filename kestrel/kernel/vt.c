@@ -116,6 +116,7 @@ static bool vt_setup(int index, struct vt *v)
     v->tty = tty_get(index);
     if (!v->tty || vfs_lookup(path, &node) < 0) return false;
     v->pty = pty_console_create(node, v->tty->max_rows, v->tty->max_cols);
+    vfs_vnode_put(node);                                /* /dev keeps its nodes */
     if (v->pty < 0) { kprintf("vt: %s: no pty (%d)\n", path, v->pty); return false; }
     v->tty->reply_ctx = v;
     v->tty->reply = vt_reply;

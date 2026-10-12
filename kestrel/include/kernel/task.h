@@ -150,6 +150,8 @@ struct tcb {
 
     int       pagefault_off;    /* uaccess: page faults are not resolved (> 0) */
     int       bkl_depth;        /* big kernel lock nesting while switched out (smp.h) */
+    int       vfs_depth;        /* the file tree's lock, held this many times (fs/vfs.c) */
+    bool      vfs_excl;         /* ... exclusively                                    */
     bool      sched_cur;        /* some CPU's current task (under the scheduler lock) */
     int       on_cpu;           /* until its registers are saved at a switch-out    */
     struct kstat_task ks;       /* performance counters (kstat.h)            */

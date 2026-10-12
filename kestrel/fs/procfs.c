@@ -391,7 +391,9 @@ static int link_cwd(struct vnode *vn, char *buf, size_t size)
     struct tcb *t = pid_task(vn->ctx);
     if (!t || !t->fs || !t->fs->cwd) return -ENOENT;
     char tmp[VFS_PATH_MAX];
-    int r = vfs_path_of(t->fs->cwd, tmp, sizeof tmp);
+    struct vnode *cwd = vfs_cwd_get(t->fs);             /* it may chdir meanwhile */
+    int r = vfs_path_of(cwd, tmp, sizeof tmp);
+    vfs_vnode_put(cwd);
     if (r < 0) return r;
     size_t n = strlen(tmp);
     if (n > size) n = size;
@@ -446,8 +448,37 @@ static void detach(struct vnode *parent, struct vnode *c)
         if (*pp == c) { *pp = c->sibling; c->sibling = NULL; return; }
 }
 
+/* The processes as a fingerprint: their number and the sums of their pids
+ * and of their squares. A lookup in /proc compares it with the one the
+ * directories were last made for, holding the tree's lock shared, and
+ * refreshes (exclusively) only when the processes changed. */
+static uint64_t proc_sig[3];
+
+static void proc_signature(uint64_t s[3])
+{
+    s[0] = s[1] = s[2] = 0;
+    for (int i = 0; i < MAX_TASKS; i++) {
+        struct tcb *t = task_slot(i);
+        if (t->state == TASK_UNUSED || t->pid != t->tgid) continue;
+        s[0]++; s[1] += (uint64_t)t->pid; s[2] += (uint64_t)t->pid * (uint64_t)t->pid;
+    }
+}
+
+static bool proc_stale(struct vnode *dir)
+{
+    (void)dir;
+    uint64_t s[3];
+    proc_signature(s);
+    return s[0] != __atomic_load_n(&proc_sig[0], __ATOMIC_RELAXED) ||
+           s[1] != __atomic_load_n(&proc_sig[1], __ATOMIC_RELAXED) ||
+           s[2] != __atomic_load_n(&proc_sig[2], __ATOMIC_RELAXED);
+}
+
+/* With the tree's lock held exclusively (vnode_ops.stale). */
 static void proc_refresh(struct vnode *dir)
 {
+    uint64_t sig[3];
+    proc_signature(sig);                                /* before: a change meanwhile shows next time */
     uint64_t fl = irq_save();
     for (int i = 0; i < MAX_TASKS; i++) {               /* gone: detach */
         struct pid_dir *d = &pid_dirs[i];
@@ -479,9 +510,10 @@ static void proc_refresh(struct vnode *dir)
         }
     }
     irq_restore(fl);
+    for (int i = 0; i < 3; i++) __atomic_store_n(&proc_sig[i], sig[i], __ATOMIC_RELAXED);
 }
 
-static const struct vnode_ops proc_root_ops = { .refresh = proc_refresh };
+static const struct vnode_ops proc_root_ops = { .refresh = proc_refresh, .stale = proc_stale, .nolock = true };
 
 void procfs_init(const char *mountpoint)
 {

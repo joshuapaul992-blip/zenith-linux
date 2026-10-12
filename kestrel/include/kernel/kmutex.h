@@ -1,4 +1,5 @@
-/* include/kernel/kmutex.h -- a sleeping, recursive mutex (proc/task.c) */
+/* include/kernel/kmutex.h -- a sleeping, recursive mutex, and a sleeping
+ * reader-writer lock (proc/task.c) */
 #ifndef KESTREL_KMUTEX_H
 #define KESTREL_KMUTEX_H
 
@@ -17,5 +18,21 @@ struct kmutex {
 void        kmutex_lock(struct kmutex *m);
 void        kmutex_unlock(struct kmutex *m);
 bool        kmutex_held(const struct kmutex *m);   /* by the calling task */
+
+/* Many readers or one writer; a waiting writer holds new readers back, so
+ * a stream of readers cannot starve it. Not recursive: a task that may
+ * take it again keeps its own count (fs/vfs.c: the file tree's lock).
+ * Waiting sleeps, which gives up the big kernel lock. Zeroed memory is an
+ * unlocked lock. */
+struct krwlock {
+    int         readers;
+    struct tcb *writer;
+    int         wwait;              /* writers waiting                       */
+    int         waiters;            /* asleep, readers and writers           */
+};
+void        krw_rlock(struct krwlock *l);
+void        krw_runlock(struct krwlock *l);
+void        krw_wlock(struct krwlock *l);
+void        krw_wunlock(struct krwlock *l);
 
 #endif

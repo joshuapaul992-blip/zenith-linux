@@ -261,9 +261,12 @@ struct vnode *devfs_register(const char *name, uint32_t mode, uint32_t rdev,
 {
     if (!devfs_root) return NULL;
     struct vnode *d = vfs_node_new(devfs_root->fs, name, VCHR, mode, ops);
+    if (!d) return NULL;
     d->rdev = rdev;
     d->ctx = ctx;
+    vfs_tree_lock(true);                                /* devices come and go after boot (USB) */
     vfs_node_add(devfs_root, d);
+    vfs_tree_unlock();
     return d;
 }
 

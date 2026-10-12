@@ -128,11 +128,11 @@ void inotify_self(struct vnode *vn, uint32_t mask)
 {
     if (!nwatches || !vn) return;
     if (!watched(vn, __atomic_load_n(&vn->parent, __ATOMIC_RELAXED))) return;     /* only compared */
-    bkl_enter();                                        /* vn->parent and vn->name hold still */
+    vfs_tree_lock(false);                               /* vn->parent and vn->name hold still */
     uint32_t dir = vn->type == VDIR ? IN_ISDIR : 0;
     inotify_event(vn, mask | dir, NULL, 0);
     if (vn->parent && vn->parent != vn) inotify_event(vn->parent, mask | dir, vn->name, 0);
-    bkl_exit();
+    vfs_tree_unlock();
 }
 
 void inotify_vnode_gone(struct vnode *vn)

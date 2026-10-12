@@ -129,10 +129,11 @@ void files_put(struct files_struct *f)
     kfree(f);
 }
 
+/* cwd: a reference the new state takes over (vfs_cwd_get), or NULL */
 struct fs_struct *fs_new(struct vnode *cwd, uint32_t umask)
 {
     struct fs_struct *f = kzalloc(sizeof *f);
-    if (!f) return NULL;
+    if (!f) { vfs_vnode_put(cwd); return NULL; }
     f->refs = 1;
     f->cwd = cwd;
     f->umask = umask;
@@ -141,7 +142,9 @@ struct fs_struct *fs_new(struct vnode *cwd, uint32_t umask)
 
 void fs_put(struct fs_struct *f)
 {
-    if (f && __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) == 0) kfree(f);
+    if (!f || __atomic_sub_fetch(&f->refs, 1, __ATOMIC_ACQ_REL) > 0) return;
+    vfs_vnode_put(f->cwd);
+    kfree(f);
 }
 
 struct sighand_struct *sighand_new(const struct sighand_struct *copy)
@@ -177,7 +180,7 @@ void signal_put(struct signal_struct *g)
 static bool task_state_new(struct tcb *t, struct tcb *from)
 {
     t->files = files_new();
-    t->fs = fs_new(from && from->fs ? from->fs->cwd : NULL, from && from->fs ? from->fs->umask : 022);
+    t->fs = fs_new(from && from->fs ? vfs_cwd_get(from->fs) : NULL, from && from->fs ? from->fs->umask : 022);
     t->sighand = sighand_new(NULL);
     t->signal = signal_new();
     if (t->files && t->fs && t->sighand && t->signal) return true;
@@ -653,6 +656,50 @@ void kmutex_unlock(struct kmutex *m)
 }
 
 bool kmutex_held(const struct kmutex *m) { return m->owner == cur; }
+
+/* Reader-writer locks: their state changes under kmutex_spin, and waiters
+ * sleep on the lock's address. */
+void krw_rlock(struct krwlock *l)
+{
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
+    while (l->writer || l->wwait) {
+        l->waiters++;
+        sleep_on_locked(l, &kmutex_spin);
+        l->waiters--;
+    }
+    l->readers++;
+    spin_unlock_irqrestore(&kmutex_spin, f);
+}
+
+void krw_runlock(struct krwlock *l)
+{
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
+    if (--l->readers == 0 && l->waiters) wakeup_waiters(l);
+    spin_unlock_irqrestore(&kmutex_spin, f);
+}
+
+void krw_wlock(struct krwlock *l)
+{
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
+    l->wwait++;
+    while (l->writer || l->readers) {
+        l->waiters++;
+        sleep_on_locked(l, &kmutex_spin);
+        l->waiters--;
+    }
+    l->wwait--;
+    l->writer = cur;
+    spin_unlock_irqrestore(&kmutex_spin, f);
+}
+
+void krw_wunlock(struct krwlock *l)
+{
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
+    if (l->writer != cur) panic("krw_wunlock: not the writer (pid %d)", cur->pid);
+    l->writer = NULL;
+    if (l->waiters) wakeup_waiters(l);
+    spin_unlock_irqrestore(&kmutex_spin, f);
+}
 
 static uint64_t poll_seq;                       /* advanced by every wakeup() */
 static int      pollers;                        /* tasks in poll_sleep        */

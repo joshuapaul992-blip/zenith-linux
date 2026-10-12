@@ -2,7 +2,8 @@
  * parallelism, TLB shootdowns (a thread on another CPU loses an unmapped
  * page at once), page faults on several CPUs at once (resolved without the
  * kernel lock), unix sockets used from several CPUs at once (also without
- * the kernel lock), and the kernel under concurrent system calls.
+ * the kernel lock), regular files and names in the file tree shared by
+ * several CPUs, and the kernel under concurrent system calls.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -24,6 +25,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/syscall.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -589,6 +591,201 @@ static int file_round(const char *path)
     return bad + rf_errors;
 }
 
+/* ---- names in the file tree from several CPUs ------------------------------------- */
+#define PR_THREADS 4
+#define PR_ITERS   300
+static const char *pr_dir;
+static volatile int pr_errors, pr_stop;
+static const char *volatile pr_why;
+static volatile long pr_got;
+
+static void pr_fail(const char *why, long got) { if (!pr_errors++) { pr_why = why; pr_got = got; } }
+
+/* Its own directory: create, write, stat, rename, link, symlink, readlink,
+ * unlink and mkdir/rmdir, each result checked; then a name shared by all
+ * threads, where EEXIST and ENOENT are the only acceptable failures. */
+static void *pr_worker(void *arg)
+{
+    int id = (int)(intptr_t)arg;
+    char d[128], a[160], b[160], l[160], s[160], buf[64];
+    snprintf(d, sizeof d, "%s/t%d", pr_dir, id);
+    if (mkdir(d, 0755)) { pr_fail("mkdir own directory", errno); return NULL; }
+    for (int i = 0; i < PR_ITERS; i++) {
+        snprintf(a, sizeof a, "%s/f%d", d, i);
+        snprintf(b, sizeof b, "%s/g%d", d, i);
+        snprintf(l, sizeof l, "%s/l%d", d, i);
+        int fd = open(a, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) { pr_fail("open O_CREAT|O_EXCL", errno); continue; }
+        int n = snprintf(buf, sizeof buf, "%d:%d", id, i);
+        if (write(fd, buf, (size_t)n) != n) pr_fail("write", errno);
+        close(fd);
+        struct stat st;
+        if (stat(a, &st) || st.st_size != n || !S_ISREG(st.st_mode)) pr_fail("stat after create", errno);
+        if (rename(a, b)) pr_fail("rename", errno);
+        if (stat(a, &st) == 0 || errno != ENOENT) pr_fail("old name gone after rename", errno);
+        if (symlink(b, l)) pr_fail("symlink", errno);
+        ssize_t k = readlink(l, s, sizeof s - 1);
+        if (k != (ssize_t)strlen(b) || memcmp(s, b, (size_t)k)) pr_fail("readlink", k);
+        fd = open(l, O_RDONLY);                         /* through the link */
+        char got[64] = "";
+        if (fd < 0 || read(fd, got, sizeof got - 1) != n || memcmp(got, buf, (size_t)n)) pr_fail("read through symlink", errno);
+        if (fd >= 0) close(fd);
+        if (unlink(l)) pr_fail("unlink symlink", errno);
+        if (i % 10) { if (unlink(b)) pr_fail("unlink", errno); }      /* every tenth stays */
+        snprintf(s, sizeof s, "%s/sub%d", d, i);
+        if (mkdir(s, 0700) || access(s, F_OK) || rmdir(s)) pr_fail("mkdir/access/rmdir", errno);
+        snprintf(s, sizeof s, "%s/shared%d", pr_dir, i % 8);   /* contended */
+        fd = open(s, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd >= 0) close(fd); else if (errno != EEXIST) pr_fail("shared create", errno);
+        if (unlink(s) && errno != ENOENT) pr_fail("shared unlink", errno);
+    }
+    return NULL;
+}
+
+/* Lists the top directory and stats every name while it changes. */
+static void *pr_lister(void *arg)
+{
+    (void)arg;
+    char p[300];
+    while (!pr_stop) {
+        int fd = open(pr_dir, O_RDONLY | O_DIRECTORY);
+        if (fd < 0) { pr_fail("open directory", errno); return NULL; }
+        char buf[4096];
+        long n;
+        while ((n = syscall(SYS_getdents64, fd, buf, sizeof buf)) > 0)
+            for (long o = 0; o < n;) {
+                struct { uint64_t ino; int64_t off; unsigned short reclen; unsigned char type; char name[]; } *e = (void *)(buf + o);
+                snprintf(p, sizeof p, "%s/%s", pr_dir, e->name);
+                struct stat st;
+                if (lstat(p, &st) && errno != ENOENT) pr_fail("lstat of a listed name", errno);
+                o += e->reclen;
+            }
+        if (n < 0) pr_fail("getdents64", errno);
+        close(fd);
+    }
+    return NULL;
+}
+
+/* An open file unlinked by another thread stays readable. */
+static void *pr_unlinked(void *arg)
+{
+    (void)arg;
+    char p[160];
+    snprintf(p, sizeof p, "%s/opened", pr_dir);
+    for (int i = 0; i < 200; i++) {
+        int fd = open(p, O_RDWR | O_CREAT | O_TRUNC, 0600);
+        if (fd < 0) { pr_fail("open to unlink", errno); return NULL; }
+        if (write(fd, "kestrel", 7) != 7) pr_fail("write before unlink", errno);
+        if (unlink(p)) pr_fail("unlink an open file", errno);
+        char b[8] = "";
+        struct stat st;
+        if (pread(fd, b, 7, 0) != 7 || memcmp(b, "kestrel", 7) || fstat(fd, &st) || st.st_size != 7)
+            pr_fail("an unlinked open file reads back", errno);
+        close(fd);
+    }
+    return NULL;
+}
+
+/* /proc while processes come and go: lookups, links, listings. */
+static void *pr_proc(void *arg)
+{
+    (void)arg;
+    char p[64], s[256];
+    while (!pr_stop) {
+        struct stat st;
+        if (stat("/proc/self/status", &st)) pr_fail("stat /proc/self/status", errno);
+        if (readlink("/proc/self/exe", s, sizeof s) <= 0) pr_fail("readlink /proc/self/exe", errno);
+        snprintf(p, sizeof p, "/proc/%d/cwd", getpid());
+        if (readlink(p, s, sizeof s) <= 0) pr_fail("readlink /proc/PID/cwd", errno);
+        int fd = open("/proc", O_RDONLY | O_DIRECTORY);
+        char buf[4096];
+        if (fd < 0 || syscall(SYS_getdents64, fd, buf, sizeof buf) <= 0) pr_fail("list /proc", errno);
+        if (fd >= 0) close(fd);
+        pid_t c = fork();
+        if (c == 0) _exit(0);
+        if (c > 0) waitpid(c, NULL, 0);
+    }
+    return NULL;
+}
+
+/* chdir into a directory another thread then removes: the caller's
+ * directory stays valid; ".." from it is ENOENT, as on Linux. */
+static int pr_cwd(void)
+{
+    char d[160], cwd[256];
+    int bad = 0;
+    snprintf(d, sizeof d, "%s/gone", pr_dir);
+    for (int i = 0; i < 20; i++) {
+        pid_t c = fork();
+        if (c == 0) {
+            if (mkdir(d, 0755) || chdir(d)) _exit(2);
+            pid_t g = fork();                           /* another process removes it */
+            if (g == 0) _exit(rmdir(d) ? 3 : 0);
+            int st;
+            waitpid(g, &st, 0);
+            if (!WIFEXITED(st) || WEXITSTATUS(st)) _exit(4);
+            struct stat s2;
+            if (stat(".", &s2)) _exit(5);               /* still a directory we stand in */
+            if (open("..", O_RDONLY) >= 0 || errno != ENOENT) _exit(6);
+            if (open("x", O_WRONLY | O_CREAT, 0644) >= 0) _exit(7);
+            (void)getcwd(cwd, sizeof cwd);
+            _exit(0);
+        }
+        int st;
+        if (waitpid(c, &st, 0) != c || !WIFEXITED(st) || WEXITSTATUS(st)) {
+            printf("  FAIL detail: removed working directory: step %d\n", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+            bad++;
+            rmdir(d);
+        }
+    }
+    return bad;
+}
+
+static int path_round(const char *dir)
+{
+    pthread_t w[PR_THREADS], li, un, pp;
+    char p[300];
+    pr_dir = dir;
+    pr_errors = 0;
+    pr_stop = 0;
+    mkdir(dir, 0755);
+    pthread_create(&li, NULL, pr_lister, NULL);
+    pthread_create(&pp, NULL, pr_proc, NULL);
+    pthread_create(&un, NULL, pr_unlinked, NULL);
+    for (int i = 0; i < PR_THREADS; i++) pthread_create(&w[i], NULL, pr_worker, (void *)(intptr_t)i);
+    for (int i = 0; i < PR_THREADS; i++) pthread_join(w[i], NULL);
+    pthread_join(un, NULL);
+    pr_stop = 1;
+    pthread_join(li, NULL);
+    pthread_join(pp, NULL);
+    int bad = pr_cwd();
+    for (int t = 0; t < PR_THREADS; t++) {              /* what each thread left: g0, g10, g20 ... */
+        snprintf(p, sizeof p, "%s/t%d", dir, t);
+        int fd = open(p, O_RDONLY | O_DIRECTORY), names = 0;
+        char buf[8192];
+        long n;
+        while (fd >= 0 && (n = syscall(SYS_getdents64, fd, buf, sizeof buf)) > 0)
+            for (long o = 0; o < n;) {
+                struct { uint64_t ino; int64_t off; unsigned short reclen; unsigned char type; char name[]; } *e = (void *)(buf + o);
+                if (strcmp(e->name, ".") && strcmp(e->name, "..")) {
+                    int i = atoi(e->name + 1);
+                    if (e->name[0] != 'g' || i % 10) bad++;
+                    names++;
+                    snprintf(p, sizeof p, "%s/t%d/%s", dir, t, e->name);
+                    unlink(p);
+                }
+                o += e->reclen;
+            }
+        if (fd >= 0) close(fd);
+        if (names != PR_ITERS / 10) { printf("  FAIL detail: t%d holds %d names, not %d\n", t, names, PR_ITERS / 10); bad++; }
+        snprintf(p, sizeof p, "%s/t%d", dir, t);
+        if (rmdir(p)) bad++;
+    }
+    if (rmdir(dir)) { printf("  FAIL detail: %s not empty at the end\n", dir); bad++; }
+    if (pr_errors) printf("  FAIL detail: %d call(s) failed; first: %s (%ld)\n", pr_errors, pr_why, pr_got);
+    return bad + pr_errors;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -623,6 +820,16 @@ int main(int argc, char **argv)
             CHECK(file_round("/tmp/smptest.dat") == 0, "tmpfs file round");
         }
         printf("smptest files: %d failure(s)\n", failures);
+        return failures ? 1 : 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "paths")) {          /* smptest paths N: only the path rounds */
+        setvbuf(stdout, NULL, _IONBF, 0);
+        int n = atoi(argv[2]);
+        for (int i = 0; i < n; i++) {
+            CHECK(path_round("/var/tmp/smptest.d") == 0, "ext2 path round");
+            CHECK(path_round("/tmp/smptest.d") == 0, "tmpfs path round");
+        }
+        printf("smptest paths: %d failure(s)\n", failures);
         return failures ? 1 : 0;
     }
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -688,6 +895,12 @@ int main(int argc, char **argv)
           "ext2: 4 threads x 1500 records by write(), read(), O_APPEND and pwrite(), fstat and fsync alongside");
     CHECK(file_round("/tmp/smptest.dat") == 0,
           "tmpfs: 4 threads x 1500 records by write(), read(), O_APPEND and pwrite(), fstat alongside");
+
+    printf("names in the file tree from several CPUs:\n");
+    CHECK(path_round("/var/tmp/smptest.d") == 0,
+          "ext2: 4 threads x 300 create/stat/rename/symlink/readlink/unlink/mkdir/rmdir, listings, /proc and unlinked open files alongside");
+    CHECK(path_round("/tmp/smptest.d") == 0,
+          "tmpfs: the same");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

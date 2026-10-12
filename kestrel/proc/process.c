@@ -228,7 +228,7 @@ int64_t proc_clone(uint64_t flags, uint64_t newsp, uint64_t ptid, uint64_t ctid,
     if (flags & CLONE_FILES) { files = p->files; __atomic_add_fetch(&files->refs, 1, __ATOMIC_ACQ_REL); }
     else files = files_dup(p->files);
     if (flags & CLONE_FS) { fs = p->fs; __atomic_add_fetch(&fs->refs, 1, __ATOMIC_ACQ_REL); }
-    else fs = fs_new(p->fs->cwd, p->fs->umask);
+    else fs = fs_new(vfs_cwd_get(p->fs), p->fs->umask);
     if (flags & CLONE_SIGHAND) { sh = p->sighand; __atomic_add_fetch(&sh->refs, 1, __ATOMIC_ACQ_REL); }
     else sh = sighand_new(p->sighand);
     if (sh && (flags & CLONE_CLEAR_SIGHAND))            /* posix_spawn: handlers reset, ignored stay ignored */

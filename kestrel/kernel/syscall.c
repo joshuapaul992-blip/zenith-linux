@@ -347,15 +347,17 @@ static int64_t sys_newfstatat(uint64_t dirfd, uint64_t path, uint64_t st, uint64
     if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
     if (n == 0) {
         if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
-        if ((int)dirfd == AT_FDCWD) { struct vnode *vn; int r = vfs_lookup(".", &vn); return r ? r : put_stat(st, vn); }
-        return sys_fstat(dirfd, st, 0, 0, 0, 0);
+        if ((int)dirfd != AT_FDCWD) return sys_fstat(dirfd, st, 0, 0, 0, 0);
+        strlcpy(p, ".", sizeof p);                      /* the working directory */
     }
     struct vnode *base, *vn; struct file *hold;
     int r = at_dir((int64_t)dirfd, p, &base, &hold);
     if (r) return r;
     r = vfs_lookup_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), &vn);
-    int64_t ret = r ? r : put_stat(st, vn);
     fput(hold);
+    if (r) return r;
+    int64_t ret = put_stat(st, vn);
+    vfs_vnode_put(vn);
     return ret;
 }
 
@@ -380,7 +382,10 @@ static int64_t sys_statfs(uint64_t path, uint64_t buf, uint64_t a3, uint64_t a4,
     struct vnode *vn;
     int r = get_path(path, p);
     if (!r) r = vfs_lookup(p, &vn);
-    return r ? r : do_statfs(vn, buf);
+    if (r) return r;
+    int64_t ret = do_statfs(vn, buf);
+    vfs_vnode_put(vn);
+    return ret;
 }
 
 static int64_t sys_fstatfs(uint64_t fd, uint64_t buf, uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6)
@@ -537,7 +542,7 @@ static int64_t sys_fchdir(uint64_t fd, uint64_t a2, uint64_t a3, uint64_t a4, ui
     struct file *f = fget((int)fd);
     if (!f) return -EBADF;
     int r = f->vn->type == VDIR ? 0 : -ENOTDIR;
-    if (!r && current_task()->fs) current_task()->fs->cwd = f->vn;
+    if (!r) vfs_set_cwd(f->vn);
     fput(f);
     return r;
 }
@@ -584,7 +589,7 @@ static int64_t sys_renameat2(uint64_t odfd, uint64_t from, uint64_t ndfd, uint64
     if ((r = at_dir((int64_t)odfd, a, &ob, &oh))) return r;
     if ((r = at_dir((int64_t)ndfd, b, &nb, &nh))) { fput(oh); return r; }
     struct vnode *exists;
-    if ((flags & 1) && vfs_lookup_at(nb, b, false, &exists) == 0) r = -EEXIST;
+    if ((flags & 1) && vfs_lookup_at(nb, b, false, &exists) == 0) { vfs_vnode_put(exists); r = -EEXIST; }
     else r = vfs_rename_at(ob, a, nb, b);
     fput(oh);
     fput(nh);
@@ -1036,7 +1041,9 @@ static int64_t sys_truncate(uint64_t path, uint64_t len, uint64_t a3, uint64_t a
     if (r) return r;
     struct vnode *vn;
     if ((r = vfs_lookup(p, &vn))) return r;
-    return vfs_truncate(vn, len);
+    r = vfs_truncate(vn, len);
+    vfs_vnode_put(vn);
+    return r;
 }
 
 /* sync(2)/syncfs(2): write back every disk file system, then ask every
@@ -1081,6 +1088,7 @@ static int xattr_target(uint64_t path, bool follow)
     struct vnode *vn;
     int r = vfs_lookup_at(base, p, follow, &vn);
     fput(hold);
+    if (!r) vfs_vnode_put(vn);
     return r;
 }
 
@@ -1842,8 +1850,10 @@ static int64_t sys_faccessat(uint64_t dirfd, uint64_t path, uint64_t mode, uint6
     AT_PATH(dirfd, path);
     struct vnode *vn;
     int r = vfs_lookup_at(base, p, true, &vn);              /* existence; root may do anything */
-    if (!r && (mode & 2) && vn->fs && (vn->fs->flags & MNT_RDONLY)) r = -EROFS;
     fput(hold);
+    if (r) return r;
+    if ((mode & 2) && vn->fs && (vn->fs->flags & MNT_RDONLY)) r = -EROFS;
+    vfs_vnode_put(vn);
     return r;
 }
 
@@ -2682,7 +2692,14 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t
     if (n < 0) return n == -ENAMETOOLONG ? n : -EFAULT;
     if (n == 0) {
         if (!(flags & AT_EMPTY_PATH)) return -ENOENT;
-        if ((int)dirfd == AT_FDCWD) { struct vnode *vn; int r = vfs_lookup(".", &vn); return r ? r : put_statx(buf, vn); }
+        if ((int)dirfd == AT_FDCWD) {
+            struct vnode *vn;
+            int r = vfs_lookup(".", &vn);
+            if (r) return r;
+            int64_t ret = put_statx(buf, vn);
+            vfs_vnode_put(vn);
+            return ret;
+        }
         struct file *f = fget((int)dirfd);
         if (!f) return -EBADF;
         int64_t r = put_statx(buf, f->vn);
@@ -2693,8 +2710,10 @@ static int64_t sys_statx(uint64_t dirfd, uint64_t path, uint64_t flags, uint64_t
     int r = at_dir((int64_t)dirfd, p, &base, &hold);
     if (r) return r;
     r = vfs_lookup_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), &vn);
-    int64_t ret = r ? r : put_statx(buf, vn);
     fput(hold);
+    if (r) return r;
+    int64_t ret = put_statx(buf, vn);
+    vfs_vnode_put(vn);
     return ret;
 }
 
@@ -2718,8 +2737,10 @@ static int64_t sys_faccessat2(uint64_t dirfd, uint64_t path, uint64_t mode, uint
     int r = at_dir((int64_t)dirfd, p, &base, &hold);
     if (r) return r;
     r = vfs_lookup_at(base, p, !(flags & AT_SYMLINK_NOFOLLOW), &vn);
-    if (!r && (mode & 2) && vn->fs && (vn->fs->flags & MNT_RDONLY)) r = -EROFS;
     fput(hold);
+    if (r) return r;
+    if ((mode & 2) && vn->fs && (vn->fs->flags & MNT_RDONLY)) r = -EROFS;
+    vfs_vnode_put(vn);
     return r;
 }
 
@@ -2840,7 +2861,7 @@ static int64_t sys_inotify_add_watch(uint64_t fd, uint64_t path, uint64_t mask, 
     if (!n) { r = -ENOENT; goto out; }
     struct vnode *vn;
     r = vfs_lookup_at(NULL, p, !((uint32_t)mask & IN_DONT_FOLLOW), &vn);
-    if (!r) r = inotify_add(f, vn, (uint32_t)mask);
+    if (!r) { r = inotify_add(f, vn, (uint32_t)mask); vfs_vnode_put(vn); }   /* a watch ends with its node */
 out:
     fput(f);
     return r;
@@ -3104,6 +3125,18 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
      * big lock takes it in fget, MAP_POPULATE in sys_mmap. */
     case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_brk:
     case SYS_madvise: case SYS_mremap:
+        return true;
+    /* names in the file tree: the tree's lock (fs/vfs.c), shared to look
+     * and exclusive to change. A device's open, a generated file's size or
+     * a /proc link take the big lock there, as do directory descriptors in
+     * fget that need it. */
+    case SYS_open: case SYS_openat: case SYS_stat: case SYS_lstat: case SYS_newfstatat: case SYS_statx:
+    case SYS_access: case SYS_faccessat: case SYS_faccessat2: case SYS_readlink: case SYS_readlinkat:
+    case SYS_getdents64: case SYS_getcwd: case SYS_chdir: case SYS_fchdir: case SYS_umask:
+    case SYS_mkdir: case SYS_mkdirat: case SYS_rmdir: case SYS_unlink: case SYS_unlinkat:
+    case SYS_rename: case SYS_renameat: case SYS_renameat2: case SYS_link: case SYS_linkat:
+    case SYS_symlink: case SYS_symlinkat: case SYS_chmod: case SYS_fchmodat: case SYS_chown:
+    case SYS_lchown: case SYS_fchownat: case SYS_utimensat:
         return true;
     default:
         return false;

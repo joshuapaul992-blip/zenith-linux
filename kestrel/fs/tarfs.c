@@ -230,7 +230,8 @@ int tarfs_mount(struct blkdev *dev, uint64_t offset, uint64_t length, const char
     if (rc < 0) return rc;
 
     struct vnode *mp;
-    if (vfs_lookup(path, &mp) < 0 && (rc = vfs_mkdir(path, 0755)) < 0) return rc;
+    if (vfs_lookup(path, &mp) == 0) vfs_vnode_put(mp);
+    else if ((rc = vfs_mkdir(path, 0755)) < 0) return rc;
     if ((rc = vfs_mount(m, path)) < 0) return rc;
     m->dev = (uint32_t)(dev->node ? dev->node->rdev : m->dev);
     kprintf("tarfs: %s mounted on %s: %u files (%lu bytes), %u directories, %u skipped\n",

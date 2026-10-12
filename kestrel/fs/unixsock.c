@@ -269,8 +269,10 @@ static struct usock *find_listener(bool abstract, const char *name, uint32_t nl)
     if (!abstract) {
         struct vnode *node;
         if (vfs_lookup(name, &node) < 0) return NULL;
-        if (node->type != VSOCK) return NULL;
+        bool sock = node->type == VSOCK;
         ino = node->ino;
+        vfs_vnode_put(node);
+        if (!sock) return NULL;
     }
     for (int i = 0; i < MAX_NAMES; i++) {
         if (!names[i].used || names[i].abstract != abstract) continue;
@@ -291,7 +293,9 @@ int usock_connect(struct file *f, const struct sockaddr_un *a, uint32_t len)
     if (!abstract) {
         struct vnode *node;
         if ((rc = vfs_lookup(name, &node)) < 0) return rc;
-        if (node->type != VSOCK) return -ECONNREFUSED;
+        bool sock = node->type == VSOCK;
+        vfs_vnode_put(node);
+        if (!sock) return -ECONNREFUSED;
     }
     struct usock *l = find_listener(abstract, name, nl);        /* the name table: big lock */
     if (!l) return -ECONNREFUSED;

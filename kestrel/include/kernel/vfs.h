@@ -41,7 +41,9 @@ struct vnode_ops {
     int     (*poll)(struct file *f, int events);   /* ready POLL* bits     */
     /* fread, fwrite, poll and poll_deadline lock the object themselves:
      * reads, writes and polls of the file run without the big kernel lock
-     * (kernel/syscall.c: fget). Pipes, eventfds and unix sockets. */
+     * (kernel/syscall.c: fget). Pipes, eventfds and unix sockets. On a file
+     * system's nodes it says that every operation locks itself, so the path
+     * calls (stat, readlink, open) call them without the big kernel lock. */
     bool    nolock;
     void    (*release)(struct file *f);            /* last close of f      */
     int     (*fioctl)(struct file *f, unsigned long req, void *arg);  /* preferred over ioctl */
@@ -49,8 +51,15 @@ struct vnode_ops {
      * open, e.g. /dev/ptmx). Called after vfs_open's permission checks. */
     int     (*open)(struct vnode *vn, int flags, struct file **out);
     /* Optional, directories: bring the children up to date before a lookup
-     * or listing (/proc's per-process directories). */
+     * or listing (a disk directory read when first used, /proc's
+     * per-process directories). Called with the tree's lock held shared, so
+     * it may only append children (vfs_node_add), and must keep any other
+     * task from appending to the same directory meanwhile -- unless `stale`
+     * is set: then refresh runs with the lock held exclusively and may also
+     * take children away, and `stale` (called with it shared) says whether
+     * a refresh is needed at all. */
     void    (*refresh)(struct vnode *dir);
+    bool    (*stale)(struct vnode *dir);
     /* Optional, regular files: set the size (ftruncate, O_TRUNC). */
     int     (*truncate)(struct vnode *vn, uint64_t size);
     /* Optional: the page-backed object holding the file's data, so that
@@ -110,9 +119,11 @@ struct vnode {
     struct mount *fs;
     struct vnode *parent, *children, *sibling;
     struct vnode *mounted;          /* root of filesystem mounted here    */
-    int         refs;               /* open files on it (atomic)          */
+    int         refs;               /* open files, lookups in progress and
+                                       working directories on it (atomic);
+                                       fs/vfs.c: VN_GONE once out of the tree */
     bool        unlinked;           /* removed from its directory: freed
-                                       when the last open file closes      */
+                                       when the last reference goes        */
     bool        loaded;             /* directory: children read (refresh)  */
     bool        loading;            /* ...being read: by the holder of the fs lock */
     uint32_t    nlink;              /* hard links (0: 1, or 2 for a dir)   */
@@ -167,16 +178,34 @@ struct vnode *vfs_root(void);
 struct mount *vfs_mounts(void);
 struct vnode *vfs_node_new(struct mount *fs, const char *name, enum vtype t, uint32_t mode,
                            const struct vnode_ops *ops);
+/* Append to a directory: at boot, or with the tree's lock held exclusively
+ * (or shared, from a refresh: see vnode_ops.refresh). So do pseudo_dir and
+ * pseudo_file below. */
 void          vfs_node_add(struct vnode *dir, struct vnode *child);
 struct vnode *vfs_mkfs(const char *fstype, uint32_t flags, struct mount **out);
 int           vfs_mount(struct mount *m, const char *path);
 int           vfs_bind(const char *src, const char *dst);     /* show src's contents at dst */
 
+/* ---- the tree's lock and node references ------------------------------------
+ * One reader-writer lock guards the directory tree (fs/vfs.c): lookups hold
+ * it shared, creating, removing and renaming exclusively; the path calls
+ * run without the big kernel lock. A node found by a lookup carries a
+ * reference, so it stays valid after the lock is dropped even if another
+ * CPU unlinks it meanwhile. */
+struct fs_struct;
+void    vfs_tree_lock(bool excl);               /* recursive per task */
+void    vfs_tree_unlock(void);
+void    vfs_vnode_get(struct vnode *vn);        /* NULL is fine */
+void    vfs_vnode_put(struct vnode *vn);        /* frees an unlinked node with its last reference */
+struct vnode *vfs_cwd_get(struct fs_struct *fs);   /* fs's working directory (root if none), referenced */
+void    vfs_set_cwd(struct vnode *vn);          /* the calling task's; takes its own reference */
+
 /* ---- path operations ------------------------------------------------------
  * Relative paths start at `base` (a directory, the *at calls' dirfd), or the
  * current task's cwd when base is NULL. Symbolic links are followed, at most
  * VFS_MAX_SYMLINKS per lookup, except in the last component when `follow`
- * is false (lstat, unlink, O_NOFOLLOW ...). */
+ * is false (lstat, unlink, O_NOFOLLOW ...). The lookups return the node
+ * with a reference: vfs_vnode_put() when done. */
 int     vfs_lookup(const char *path, struct vnode **out);
 int     vfs_lookup_at(struct vnode *base, const char *path, bool follow, struct vnode **out);
 int     vfs_open_at(struct vnode *base, const char *path, int flags, mode_t mode, struct file **out);

@@ -1289,14 +1289,19 @@ static const struct vnode_ops e2_file_ops = {
     .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
     .nolock = true,                                     /* fs->lock; block I/O takes the big lock itself */
 };
+/* Every operation takes fs->lock: the path calls use them without the big
+ * lock (vnode_ops.nolock). e2_refresh appends to a directory under the
+ * tree's lock held shared, and fs->lock keeps a second reader out. */
 static const struct vnode_ops e2_dir_ops = {
     .refresh = e2_refresh, .create = e2_create, .link = e2_link, .remove = e2_remove, .rename = e2_rename,
-    .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
+    .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr, .nolock = true,
 };
 static const struct vnode_ops e2_link_ops = {
     .readlink = e2_readlink, .size = e2_size, .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
+    .nolock = true,
 };
-static const struct vnode_ops e2_special_ops = { .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr };
+static const struct vnode_ops e2_special_ops = { .setattr = e2_setattr, .evict = e2_evict, .getattr = e2_getattr,
+                                                 .nolock = true };
 
 /* ---- mount, sync, statfs ------------------------------------------------------------ */
 static int e2_sync(struct mount *m, bool final)

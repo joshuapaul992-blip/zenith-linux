@@ -71,7 +71,8 @@ static void seed(const char *name, const char *text)
     char path[64];
     struct vnode *vn;
     snprintf(path, sizeof path, "/etc/%s", name);
-    if (!text || vfs_lookup(path, &vn) == 0) return;
+    if (!text) return;
+    if (vfs_lookup(path, &vn) == 0) { vfs_vnode_put(vn); return; }
     struct file *f;
     if (vfs_open(path, O_WRONLY | O_CREAT | O_EXCL, 0644, &f) < 0) return;
     vfs_write(f, text, strlen(text));
@@ -127,17 +128,18 @@ int rootfs_mount(void)
 
     struct vnode *vn;
     if (!(m->flags & MNT_RDONLY)) {
-        if (vfs_lookup("/etc", &vn) < 0) vfs_mkdir("/etc", 0755);
+        if (vfs_lookup("/etc", &vn) < 0) vfs_mkdir("/etc", 0755); else vfs_vnode_put(vn);
         for (size_t i = 0; i < sizeof etc / sizeof *etc; i++) seed(etc[i], saved[i]);
         if (vfs_symlink_at("/proc/net/pnp", NULL, "/etc/resolv.conf") == 0)    /* fails with EEXIST if present */
             kprintf("rootfs: /etc/resolv.conf -> /proc/net/pnp written (the volume had none)\n");
-        if (vfs_lookup("/root", &vn) < 0) vfs_mkdir("/root", 0700);
+        if (vfs_lookup("/root", &vn) < 0) vfs_mkdir("/root", 0700); else vfs_vnode_put(vn);
     }
     for (size_t i = 0; i < sizeof etc / sizeof *etc; i++) kfree(saved[i]);
 
     struct mount *tmp;                                  /* scratch space in memory, empty at each boot */
     vfs_mkfs("tmpfs", 0, &tmp)->mode = S_IFDIR | 01777;
-    if (vfs_lookup("/tmp", &vn) < 0 && !(m->flags & MNT_RDONLY)) vfs_mkdir("/tmp", 01777);
+    if (vfs_lookup("/tmp", &vn) == 0) vfs_vnode_put(vn);
+    else if (!(m->flags & MNT_RDONLY)) vfs_mkdir("/tmp", 01777);
     if (vfs_mount(tmp, "/tmp") < 0) kprintf("rootfs: no /tmp on the root volume: /tmp unavailable\n");
     kprintf("rootfs: \033[92m/ is now /dev/%s\033[0m (ext2%s)\n", dev->name,
             (m->flags & MNT_RDONLY) ? ", read-only" : dev->kind == BLK_DISK_RAM ? ", in memory: changes last until power-off" : "");
