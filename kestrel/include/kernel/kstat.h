@@ -72,7 +72,8 @@ size_t   kstat_gen(char *buf, size_t cap);              /* /proc/kstat */
  * with addr2line against kernel.elf. */
 void     kstat_prof_tick(uint64_t rip, bool user);
 size_t   kstat_gen_prof(char *buf, size_t cap);         /* /proc/kprof */
-void     kstat_lockwait(uint64_t caller, uint64_t cyc);  /* a contended big-lock acquisition */
+void     kstat_lockwait(uint64_t caller, uint64_t cyc);  /* a contended big-lock acquisition
+                                                          * (caller < 256: an interrupt vector) */
 size_t   kstat_gen_process(int tgid, char *buf, size_t cap);   /* /proc/PID/kstat */
 void     kstat_init(void);                              /* the REPORT.TXT section */
 

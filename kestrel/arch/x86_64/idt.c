@@ -282,9 +282,6 @@ static void exception(struct int_frame *f)
     kernel_exception(f);
 }
 
-extern void timer_interrupt(bool boot_cpu);
-extern bool timer_tick_needs_lock(void);
-extern void timer_tick_fast(void);
 
 /* Vectors that need no kernel lock: they touch only this CPU's state. */
 static bool lockless(struct int_frame *f)
@@ -309,13 +306,16 @@ static bool lockless(struct int_frame *f)
         tlb_service();
         lapic_eoi();
         return true;
-    case VEC_LAPIC_TIMER:                               /* other CPUs: accounting, the slice */
+    case VEC_LAPIC_TIMER:                               /* every CPU: accounting, the slice */
         kstat_prof_tick(f->rip, (f->cs & 3) == 3);
-        if (this_cpu()->id == 0 && timer_tick_needs_lock()) return false;   /* hooks, interval timers */
         lapic_eoi();                                    /* first: we may switch away */
         this_cpu()->ticks++;
-        if (this_cpu()->id == 0) timer_tick_fast();     /* sleepers, netd's timer, the slice */
-        else sched_tick_fast();
+        if (this_cpu()->id == 0) {
+            if (timer_tick_needs_lock()) bkl_defer(BKL_DEFER_TICK);     /* hooks, interval timers */
+            timer_tick_fast();                          /* sleepers, netd's timer, the slice */
+        } else {
+            sched_tick_fast();
+        }
         if ((f->cs & 3) == 3 && signal_pending()) {     /* back to ring 3 with a signal to take */
             bkl_enter();
             signal_deliver(f, 0, false);
@@ -344,7 +344,19 @@ void isr_dispatch(struct int_frame *f)
         cli();
         return;
     }
+    if (f->vector >= VEC_MSI_BASE && f->vector < VEC_MSI_BASE + VEC_MSI_COUNT) {
+        /* A device's MSI does not wait for the big lock: with it busy, its
+         * holder runs the handler as it lets go (msi.h: msi_defer) */
+        lapic_eoi();                                    /* edge-triggered: EOI first */
+        uint64_t t0 = rdtsc();
+        bkl_defer(1ull << (f->vector - VEC_MSI_BASE));
+        k->irq_n++;
+        k->irq_cyc += rdtsc() - t0;
+        return;
+    }
+    uint64_t lw0 = k->lock_spin_cyc;
     bkl_enter();
+    if (k->lock_spin_cyc != lw0) kstat_lockwait(f->vector, k->lock_spin_cyc - lw0);  /* by vector, for /proc/kprof */
     bool user = (f->cs & 3) == 3;
     if (f->vector < 32) {
         exception(f);
@@ -371,12 +383,6 @@ void isr_dispatch(struct int_frame *f)
             this_cpu()->ks.irq_n++;
             this_cpu()->ks.irq_cyc += rdtsc() - t0;
         }
-    } else if (f->vector >= VEC_MSI_BASE && f->vector < VEC_MSI_BASE + VEC_MSI_COUNT) {
-        lapic_eoi();                                    /* edge-triggered: EOI first, like the PIC path */
-        uint64_t t0 = rdtsc();
-        msi_dispatch((int)f->vector);
-        this_cpu()->ks.irq_n++;
-        this_cpu()->ks.irq_cyc += rdtsc() - t0;
     } else if (f->vector == VEC_LAPIC_TIMER) {
         lapic_eoi();
         this_cpu()->ticks++;

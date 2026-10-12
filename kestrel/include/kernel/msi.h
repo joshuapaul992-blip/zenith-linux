@@ -30,7 +30,7 @@ void msi_disable(struct pci_device *dev, int vector);
 /* The vector msi_enable() returned is delivered by MSI-X (not MSI). */
 bool msi_is_msix(int vector);
 /* isr_dispatch: a vector in [VEC_MSI_BASE, VEC_MSI_BASE + VEC_MSI_COUNT) */
-void msi_dispatch(int vector);
+void msi_dispatch(int vector);         /* big lock held (smp.h: bkl_defer) */
 /* /proc/interrupts lines for the MSI vectors in use */
 size_t msi_proc(char *buf, size_t cap);
 

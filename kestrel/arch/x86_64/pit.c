@@ -36,6 +36,15 @@ void timer_tick_fast(void)
     sched_tick_boot_fast();
 }
 
+/* The rest of a boot CPU tick, big lock held: the hooks every HOOK_EVERY
+ * ticks, and interval timers that are due. */
+void timer_tick_locked(void)
+{
+    for (int i = 0; i < MAX_TICK_HOOKS && tick_hooks[i]; i++)
+        tick_hooks[i]();            /* xhci_poll(), terminal cursor blink, ... */
+    sched_alarms();
+}
+
 void timer_interrupt(bool boot_cpu)
 {
     if (!boot_cpu) { sched_tick_local(); return; }

@@ -9,6 +9,7 @@
  * and PAT, its local APIC and timer. It reports itself online and becomes
  * that CPU's idle thread. If an AP does not answer within 200 ms, no
  * further APs are started (its slot and stack stay reserved). kestrel.smp=0 (or maxcpus=1) keeps the system on one CPU. */
+#include <kernel/msi.h>
 #include <kernel/smp.h>
 #include <kernel/arch.h>
 #include <kernel/cpu.h>
@@ -76,17 +77,76 @@ void bkl_enter(void)
     irq_restore(f);
 }
 
+bool bkl_try_enter(void)
+{
+    uint64_t f = irq_save();
+    struct percpu *c = this_cpu();
+    if (c->bkl_depth == 0) {
+        if (__atomic_exchange_n(&bkl_word, 1, __ATOMIC_ACQUIRE)) { irq_restore(f); return false; }
+        bkl_owner = c->id;
+        c->ks.lock_acq++;
+        c->ks.lock_since = rdtsc();
+    }
+    c->bkl_depth++;
+    irq_restore(f);
+    return true;
+}
+
+static void bkl_release(struct percpu *c)
+{
+    c->ks.lock_hold_cyc += rdtsc() - c->ks.lock_since;
+    bkl_owner = -1;
+    __atomic_store_n(&bkl_word, 0, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);            /* against bkl_defer()'s post, then try */
+}
+
+static uint64_t bkl_deferred;
+
+static void run_deferred(void)
+{
+    uint64_t bits;
+    while ((bits = __atomic_exchange_n(&bkl_deferred, 0, __ATOMIC_ACQ_REL))) {
+        for (int i = 0; i < VEC_MSI_COUNT; i++)
+            if (bits & (1ull << i)) msi_dispatch(VEC_MSI_BASE + i);
+        if (bits & BKL_DEFER_TICK) timer_tick_locked();
+    }
+}
+
+void bkl_defer(uint64_t work)
+{
+    __atomic_or_fetch(&bkl_deferred, work, __ATOMIC_SEQ_CST);
+    if (bkl_try_enter()) bkl_exit();                    /* free: runs it */
+}
+
+/* Interrupt handlers deferred while the lock was busy (msi.h) run before it
+ * is let go, and once more if one was deferred as it was let go. */
 void bkl_exit(void)
 {
     uint64_t f = irq_save();
     struct percpu *c = this_cpu();
     if (c->bkl_depth <= 0) panic("bkl_exit: not held on CPU %d", c->id);
+    if (c->bkl_depth == 1 && __atomic_load_n(&bkl_deferred, __ATOMIC_RELAXED)) run_deferred();
     if (--c->bkl_depth == 0) {
-        c->ks.lock_hold_cyc += rdtsc() - c->ks.lock_since;
-        bkl_owner = -1;
-        __atomic_store_n(&bkl_word, 0, __ATOMIC_RELEASE);
+        bkl_release(c);
+        if (__atomic_load_n(&bkl_deferred, __ATOMIC_RELAXED) && bkl_try_enter()) bkl_exit();
     }
     irq_restore(f);
+}
+
+/* schedule(), between two tasks: nothing may run here, the deferred work
+ * waits for sched_switch_tail(). */
+void bkl_exit_switch(void)
+{
+    uint64_t f = irq_save();
+    struct percpu *c = this_cpu();
+    c->bkl_depth = 0;
+    bkl_release(c);
+    irq_restore(f);
+}
+
+void bkl_run_deferred(void)
+{
+    if (__atomic_load_n(&bkl_deferred, __ATOMIC_RELAXED) && bkl_try_enter()) bkl_exit();
 }
 
 int bkl_depth(void) { return this_cpu()->bkl_depth; }

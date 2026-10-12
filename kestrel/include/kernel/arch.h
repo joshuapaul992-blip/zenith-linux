@@ -58,5 +58,12 @@ uint64_t pit_ticks(void);            /* monotonic, 1 tick = 1 ms */
 bool pit_add_tick_hook(void (*fn)(void));
 uint64_t uptime_ms(void);
 void pit_sleep_ms(uint64_t ms);      /* busy-wait with hlt (pre-scheduler) */
+/* A tick (idt.c): timer_interrupt with the big lock; without it,
+ * timer_tick_fast and, when timer_tick_needs_lock, timer_tick_locked
+ * posted to the lock's holder (smp.h: bkl_defer). */
+void timer_interrupt(bool boot_cpu);
+bool timer_tick_needs_lock(void);
+void timer_tick_fast(void);
+void timer_tick_locked(void);
 
 #endif

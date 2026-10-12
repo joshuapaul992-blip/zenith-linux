@@ -420,6 +420,7 @@ void sched_switch_tail(void)
     int d = c->current->bkl_depth;
     if (d && !c->bkl_depth) bkl_enter();
     c->bkl_depth = d;
+    if (!d) bkl_run_deferred();                 /* interrupts deferred as the lock left the last task */
 }
 
 void schedule(void)
@@ -450,7 +451,7 @@ void schedule(void)
      * without it lets it go, one arriving with it after a task that did not
      * hold it queues for it in sched_switch_tail. */
     prev->bkl_depth = c->bkl_depth;
-    if (c->bkl_depth && !next->bkl_depth) { c->bkl_depth = 1; bkl_exit(); }
+    if (c->bkl_depth && !next->bkl_depth) bkl_exit_switch();
     uint64_t ktop = ((uintptr_t)next->kstack + next->kstack_size) & ~0xFull;
     tss_set_kernel_stack(ktop);
     c->kernel_rsp = ktop;
@@ -537,8 +538,17 @@ static void wake_sleepers(void)
 void sched_tick(void)
 {
     if (!running) return;
-    uint64_t ms = time_ms();
     wake_sleepers();
+    sched_alarms();
+    net_tick();                                 /* received frames or a due timer wake netd */
+    sched_tick_local();
+}
+
+/* ITIMER_REAL timers that are due (big lock held). */
+void sched_alarms(void)
+{
+    if (!running) return;
+    uint64_t ms = time_ms();
     uint64_t next = 0;
     for (int i = 1; i < MAX_TASKS; i++) {
         struct signal_struct *g = tasks[i].signal;      /* ITIMER_REAL: per process, on its leader */
@@ -551,8 +561,6 @@ void sched_tick(void)
         if (g->alarm_at && (!next || g->alarm_at < next)) next = g->alarm_at;
     }
     alarm_next = next;
-    net_tick();                                 /* received frames or a due timer wake netd */
-    sched_tick_local();
 }
 
 /* The boot CPU's tick without the kernel lock (idt.c), when no interval

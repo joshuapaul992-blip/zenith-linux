@@ -125,6 +125,16 @@ extern volatile bool smp_panicking;
 /* Big kernel lock */
 void bkl_enter(void);                   /* nest (take it if this CPU has not)  */
 void bkl_exit(void);                    /* unnest (release at depth 0)         */
+bool bkl_try_enter(void);               /* nest, or take it only if it is free */
+void bkl_exit_switch(void);             /* schedule(): release, deferred work left */
+/* Interrupt work that needs the big lock does not wait for it: an
+ * interrupt that finds it busy posts its work here, and the holder runs
+ * it as it lets go (bkl_exit), interrupts off. Bits 0-31: MSI vector
+ * VEC_MSI_BASE + bit (msi_dispatch); BKL_DEFER_TICK: the boot CPU's tick
+ * hooks and interval timers (timer_tick_locked). */
+#define BKL_DEFER_TICK (1ull << 32)
+void bkl_defer(uint64_t work);          /* post, then run it now if the lock is free */
+void bkl_run_deferred(void);            /* left by bkl_exit_switch: run it if free */
 int  bkl_depth(void);
 void bkl_set_depth(int d);              /* context switch: the next task's     */
 int  bkl_release_all(void);             /* pure computation: returns the depth */

@@ -184,6 +184,7 @@ void        sched_tick_local(void);     /* other CPUs' timers: slice only       
 void        sched_tick_fast(void);      /* the same without the kernel lock         */
 bool        sched_tick_needs_lock(void);    /* the boot CPU: an interval timer is due   */
 void        sched_tick_boot_fast(void);     /* the boot CPU's tick without the lock     */
+void        sched_alarms(void);             /* due interval timers (big lock held)      */
 void        sched_alarm_armed(uint64_t at); /* ITIMER_REAL set to time_ms() `at`        */
 void        sched_idle_loop(void) __attribute__((noreturn));
 
