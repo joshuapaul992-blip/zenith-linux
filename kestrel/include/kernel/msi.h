@@ -25,6 +25,8 @@ typedef void (*msi_handler_t)(void *arg);
  * or -1 if the device has no MSI capability, there is no APIC or no free
  * vector: the driver then keeps polling. `name` is for /proc/interrupts. */
 int  msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *name);
+/* Turn the device's MSI or MSI-X off and give the vector back. */
+void msi_disable(struct pci_device *dev, int vector);
 /* The vector msi_enable() returned is delivered by MSI-X (not MSI). */
 bool msi_is_msix(int vector);
 /* isr_dispatch: a vector in [VEC_MSI_BASE, VEC_MSI_BASE + VEC_MSI_COUNT) */

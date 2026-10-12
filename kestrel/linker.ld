@@ -28,6 +28,21 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
+    /* The Linux KPI (linuxkpi/): initcalls by level, module parameters
+     * and module information, walked by linuxkpi_init() */
+    .lkpi ALIGN(8) : {
+        __lkpi_initcall_start = .;
+        KEEP(*(SORT_BY_NAME(.lkpi_initcall.*)))
+        __lkpi_initcall_end = .;
+        . = ALIGN(8);
+        __lkpi_param_start = .;
+        KEEP(*(.lkpi_param))
+        __lkpi_param_end = .;
+        __lkpi_modinfo_start = .;
+        KEEP(*(.lkpi_modinfo))
+        __lkpi_modinfo_end = .;
+    }
+
     /* <faulting RIP, fixup RIP> pairs for user-memory access (uaccess.asm) */
     .ex_table ALIGN(8) : {
         __ex_table_start = .;

@@ -128,8 +128,20 @@ static void final_screen(const char *msg)
     image_draw_fullscreen(&halt_screen);
 }
 
+static void (*power_hook)(int what);
+
+void power_set_hook(void (*fn)(int what)) { power_hook = fn; }
+
+static void run_hook(int what)
+{
+    void (*hook)(int) = power_hook;
+    power_hook = NULL;
+    if (hook) hook(what);
+}
+
 void power_off(void)
 {
+    run_hook(POWER_HOOK_OFF);
     quiesce("powering off");
     acpi_s5();
     outw(0x604, 0x2000);                                /* QEMU q35/pc */
@@ -142,6 +154,7 @@ void power_off(void)
 
 void power_reboot(void)
 {
+    run_hook(POWER_HOOK_REBOOT);
     quiesce("restarting");
     const uint8_t *fadt = acpi_find_table("FACP");
     if (fadt && rd32(fadt + 4) >= FADT_RESET_VALUE + 1 && (rd32(fadt + FADT_FLAGS) & FADT_RESET_REG_SUP)) {
@@ -166,6 +179,7 @@ void power_reboot(void)
 
 void power_halt(void)
 {
+    run_hook(POWER_HOOK_HALT);
     quiesce("halting");
     final_screen("System halted. It is now safe to turn off your computer.");
     cpu_halt_forever();

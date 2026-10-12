@@ -91,6 +91,23 @@ int msi_enable(struct pci_device *dev, msi_handler_t fn, void *arg, const char *
     return vector;
 }
 
+void msi_disable(struct pci_device *dev, int vector)
+{
+    if (vector < VEC_MSI_BASE || vector >= VEC_MSI_BASE + VEC_MSI_COUNT) return;
+    struct msi_slot *s = &slots[vector - VEC_MSI_BASE];
+    uint8_t cap = find_cap(dev, s->msix ? CAP_MSIX : CAP_MSI);
+    if (cap) {
+        uint16_t ctl = pci_read16(dev->bus, dev->device, dev->function, (uint8_t)(cap + 2));
+        ctl = s->msix ? (uint16_t)(ctl & ~0x8000) : (uint16_t)(ctl & ~0x0001);
+        pci_write16(dev->bus, dev->device, dev->function, (uint8_t)(cap + 2), ctl);
+    }
+    uint64_t f = irq_save();
+    s->fn = NULL;
+    s->arg = NULL;
+    s->msix = false;
+    irq_restore(f);
+}
+
 bool msi_is_msix(int vector)
 {
     return vector >= VEC_MSI_BASE && vector < VEC_MSI_BASE + VEC_MSI_COUNT && slots[vector - VEC_MSI_BASE].msix;
