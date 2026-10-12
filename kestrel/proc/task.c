@@ -337,6 +337,12 @@ static bool normal_ready(void)
     return false;
 }
 
+/* Until it becomes CPU 0's idle loop, the boot thread is an ordinary
+ * thread that can be preempted holding a lock (a TTY, while it prints):
+ * it must then get the CPU back like any other, or threads yielding to the
+ * lock's holder would never let it run. Cleared by sched_idle_loop(). */
+static bool boot_thread_busy = true;
+
 /* Round robin among ready tasks; idle-class tasks only when no normal task
  * is ready (they are what the CPU does instead of halting). */
 static struct tcb *pick_next(void)
@@ -346,7 +352,8 @@ static struct tcb *pick_next(void)
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 1; i <= MAX_TASKS; i++) {
             struct tcb *t = &tasks[(start + i) % MAX_TASKS];
-            if (t->pid != 0 && t->state == TASK_READY && t->idle_class == (pass == 1)) return t;
+            bool eligible = t->pid != 0 || (boot_thread_busy && this_cpu()->id == 0);
+            if (eligible && t->state == TASK_READY && t->idle_class == (pass == 1)) return t;
         }
         /* no other normal task: a normal current task keeps the CPU */
         if (pass == 0 && cur->state == TASK_RUNNING && !cur->idle_class && cur->pid != 0) return cur;
@@ -603,6 +610,7 @@ int task_wait(int pid)
 void sched_idle_loop(void)
 {
     struct percpu *c = this_cpu();
+    if (cur->pid == 0) boot_thread_busy = false;
     for (;;) {
         cli();
         reap_zombies();
