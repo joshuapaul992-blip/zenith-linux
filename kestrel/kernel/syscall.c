@@ -923,6 +923,7 @@ static int64_t sys_mmap(uint64_t addr, uint64_t len, uint64_t prot, uint64_t fla
     if (flags & MAP_HUGETLB) return -EINVAL;
     if (!len || (off & (UVM_PAGE - 1))) return -EINVAL;
     if (len > UVM_USER_END - UVM_USER_START) return -ENOMEM;
+    if ((flags & MAP_POPULATE) && !bkl_depth()) bkl_enter();   /* faults that may read a file; kept */
     bool shared = type != MAP_PRIVATE;
     if (flags & MAP_ANONYMOUS) {
         if (!shared) return vm_mmap(mm, addr, len, (int)prot, (int)flags, NULL, NULL, 0, 0);
@@ -3093,6 +3094,11 @@ static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
      * that needs it, and the call keeps it from then on */
     case SYS_poll: case SYS_ppoll: case SYS_select: case SYS_pselect6:
     case SYS_epoll_wait: case SYS_epoll_pwait:
+        return true;
+    /* the address space: mm->lock (mm/vm.c). A file mapping takes the big
+     * lock in fget, MAP_POPULATE in sys_mmap. */
+    case SYS_mmap: case SYS_munmap: case SYS_mprotect: case SYS_brk:
+    case SYS_madvise: case SYS_mremap:
         return true;
     default:
         return false;

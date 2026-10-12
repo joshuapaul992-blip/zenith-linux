@@ -614,22 +614,29 @@ void sleep_on_until(void *chan, uint64_t deadline_ms)
     cur->wait_chan = NULL;
 }
 
+/* Mutexes are taken with and without the big kernel lock (an address
+ * space's, by mmap and by faults): one spinlock makes taking one atomic. */
+static struct spinlock kmutex_spin;
+
 void kmutex_lock(struct kmutex *m)
 {
-    uint64_t f = irq_save();
-    if (m->owner == cur) { m->depth++; irq_restore(f); return; }
-    while (m->owner) sleep_on(m);
-    m->owner = cur;
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
+    if (m->owner == cur) { m->depth++; spin_unlock_irqrestore(&kmutex_spin, f); return; }
+    while (m->owner) sleep_on_locked(m, &kmutex_spin);
+    __atomic_store_n(&m->owner, cur, __ATOMIC_RELEASE);
     m->depth = 1;
-    irq_restore(f);
+    spin_unlock_irqrestore(&kmutex_spin, f);
 }
 
 void kmutex_unlock(struct kmutex *m)
 {
-    uint64_t f = irq_save();
+    uint64_t f = spin_lock_irqsave(&kmutex_spin);
     if (m->owner != cur) panic("kmutex_unlock: not the owner (pid %d)", cur->pid);
-    if (--m->depth == 0) { m->owner = NULL; wakeup_waiters(m); }   /* nobody polls a mutex */
-    irq_restore(f);
+    if (--m->depth == 0) {
+        __atomic_store_n(&m->owner, NULL, __ATOMIC_RELEASE);
+        wakeup_waiters(m);                      /* nobody polls a mutex */
+    }
+    spin_unlock_irqrestore(&kmutex_spin, f);
 }
 
 bool kmutex_held(const struct kmutex *m) { return m->owner == cur; }
