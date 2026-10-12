@@ -452,9 +452,11 @@ int64_t proc_execve(uint64_t upath, uint64_t uargv, uint64_t uenvp)
     struct files_struct *ft = t->files;
     for (int fd = 0; fd < MAX_FDS; fd++)
         if (ft->fd[fd] && ft->cloexec[fd]) {
+            uint64_t fl = spin_lock_irqsave(&ft->lock);
             struct file *x = ft->fd[fd];
             ft->fd[fd] = NULL;
             ft->cloexec[fd] = 0;
+            spin_unlock_irqrestore(&ft->lock, fl);
             vfs_locks_fd_closed(x);
             vfs_close(x);
         }

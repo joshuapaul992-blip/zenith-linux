@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <kernel/kstat.h>
+#include <kernel/spinlock.h>
 
 #define MAX_TASKS       512             /* threads included */
 #define KSTACK_SIZE     (16 * 1024)
@@ -51,6 +52,7 @@ struct k_sigaction {
 /* ---- what the threads of a process share (clone flags decide) ----------- */
 struct files_struct {               /* CLONE_FILES: the descriptor table     */
     int          refs;
+    struct spinlock lock;           /* fd[]: changes, and lookups taking a reference */
     struct file *fd[MAX_FDS];
     uint8_t      cloexec[MAX_FDS];
 };
@@ -179,8 +181,10 @@ void        sched_yield(void);
 void        task_set_idle_class(struct tcb *t);  /* background work (kworker/0) */
 void        sched_tick(void);           /* boot CPU timer: sleepers, alarms, slice */
 void        sched_tick_local(void);     /* other CPUs' timers: slice only          */
-bool        sched_tick_fast(bool from_user);    /* the same without the kernel lock, if
-                                                   nothing needs it (false: take it) */
+void        sched_tick_fast(void);      /* the same without the kernel lock         */
+bool        sched_tick_needs_lock(void);    /* the boot CPU: an interval timer is due   */
+void        sched_tick_boot_fast(void);     /* the boot CPU's tick without the lock     */
+void        sched_alarm_armed(uint64_t at); /* ITIMER_REAL set to time_ms() `at`        */
 void        sched_idle_loop(void) __attribute__((noreturn));
 
 /* A sleeping, recursive mutex: the owner may lock it again (a page fault
@@ -194,6 +198,11 @@ void        kmutex_unlock(struct kmutex *m);
 bool        kmutex_held(const struct kmutex *m);   /* by the calling task */
 
 void        sleep_on(void *chan);       /* call with interrupts disabled */
+/* sleep_on() for code under spinlock l (taken with interrupts off): the
+ * task is asleep before l is dropped, so a waker that changes the state
+ * under l and then calls wakeup(chan) cannot be missed; l is held again on
+ * return. */
+void        sleep_on_locked(void *chan, struct spinlock *l);
 /* sleep_on() that also ends at deadline_ms of time_ms() (0: none) */
 void        sleep_on_until(void *chan, uint64_t deadline_ms);
 void        wakeup(void *chan);

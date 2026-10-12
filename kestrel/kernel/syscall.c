@@ -54,16 +54,34 @@ static bool ubuf_ok(uint64_t p, uint64_t len)
 }
 
 /* ---- file descriptors ---------------------------------------------------- */
-/* The open file behind fd, with a reference the caller drops with fput(). */
+/* The open file behind fd, with a reference the caller drops with fput().
+ * A call running without the big kernel lock (syscall_nolock: I/O on unix
+ * sockets) takes the lock here if the file turns out to be anything else
+ * -- another thread may have put a different file under that descriptor
+ * since the dispatcher looked -- and keeps it to the end of the call. */
 static struct file *fget(int fd)
 {
     struct tcb *t = current_task();
     if (fd < 0 || fd >= MAX_FDS) return NULL;
-    uint64_t fl = irq_save();
-    struct file *f = vfs_file_get(t->files->fd[fd]);
+    struct files_struct *fs = t->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    struct file *f = vfs_file_get(fs->fd[fd]);
+    spin_unlock_keep_irqs(&fs->lock);
+    if (f && !bkl_depth() && (!usock_is(f) || f->ep_links)) bkl_enter();
     if (f && f->ep_links) epoll_file_used(f);           /* I/O on it re-arms EPOLLET watches */
     irq_restore(fl);
     return f;
+}
+
+/* Is fd a unix socket (the dispatcher's guess; fget makes sure)? */
+static bool fd_is_usock(uint64_t fd)
+{
+    if (fd >= MAX_FDS) return false;
+    struct files_struct *fs = current_task()->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    bool r = usock_is(fs->fd[fd]);
+    spin_unlock_irqrestore(&fs->lock, fl);
+    return r;
 }
 static void fput(struct file *f) { vfs_close(f); }
 
@@ -71,15 +89,16 @@ static void fput(struct file *f) { vfs_close(f); }
  * descriptor >= min. -EMFILE if there is none (f is not consumed then). */
 static int fd_alloc(struct tcb *t, int min, struct file *f, bool cloexec)
 {
-    uint64_t fl = irq_save();
+    struct files_struct *fs = t->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
     for (int fd = min < 0 ? 0 : min; fd < MAX_FDS; fd++)
-        if (!t->files->fd[fd]) {
-            t->files->fd[fd] = f;
-            t->files->cloexec[fd] = cloexec;
-            irq_restore(fl);
+        if (!fs->fd[fd]) {
+            fs->fd[fd] = f;
+            fs->cloexec[fd] = cloexec;
+            spin_unlock_irqrestore(&fs->lock, fl);
             return fd;
         }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&fs->lock, fl);
     return -EMFILE;
 }
 
@@ -87,11 +106,12 @@ static int fd_alloc(struct tcb *t, int min, struct file *f, bool cloexec)
 static struct file *fd_take(struct tcb *t, int fd)
 {
     if (fd < 0 || fd >= MAX_FDS) return NULL;
-    uint64_t fl = irq_save();
-    struct file *f = t->files->fd[fd];
-    t->files->fd[fd] = NULL;
-    t->files->cloexec[fd] = 0;
-    irq_restore(fl);
+    struct files_struct *fs = t->files;
+    uint64_t fl = spin_lock_irqsave(&fs->lock);
+    struct file *f = fs->fd[fd];
+    fs->fd[fd] = NULL;
+    fs->cloexec[fd] = 0;
+    spin_unlock_irqrestore(&fs->lock, fl);
     return f;
 }
 
@@ -1307,11 +1327,11 @@ static int64_t do_dup(int oldfd, int newfd, int flags, bool any)
     }
     if (newfd < 0 || newfd >= MAX_FDS) { fput(f); return -EBADF; }
     if (newfd == oldfd) { fput(f); return flags ? -EINVAL : newfd; }   /* dup3 refuses, dup2 is a no-op */
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&t->files->lock);
     struct file *old = t->files->fd[newfd];
     t->files->fd[newfd] = f;
     t->files->cloexec[newfd] = (flags & O_CLOEXEC) != 0;
-    irq_restore(fl);
+    spin_unlock_irqrestore(&t->files->lock, fl);
     if (old) { vfs_locks_fd_closed(old); vfs_close(old); }
     return newfd;
 }
@@ -1712,6 +1732,7 @@ static int64_t sys_setitimer(uint64_t which, uint64_t nv, uint64_t ov, uint64_t 
         uint64_t value = tv_ms(&v[1]);
         t->signal->alarm_every = tv_ms(&v[0]);
         t->signal->alarm_at = value ? time_ms() + value : 0;
+        sched_alarm_armed(t->signal->alarm_at);
     }
     return 0;
 }
@@ -1724,6 +1745,7 @@ static int64_t sys_alarm(uint64_t sec, uint64_t a2, uint64_t a3, uint64_t a4, ui
     int64_t left = g->alarm_at > now ? (int64_t)((g->alarm_at - now + 999) / 1000) : 0;
     g->alarm_every = 0;
     g->alarm_at = sec ? now + (sec > (1ull << 32) ? (1ull << 32) : sec) * 1000 : 0;
+    sched_alarm_armed(g->alarm_at);
     return left;
 }
 
@@ -3045,20 +3067,35 @@ static bool syscall_fast(struct int_frame *f)
 /* Calls that run without the big kernel lock: they keep their own locks
  * and sleep through the scheduler lock. Private futexes (the futex.c
  * buckets; a shared one needs the address space's mappings) and yields --
- * every pthread lock, condition variable and join of a busy program. */
+ * every pthread lock, condition variable and join of a busy program -- and
+ * calls that touch only the calling thread and the clock (a thread's own
+ * signal mask, name, TLS base; sleeps; random bytes). Each of those took a
+ * few microseconds and then queued hundreds for the lock. */
 #define FUTEX_PRIVATE_FLAG 128
 static bool syscall_nolock(uint64_t nr, const struct int_frame *f)
 {
     switch (nr) {
-    case SYS_futex:       return (f->rsi & FUTEX_PRIVATE_FLAG) != 0;
-    case SYS_sched_yield: return true;
-    default:              return false;
+    case SYS_futex:          return (f->rsi & FUTEX_PRIVATE_FLAG) != 0;
+    case SYS_sched_yield:    case SYS_rt_sigprocmask: case SYS_sigaltstack:   case SYS_prctl:
+    case SYS_arch_prctl:     case SYS_set_tid_address: case SYS_set_robust_list:
+    case SYS_getrandom:      case SYS_nanosleep:      case SYS_clock_nanosleep:
+    case SYS_clock_gettime:  case SYS_clock_getres:   case SYS_gettimeofday:  case SYS_time:
+    case SYS_getpid:         case SYS_gettid:         case SYS_getppid:
+    case SYS_getuid:         case SYS_geteuid:        case SYS_getgid:        case SYS_getegid:
+    case SYS_sched_getaffinity:
+        return true;
+    /* data through a unix socket (fs/unixsock.c has its own lock) */
+    case SYS_read: case SYS_write: case SYS_readv: case SYS_writev:
+    case SYS_recvmsg: case SYS_sendmsg: case SYS_recvfrom: case SYS_sendto:
+        return fd_is_usock(f->rdi);
+    default:
+        return false;
     }
 }
 
 /* Per call number: on-CPU and wall cycles, the longest call (kstat.h).
  * Updated with atomics: lock-free calls count here too. */
-static uint64_t cost_cpu[SYS_MAX], cost_wall[SYS_MAX], cost_max[SYS_MAX];
+static uint64_t cost_cpu[SYS_MAX], cost_wall[SYS_MAX], cost_max[SYS_MAX], cost_lock[SYS_MAX];
 
 int syscall_dispatch(struct int_frame *f)
 {
@@ -3066,6 +3103,7 @@ int syscall_dispatch(struct int_frame *f)
     uint64_t nr = f->rax;
     struct tcb *t = current_task();
     bool locked = strace_pat[0] || !t->user || !syscall_nolock(nr, f);
+    uint64_t lw0 = t->ks.lock_cyc;                      /* waits for the kernel lock, this call */
     if (locked) bkl_enter();                            /* kernel code: one CPU at a time */
     if (nr >= SYS_MAX || !table[nr] || table[nr] == sys_enosys) {
         static uint8_t warned[SYS_MAX + 1];
@@ -3088,11 +3126,13 @@ int syscall_dispatch(struct int_frame *f)
         if (f->rflags & (1u << 9)) sti();   /* preemptible if the caller was */
         int64_t r = table[nr](f->rdi, f->rsi, f->rdx, f->r10, f->r8, f->r9);
         f->rax = (uint64_t)r;
+        if (!locked && bkl_depth()) locked = true;      /* fget took the lock on the way */
         cli();
         uint64_t wall = rdtsc() - w0, cpu = kstat_run_cycles(t) - c0;
         __atomic_add_fetch(&cost_cpu[nr], cpu, __ATOMIC_RELAXED);
         __atomic_add_fetch(&cost_wall[nr], wall, __ATOMIC_RELAXED);
         if (cpu > cost_max[nr]) cost_max[nr] = cpu;     /* a race only loses a maximum */
+        __atomic_add_fetch(&cost_lock[nr], t->ks.lock_cyc - lw0, __ATOMIC_RELAXED);
         t->ks.sys_n++; t->ks.sys_cyc += cpu; t->ks.sys_wall += wall;
         struct kstat_cpu *k = &this_cpu()->ks;
         k->sys_n++; k->sys_cyc += cpu;
@@ -3120,6 +3160,8 @@ int syscall_dispatch(struct int_frame *f)
 const char *syscall_name(int nr) { return (nr >= 0 && nr < SYS_MAX && names[nr]) ? names[nr] : NULL; }
 int syscall_implemented(int nr) { return nr >= 0 && nr < SYS_MAX && table[nr] && table[nr] != sys_enosys && table[nr] != sys_absent; }
 uint64_t syscall_count(int nr) { return (nr >= 0 && nr < SYS_MAX) ? counts[nr] : 0; }
+
+uint64_t syscall_lockwait(int nr) { return nr >= 0 && nr < SYS_MAX ? cost_lock[nr] : 0; }
 
 bool syscall_cost(int nr, uint64_t *calls, uint64_t *cpu, uint64_t *wall, uint64_t *max)
 {

@@ -2,6 +2,7 @@
  * plus the two generic node flavours used by every filesystem:
  *   ramfs   - regular files backed by a growable heap buffer
  *   pseudo  - read-only files whose content is generated on each read */
+#include <kernel/smp.h>
 #include <kernel/vfs.h>
 #include <kernel/inotify.h>
 #include <kernel/mm.h>
@@ -827,9 +828,19 @@ int vfs_flock(struct file *f, int op)
     }
 }
 
+static void vfs_close_last(struct file *f);
+
 void vfs_close(struct file *f)
 {
     if (!f || __atomic_sub_fetch(&f->refcnt, 1, __ATOMIC_ACQ_REL) > 0) return;
+    /* The last close runs file-system and driver code: under the big kernel
+     * lock, also from a call that runs without it (unix socket I/O). */
+    if (!bkl_depth()) { bkl_enter(); vfs_close_last(f); bkl_exit(); return; }
+    vfs_close_last(f);
+}
+
+static void vfs_close_last(struct file *f)
+{
     if (f->ep_links) epoll_file_closing(f);            /* leaves every epoll set */
     flock_drop(f);
     vfs_locks_file_gone(f);

@@ -1,7 +1,8 @@
 /* user/smptest.c -- multiprocessor behaviour: CPUs seen by programs, real
  * parallelism, TLB shootdowns (a thread on another CPU loses an unmapped
  * page at once), page faults on several CPUs at once (resolved without the
- * kernel lock), and the kernel under concurrent system calls.
+ * kernel lock), unix sockets used from several CPUs at once (also without
+ * the kernel lock), and the kernel under concurrent system calls.
  * Exit status 0 = every check passed. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -17,6 +18,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
 
 static int failures;
 #define CHECK(c, what) do { int ok_ = (c); printf("  %s  %s\n", ok_ ? "ok  " : "FAIL", what); if (!ok_) failures++; } while (0)
@@ -171,6 +173,130 @@ static int fault_round(void)
     return bad;
 }
 
+/* ---- unix sockets from several CPUs ---------------------------------------------------- */
+#define US_PAIRS 4
+#define US_BYTES (2 << 20)
+static volatile int us_errors;
+
+static void *us_writer(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    static __thread unsigned char buf[9000];
+    unsigned seed = (unsigned)fd * 2654435761u;
+    for (long pos = 0; pos < US_BYTES; ) {
+        seed = seed * 1103515245u + 12345u;
+        long n = 1 + (long)(seed >> 8) % (long)sizeof buf;
+        if (n > US_BYTES - pos) n = US_BYTES - pos;
+        for (long i = 0; i < n; i++) buf[i] = (unsigned char)((pos + i) % 251);
+        for (long off = 0; off < n; ) {
+            ssize_t w = write(fd, buf + off, (size_t)(n - off));
+            if (w <= 0) { us_errors++; return NULL; }
+            off += w;
+        }
+        pos += n;
+    }
+    return NULL;
+}
+
+static void *us_reader(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    static __thread unsigned char buf[7000];
+    long pos = 0;
+    for (;;) {
+        ssize_t r = read(fd, buf, sizeof buf);
+        if (r < 0) { us_errors++; break; }
+        if (r == 0) break;
+        for (ssize_t i = 0; i < r; i++) if (buf[i] != (unsigned char)((pos + i) % 251)) { us_errors++; return NULL; }
+        pos += r;
+    }
+    if (pos != US_BYTES) us_errors++;
+    return NULL;
+}
+
+/* Records carrying a descriptor: a pipe whose content names the record. */
+static void *us_fd_sender(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    for (int i = 0; i < 300; i++) {
+        int p[2];
+        if (pipe(p)) { us_errors++; break; }
+        write(p[1], &i, sizeof i);
+        close(p[1]);
+        char ctl[CMSG_SPACE(sizeof(int))];
+        struct iovec v = { &i, sizeof i };
+        struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl };
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &p[0], sizeof(int));
+        if (sendmsg(fd, &m, 0) != sizeof i) us_errors++;
+        close(p[0]);
+    }
+    shutdown(fd, SHUT_WR);
+    return NULL;
+}
+
+static void *us_fd_receiver(void *arg)
+{
+    int fd = (int)(intptr_t)arg, got = 0;
+    for (;;) {
+        int idx = -1;
+        char ctl[CMSG_SPACE(sizeof(int))];
+        struct iovec v = { &idx, sizeof idx };
+        struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = ctl, .msg_controllen = sizeof ctl };
+        ssize_t r = recvmsg(fd, &m, 0);
+        if (r == 0) break;
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        if (r != sizeof idx || !c || c->cmsg_type != SCM_RIGHTS) { us_errors++; break; }
+        int pfd, inside = -2;
+        memcpy(&pfd, CMSG_DATA(c), sizeof pfd);
+        if (read(pfd, &inside, sizeof inside) != sizeof inside || inside != idx || idx != got) us_errors++;
+        close(pfd);
+        got++;
+    }
+    if (got != 300) us_errors++;
+    return NULL;
+}
+
+/* A reader blocked in recv on one CPU while the peer closes on another. */
+static void *us_eof_reader(void *arg)
+{
+    char c;
+    if (read((int)(intptr_t)arg, &c, 1) != 0) us_errors++;
+    return NULL;
+}
+
+static int unix_round(void)
+{
+    us_errors = 0;
+    pthread_t w[US_PAIRS], r[US_PAIRS], fs, fr;
+    int sv[US_PAIRS][2], fv[2];
+    for (int i = 0; i < US_PAIRS; i++) {
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i])) return 1;
+        pthread_create(&w[i], NULL, us_writer, (void *)(intptr_t)sv[i][0]);
+        pthread_create(&r[i], NULL, us_reader, (void *)(intptr_t)sv[i][1]);
+    }
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fv)) return 1;
+    pthread_create(&fs, NULL, us_fd_sender, (void *)(intptr_t)fv[0]);
+    pthread_create(&fr, NULL, us_fd_receiver, (void *)(intptr_t)fv[1]);
+    for (int i = 0; i < US_PAIRS; i++) { pthread_join(w[i], NULL); close(sv[i][0]); }
+    for (int i = 0; i < US_PAIRS; i++) { pthread_join(r[i], NULL); close(sv[i][1]); }
+    pthread_join(fs, NULL);
+    pthread_join(fr, NULL);
+    close(fv[0]); close(fv[1]);
+    for (int i = 0; i < 200; i++) {
+        int e[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, e)) { us_errors++; break; }
+        pthread_t t;
+        pthread_create(&t, NULL, us_eof_reader, (void *)(intptr_t)e[1]);
+        if (i & 1) sched_yield();
+        close(e[0]);
+        pthread_join(t, NULL);
+        close(e[1]);
+    }
+    return us_errors;
+}
+
 /* ---- concurrent system calls ------------------------------------------------------- */
 static volatile int churn_errors;
 static void *churn(void *arg)
@@ -242,6 +368,11 @@ int main(void)
     int fbad = 0;
     for (int r = 0; r < 3; r++) fbad += fault_round();
     CHECK(fbad == 0, "4 threads x 8 MiB of racing first touches and copy-on-write, forks alongside (3 rounds)");
+
+    printf("unix sockets on several CPUs:\n");
+    int ubad = 0;
+    for (int r = 0; r < 2; r++) ubad += unix_round();
+    CHECK(ubad == 0, "4 streams x 2 MiB checked byte by byte, 300 records with descriptors, 200 close-while-reading (2 rounds)");
 
     printf("thread churn:\n");
     int procs = 3, okp = 0;

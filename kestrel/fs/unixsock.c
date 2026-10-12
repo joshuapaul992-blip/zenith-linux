@@ -1,9 +1,14 @@
 /* fs/unixsock.c -- AF_UNIX sockets (see include/kernel/socket.h)
  *
  * Every socket is an anonymous vnode embedded in a struct usock; a file
- * descriptor is a struct file on that vnode. Single CPU: state changes run
- * with interrupts off, and waiting uses sleep_on()/wakeup() on the usock
- * whose state matters (its receive buffer, or its accept queue).
+ * descriptor is a struct file on that vnode. Every socket's state is
+ * guarded by one spinlock (`lock` below), so sending and receiving run
+ * without the big kernel lock (kernel/syscall.c: syscall_nolock); waiting
+ * uses sleep_on_locked()/wakeup() on the usock whose state matters (its
+ * receive buffer, or its accept queue). Nothing under the lock sleeps,
+ * faults or closes a file: descriptors in flight are closed after it is
+ * dropped. The name table is the big lock's (bind, connect and the last
+ * close all run under it).
  *
  * Lifetime: a usock lives while its file is open, or while it sits
  * unaccepted in a listener's queue. Closing detaches it from its peer
@@ -31,6 +36,7 @@
 #include <kernel/cpu.h>
 #include <kernel/string.h>
 #include <kernel/klog.h>
+#include <kernel/spinlock.h>
 
 #define SOCK_BUF        65536
 #define MAX_BACKLOG     64
@@ -79,6 +85,7 @@ static struct {
 } names[MAX_NAMES];
 
 static const struct vnode_ops sock_ops;
+static struct spinlock lock;                    /* all sockets' state */
 
 static struct usock *us(struct file *f) { return f->vn->data; }
 bool usock_is(struct file *f) { return f && f->vn && f->vn->ops == &sock_ops; }
@@ -113,7 +120,7 @@ static void umsg_free(struct umsg *m)
     kfree(m);
 }
 
-/* Unlink the first mark (interrupts off). */
+/* Unlink the first mark (lock held). */
 static struct umsg *umsg_pop(struct usock *s)
 {
     struct umsg *m = s->msgs;
@@ -124,12 +131,13 @@ static struct umsg *umsg_pop(struct usock *s)
     return m;
 }
 
-/* Detach from the peer and free. Interrupts must be off. */
-static void usock_destroy(struct usock *s)
+/* Detach from the peer and free (lock held). Undelivered descriptors go
+ * on *dead, to be closed once the lock is dropped. */
+static void destroy_locked(struct usock *s, struct umsg **dead)
 {
     unname(s);
-    while (s->msgs) umsg_free(umsg_pop(s));             /* undelivered descriptors */
-    for (int i = 0; i < s->qlen; i++) usock_destroy(s->queue[i]);     /* never-accepted connections */
+    while (s->msgs) { struct umsg *m = umsg_pop(s); m->next = *dead; *dead = m; }
+    for (int i = 0; i < s->qlen; i++) destroy_locked(s->queue[i], dead);   /* never-accepted connections */
     s->qlen = 0;
     if (s->peer) {
         s->peer->peer = NULL;
@@ -139,6 +147,15 @@ static void usock_destroy(struct usock *s)
     wakeup(s);
     kfree(s->rx);
     kfree(s);
+}
+
+static void usock_destroy(struct usock *s)
+{
+    struct umsg *dead = NULL;
+    uint64_t fl = spin_lock_irqsave(&lock);
+    destroy_locked(s, &dead);
+    spin_unlock_irqrestore(&lock, fl);
+    while (dead) { struct umsg *n = dead->next; umsg_free(dead); dead = n; }
 }
 
 static struct file *file_for(struct usock *s, int flags)
@@ -235,11 +252,15 @@ int usock_bind(struct file *f, const struct sockaddr_un *a, uint32_t len)
 int usock_listen(struct file *f, int backlog)
 {
     struct usock *s = us(f);
-    if (s->state == US_CONNECTED) return -EINVAL;
-    if (!s->bound) return -EINVAL;              /* Linux autobinds; X always binds first */
-    s->state = US_LISTEN;
-    s->backlog = backlog < 1 ? 1 : backlog > MAX_BACKLOG ? MAX_BACKLOG : backlog;
-    return 0;
+    uint64_t fl = spin_lock_irqsave(&lock);
+    int r = 0;
+    if (s->state == US_CONNECTED || !s->bound) r = -EINVAL;     /* Linux autobinds; X always binds first */
+    else {
+        s->state = US_LISTEN;
+        s->backlog = backlog < 1 ? 1 : backlog > MAX_BACKLOG ? MAX_BACKLOG : backlog;
+    }
+    spin_unlock_irqrestore(&lock, fl);
+    return r;
 }
 
 static struct usock *find_listener(bool abstract, const char *name, uint32_t nl)
@@ -272,54 +293,55 @@ int usock_connect(struct file *f, const struct sockaddr_un *a, uint32_t len)
         if ((rc = vfs_lookup(name, &node)) < 0) return rc;
         if (node->type != VSOCK) return -ECONNREFUSED;
     }
-    uint64_t fl = irq_save();
-    struct usock *l = find_listener(abstract, name, nl);
-    if (!l || l->state != US_LISTEN) { irq_restore(fl); return -ECONNREFUSED; }
-    if (l->type != s->type) { irq_restore(fl); return -EPROTOTYPE; }
-    if (l->qlen >= l->backlog) { irq_restore(fl); return (f->flags & O_NONBLOCK) ? -EAGAIN : -ECONNREFUSED; }
-    struct usock *srv = usock_new(s->type);
-    if (!srv) { irq_restore(fl); return -ENOMEM; }
+    struct usock *l = find_listener(abstract, name, nl);        /* the name table: big lock */
+    if (!l) return -ECONNREFUSED;
+    struct usock *srv = usock_new(s->type);     /* before the lock: it allocates */
+    if (!srv) return -ENOMEM;
+    uint64_t fl = spin_lock_irqsave(&lock);
+    if (s->state == US_CONNECTED) rc = -EISCONN;
+    else if (l->state != US_LISTEN) rc = -ECONNREFUSED;
+    else if (l->type != s->type) rc = -EPROTOTYPE;
+    else if (l->qlen >= l->backlog) rc = (f->flags & O_NONBLOCK) ? -EAGAIN : -ECONNREFUSED;
+    if (rc) { spin_unlock_irqrestore(&lock, fl); kfree(srv->rx); kfree(srv); return rc; }
     srv->cred = l->cred;                        /* the server process owns it */
     srv->addr = l->addr;
     srv->addrlen = l->addrlen;
     connect_pair(s, srv);
     l->queue[l->qlen++] = srv;
     wakeup(l);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lock, fl);
     return 0;
 }
 
 int usock_accept(struct file *f, int flags, struct file **out, struct sockaddr_un *peer, uint32_t *len)
 {
     struct usock *l = us(f);
-    if (l->state != US_LISTEN) return -EINVAL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&lock);
+    if (l->state != US_LISTEN) { spin_unlock_irqrestore(&lock, fl); return -EINVAL; }
     while (!l->qlen) {
-        if (f->flags & O_NONBLOCK) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(l);
-        if (l->state != US_LISTEN) { irq_restore(fl); return -EINVAL; }
+        if (f->flags & O_NONBLOCK) { spin_unlock_irqrestore(&lock, fl); return -EAGAIN; }
+        if (signal_pending()) { spin_unlock_irqrestore(&lock, fl); return -ERESTARTSYS; }
+        sleep_on_locked(l, &lock);
+        if (l->state != US_LISTEN) { spin_unlock_irqrestore(&lock, fl); return -EINVAL; }
     }
     struct usock *s = l->queue[0];
     memmove(l->queue, l->queue + 1, (size_t)(l->qlen - 1) * sizeof *l->queue);
     l->qlen--;
-    irq_restore(fl);
+    struct sockaddr_un tmp = { .sun_family = AF_UNIX };    /* the client: normally unnamed */
+    uint32_t alen = 2;
+    if (s->peer && s->peer->addrlen) { tmp = s->peer->addr; alen = s->peer->addrlen; }
+    spin_unlock_irqrestore(&lock, fl);
     struct file *nf = file_for(s, flags);
-    if (!nf) { fl = irq_save(); usock_destroy(s); irq_restore(fl); return -ENOMEM; }
-    if (peer && len) {                          /* the client: normally unnamed */
-        struct usock *c = s->peer;
-        uint32_t n = c && c->addrlen ? c->addrlen : 2;
-        if (n > *len) n = *len;
-        struct sockaddr_un tmp = { .sun_family = AF_UNIX };
-        if (c && c->addrlen) tmp = c->addr;
-        memcpy(peer, &tmp, n);
-        *len = c && c->addrlen ? c->addrlen : 2;
+    if (!nf) { usock_destroy(s); return -ENOMEM; }
+    if (peer && len) {
+        memcpy(peer, &tmp, alen < *len ? alen : *len);
+        *len = alen;
     }
     *out = nf;
     return 0;
 }
 
-/* Copy n bytes into p's ring at its tail (interrupts off, room checked). */
+/* Copy n bytes into p's ring at its tail (lock held, room checked). */
 static void ring_put(struct usock *p, const void *buf, size_t n)
 {
     size_t tail = (p->rx_head + p->rx_count) % SOCK_BUF;
@@ -373,7 +395,7 @@ long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struc
         m->len = (uint32_t)len;
     }
     size_t done = 0;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&lock);
     long r = 0;
     if (s->state != US_CONNECTED && !s->peer_gone) { r = -ENOTCONN; goto out; }
     if (s->shut_wr) { r = -EPIPE; goto out; }
@@ -386,7 +408,7 @@ long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struc
         if (!fits) {
             if (nb) { r = -EAGAIN; break; }
             if (signal_pending()) { r = -ERESTARTSYS; break; }
-            sleep_on(p);
+            sleep_on_locked(p, &lock);
             continue;
         }
         size_t n = len - done < room ? len - done : room;
@@ -402,7 +424,7 @@ long usock_sendmsg(struct file *f, const void *buf, size_t len, int flags, struc
         if (done == len) break;
     }
 out:
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lock, fl);
     if (m) kfree(m);                                    /* never queued: files stay the caller's */
     if (done || (r == 0 && len == 0)) return (long)done;
     return r ? r : -EAGAIN;
@@ -425,15 +447,18 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
     if (nfiles) *nfiles = 0;
     if (msg_flags) *msg_flags = 0;
     if (!len && !records(s)) return 0;
-    uint64_t fl = irq_save();
-    if (s->state != US_CONNECTED && !s->peer_gone) { irq_restore(fl); return -ENOTCONN; }
+    uint64_t fl = spin_lock_irqsave(&lock);
+    if (s->state != US_CONNECTED && !s->peer_gone) { spin_unlock_irqrestore(&lock, fl); return -ENOTCONN; }
     for (;;) {
         bool have = records(s) ? s->msgs != NULL : s->rx_count > 0;
         if (have) break;
-        if (!s->peer || s->shut_rd || (s->peer && s->peer->shut_wr)) { irq_restore(fl); return 0; }    /* EOF */
-        if (nb) { irq_restore(fl); return -EAGAIN; }
-        if (signal_pending()) { irq_restore(fl); return -ERESTARTSYS; }
-        sleep_on(s);
+        long r = 0;
+        if (!s->peer || s->shut_rd || (s->peer && s->peer->shut_wr)) r = 0;     /* EOF */
+        else if (nb) r = -EAGAIN;
+        else if (signal_pending()) r = -ERESTARTSYS;
+        else { sleep_on_locked(s, &lock); continue; }
+        spin_unlock_irqrestore(&lock, fl);
+        return r;
     }
     struct umsg *m = s->msgs;
     long ret;
@@ -463,10 +488,10 @@ long usock_recvmsg(struct file *f, void *buf, size_t len, int flags, struct file
             if (files && nfiles && *nfiles < maxfiles) { files[(*nfiles)++] = m->files[i]; m->files[i] = NULL; }
             else if (msg_flags) *msg_flags |= MSG_CTRUNC;
         }
-        umsg_free(m);                                   /* closes any not handed over */
     }
     if (!peek) wakeup(s);                               /* writers waiting for room */
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lock, fl);
+    if (m) umsg_free(m);                                /* closes any not handed over */
     return ret;
 }
 
@@ -478,24 +503,26 @@ long usock_recv(struct file *f, void *buf, size_t len, int flags)
 int usock_shutdown(struct file *f, int how)
 {
     struct usock *s = us(f);
-    if (s->state != US_CONNECTED) return -ENOTCONN;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&lock);
+    if (s->state != US_CONNECTED) { spin_unlock_irqrestore(&lock, fl); return -ENOTCONN; }
     if (how == SHUT_RD || how == SHUT_RDWR) s->shut_rd = true;
     if (how == SHUT_WR || how == SHUT_RDWR) s->shut_wr = true;
     wakeup(s);
     if (s->peer) wakeup(s->peer);
-    irq_restore(fl);
+    spin_unlock_irqrestore(&lock, fl);
     return 0;
 }
 
 int usock_name(struct file *f, bool peer, struct sockaddr_un *a, uint32_t *len)
 {
     struct usock *s = us(f);
-    if (peer && !s->peer) return -ENOTCONN;
+    uint64_t fl = spin_lock_irqsave(&lock);
+    if (peer && !s->peer) { spin_unlock_irqrestore(&lock, fl); return -ENOTCONN; }
     struct usock *o = peer ? s->peer : s;
     struct sockaddr_un tmp = { .sun_family = AF_UNIX };
     uint32_t n = 2;
     if (o->addrlen) { tmp = o->addr; n = o->addrlen; }
+    spin_unlock_irqrestore(&lock, fl);
     memcpy(a, &tmp, n < *len ? n : *len);
     *len = n;
     return 0;
@@ -508,9 +535,12 @@ int usock_getsockopt(struct file *f, int level, int opt, void *val, uint32_t *le
     int32_t i;
     switch (opt) {
     case SO_PEERCRED: {
-        if (!s->peer) return -ENOTCONN;
         if (*len < sizeof(struct ucred)) return -EINVAL;
-        memcpy(val, &s->peer->cred, sizeof(struct ucred));
+        uint64_t fl = spin_lock_irqsave(&lock);
+        bool connected = s->peer != NULL;
+        if (connected) memcpy(val, &s->peer->cred, sizeof(struct ucred));
+        spin_unlock_irqrestore(&lock, fl);
+        if (!connected) return -ENOTCONN;
         *len = sizeof(struct ucred);
         return 0;
     }
@@ -534,6 +564,7 @@ static int sock_poll(struct file *f, int events)
 {
     struct usock *s = us(f);
     int r = 0;
+    uint64_t fl = spin_lock_irqsave(&lock);
     poll_wait(s);                               /* data, accepts, the peer leaving */
     if (s->peer) poll_wait(s->peer);            /* room to write: the peer reads */
     if (s->state == US_LISTEN) {
@@ -545,6 +576,7 @@ static int sock_poll(struct file *f, int events)
     } else {
         r |= POLLOUT | POLLHUP;                 /* unconnected: like Linux */
     }
+    spin_unlock_irqrestore(&lock, fl);
     return r & (events | POLLERR | POLLHUP);
 }
 
@@ -552,16 +584,14 @@ static int sock_poll(struct file *f, int events)
 static int sock_ioctl(struct vnode *vn, unsigned long req, void *arg)
 {
     struct usock *s = vn->data;
-    if (req == FIONREAD) { *(int *)arg = records(s) ? (s->msgs ? (int)s->msgs->len : 0) : (int)s->rx_count; return 0; }
-    return -ENOTTY;
+    if (req != FIONREAD) return -ENOTTY;
+    uint64_t fl = spin_lock_irqsave(&lock);
+    *(int *)arg = records(s) ? (s->msgs ? (int)s->msgs->len : 0) : (int)s->rx_count;
+    spin_unlock_irqrestore(&lock, fl);
+    return 0;
 }
 
-static void sock_release(struct file *f)
-{
-    uint64_t fl = irq_save();
-    usock_destroy(us(f));
-    irq_restore(fl);
-}
+static void sock_release(struct file *f) { usock_destroy(us(f)); }
 
 static const struct vnode_ops sock_ops = {
     .fread = sock_fread, .fwrite = sock_fwrite, .poll = sock_poll, .release = sock_release, .ioctl = sock_ioctl,

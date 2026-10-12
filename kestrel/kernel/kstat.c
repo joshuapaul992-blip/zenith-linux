@@ -205,7 +205,8 @@ size_t kstat_gen(char *buf, size_t cap)
         uint64_t c, cpu, wall, mx;
         syscall_cost(order[k], &c, &cpu, &wall, &mx);
         const char *nm = syscall_name(order[k]);
-        if (nm) P("sys.%s calls=%lu cpu_us=%lu wall_us=%lu max_cpu_us=%lu\n", nm, c, kstat_us(cpu), kstat_us(wall), kstat_us(mx));
+        if (nm) P("sys.%s calls=%lu cpu_us=%lu wall_us=%lu max_cpu_us=%lu lockwait_us=%lu\n", nm, c, kstat_us(cpu),
+                  kstat_us(wall), kstat_us(mx), kstat_us(syscall_lockwait(order[k])));
         else P("sys.%d calls=%lu cpu_us=%lu wall_us=%lu max_cpu_us=%lu\n", order[k], c, kstat_us(cpu), kstat_us(wall), kstat_us(mx));
     }
 
@@ -257,4 +258,68 @@ static size_t report_section(char *buf, size_t cap) { return kstat_gen(buf, cap)
 void kstat_init(void)
 {
     report_add_section("Performance counters (/proc/kstat)", report_section);
+}
+
+/* ---- tick profile (kstat.h) ------------------------------------------------ */
+#define PROF_SHIFT 4
+#define PROF_SLOTS ((2u << 20) >> PROF_SHIFT)          /* 2 MiB of kernel text */
+extern char __text_start[], __text_end[];
+static uint32_t prof[PROF_SLOTS];
+static uint64_t prof_user, prof_idle, prof_kernel, prof_other;
+
+void kstat_prof_tick(uint64_t rip, bool user)
+{
+    if (user) { __atomic_add_fetch(&prof_user, 1, __ATOMIC_RELAXED); return; }
+    struct tcb *t = this_cpu()->current;
+    if (t && t->pid == 0) { __atomic_add_fetch(&prof_idle, 1, __ATOMIC_RELAXED); return; }
+    uint64_t off = rip - (uint64_t)__text_start;
+    if (rip < (uint64_t)__text_start || rip >= (uint64_t)__text_end || (off >> PROF_SHIFT) >= PROF_SLOTS) {
+        __atomic_add_fetch(&prof_other, 1, __ATOMIC_RELAXED);
+        return;
+    }
+    __atomic_add_fetch(&prof_kernel, 1, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&prof[off >> PROF_SHIFT], 1, __ATOMIC_RELAXED);
+}
+
+/* Who waits for the big kernel lock: the caller of bkl_enter, waits and
+ * cycles (smp.c records contended acquisitions here). */
+#define LW_SLOTS 64
+static struct { uint64_t caller, n, cyc; } lw[LW_SLOTS];
+
+void kstat_lockwait(uint64_t caller, uint64_t cyc)
+{
+    for (int i = 0; i < LW_SLOTS; i++) {
+        uint64_t c = __atomic_load_n(&lw[i].caller, __ATOMIC_ACQUIRE);
+        if (!c) {
+            uint64_t z = 0;
+            if (!__atomic_compare_exchange_n(&lw[i].caller, &z, caller, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) c = z;
+            else c = caller;
+        }
+        if (c == caller) {
+            __atomic_add_fetch(&lw[i].n, 1, __ATOMIC_RELAXED);
+            __atomic_add_fetch(&lw[i].cyc, cyc, __ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
+
+size_t kstat_gen_prof(char *buf, size_t cap)
+{
+    size_t n = 0;
+    for (int i = 0; i < LW_SLOTS && lw[i].caller; i++)
+        P("lockwait caller=%lx n=%lu us=%lu\n", lw[i].caller, lw[i].n, kstat_us(lw[i].cyc));
+    P("kprof user=%lu idle=%lu kernel=%lu other=%lu slot_bytes=%u\n", prof_user, prof_idle, prof_kernel, prof_other,
+      1u << PROF_SHIFT);
+    /* the busiest slots, best first: each round prints every slot with the
+     * highest count below the previous round's */
+    uint32_t below = UINT32_MAX;
+    for (int lines = 0; lines < 160 && n + 40 < cap;) {
+        uint32_t best = 0;
+        for (uint32_t i = 0; i < PROF_SLOTS; i++) if (prof[i] < below && prof[i] > best) best = prof[i];
+        if (!best) break;
+        for (uint32_t i = 0; i < PROF_SLOTS && n + 40 < cap; i++)
+            if (prof[i] == best) { P("%lx %u\n", (uint64_t)__text_start + ((uint64_t)i << PROF_SHIFT), best); lines++; }
+        below = best;
+    }
+    return n;
 }

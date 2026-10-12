@@ -283,6 +283,8 @@ static void exception(struct int_frame *f)
 }
 
 extern void timer_interrupt(bool boot_cpu);
+extern bool timer_tick_needs_lock(void);
+extern void timer_tick_fast(void);
 
 /* Vectors that need no kernel lock: they touch only this CPU's state. */
 static bool lockless(struct int_frame *f)
@@ -308,9 +310,18 @@ static bool lockless(struct int_frame *f)
         lapic_eoi();
         return true;
     case VEC_LAPIC_TIMER:                               /* other CPUs: accounting, the slice */
-        if (this_cpu()->id == 0 || !sched_tick_fast((f->cs & 3) == 3)) return false;
-        lapic_eoi();
+        kstat_prof_tick(f->rip, (f->cs & 3) == 3);
+        if (this_cpu()->id == 0 && timer_tick_needs_lock()) return false;   /* hooks, interval timers */
+        lapic_eoi();                                    /* first: we may switch away */
         this_cpu()->ticks++;
+        if (this_cpu()->id == 0) timer_tick_fast();     /* sleepers, netd's timer, the slice */
+        else sched_tick_fast();
+        if ((f->cs & 3) == 3 && signal_pending()) {     /* back to ring 3 with a signal to take */
+            bkl_enter();
+            signal_deliver(f, 0, false);
+            cli();
+            bkl_exit();
+        }
         return true;
     case VEC_RESCHED:                                   /* the idle loop looks after the hlt */
         lapic_eoi();

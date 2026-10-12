@@ -975,15 +975,21 @@ static int load_one(struct e2fs *fs, struct buf *b, uint32_t off, uint32_t prev,
     return 0;
 }
 
+/* Read a directory's entries into its children, once. `loaded` is set only
+ * when the list is complete: a lookup that finds the directory being read
+ * (the reader sleeps on the disk) waits on the fs lock instead of searching
+ * half a list. A refresh from inside the read (iget) returns at once. */
 static void e2_refresh(struct vnode *dir)
 {
-    if (dir->loaded) return;
+    if (__atomic_load_n(&dir->loaded, __ATOMIC_ACQUIRE)) return;
     struct e2fs *fs = fs_of(dir);
     kmutex_lock(&fs->lock);
-    if (!dir->loaded) {
-        dir->loaded = true;                             /* before: iget may recurse into nothing else */
+    if (!dir->loaded && !dir->loading) {
+        dir->loading = true;
         struct load_ctx c = { dir };
         dir_iterate(fs, ino_of(dir), load_one, &c);
+        dir->loading = false;
+        __atomic_store_n(&dir->loaded, true, __ATOMIC_RELEASE);
     }
     kmutex_unlock(&fs->lock);
 }

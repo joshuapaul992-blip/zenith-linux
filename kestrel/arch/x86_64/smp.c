@@ -66,6 +66,7 @@ void bkl_enter(void)
             c->ks.lock_spin_n++;
             c->ks.lock_spin_cyc += w;
             if (c->current) { c->current->ks.lock_n++; c->current->ks.lock_cyc += w; }
+            kstat_lockwait((uint64_t)__builtin_return_address(0), w);
         }
         bkl_owner = c->id;
         c->ks.lock_acq++;

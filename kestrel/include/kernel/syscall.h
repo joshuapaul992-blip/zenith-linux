@@ -248,5 +248,6 @@ int  syscall_implemented(int nr);
 uint64_t syscall_count(int nr);
 /* Calls, on-CPU and wall cycles, the longest on-CPU call (kstat.h); false if nr is out of range. */
 bool syscall_cost(int nr, uint64_t *calls, uint64_t *cpu, uint64_t *wall, uint64_t *max);
+uint64_t syscall_lockwait(int nr);      /* cycles its calls waited for the kernel lock */
 
 #endif

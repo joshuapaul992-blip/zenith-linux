@@ -40,6 +40,7 @@ static struct tcb idle_tasks[MAX_CPUS];            /* the APs' idle threads */
 #define cur          (this_task())           /* writes: this_cpu()->current, irqs off */
 #define need_resched (this_cpu()->need_resched)
 static int next_pid = 1;
+static uint32_t zombie_gen;                         /* task_exit: the idle loop reaps */
 static bool running, preempt = true;
 static uint64_t nswitches;
 
@@ -111,12 +112,12 @@ struct files_struct *files_dup(struct files_struct *src)
 {
     struct files_struct *f = files_new();
     if (!f) return NULL;
-    uint64_t fl = irq_save();
+    uint64_t fl = spin_lock_irqsave(&src->lock);
     for (int i = 0; i < MAX_FDS; i++) {
         f->fd[i] = vfs_file_get(src->fd[i]);
         f->cloexec[i] = src->cloexec[i];
     }
-    irq_restore(fl);
+    spin_unlock_irqrestore(&src->lock, fl);
     return f;
 }
 
@@ -491,48 +492,77 @@ void sched_tick_local(void)
 }
 
 /* Every other CPU's tick, without the kernel lock (idt.c): the same
- * accounting and slice countdown as sched_tick_local(). False when the tick
- * has more to do -- switch tasks, or deliver a signal to the interrupted
- * user code -- before anything is counted; the caller then takes the lock
- * and runs sched_tick_local(). Most ticks end here, so a CPU running user
- * code or halted no longer queues for the lock a thousand times a second. */
-bool sched_tick_fast(bool from_user)
+ * accounting and time slice as sched_tick_local(). The scheduler has its
+ * own lock, so a slice that runs out switches tasks right here, and a CPU
+ * running user code or halted never queues for the big lock on a tick. */
+void sched_tick_fast(void)
 {
-    if (!running) return true;
+    if (!running) return;
     struct tcb *t = cur;
-    if (need_resched) return false;
-    if (t->pid != 0) {
-        if (from_user && signal_pending()) return false;
-        if (preempt && (t->quantum <= 1 || (t->idle_class && normal_ready()))) return false;
-    }
     t->cpu_ticks++;
-    if (t->pid == 0) __atomic_add_fetch(&ticks_idle, 1, __ATOMIC_RELAXED);
-    else if (t->user) __atomic_add_fetch(&ticks_user, 1, __ATOMIC_RELAXED);
+    if (t->pid == 0) { __atomic_add_fetch(&ticks_idle, 1, __ATOMIC_RELAXED); return; }   /* the idle loop looks itself */
+    if (t->user) __atomic_add_fetch(&ticks_user, 1, __ATOMIC_RELAXED);
     else __atomic_add_fetch(&ticks_system, 1, __ATOMIC_RELAXED);
-    if (t->pid != 0 && preempt) t->quantum--;
-    return true;
+    if (!preempt) return;
+    if ((t->idle_class && normal_ready()) || --t->quantum <= 0 || need_resched) schedule();
+}
+
+/* The earliest ITIMER_REAL of any process (time_ms; 0: none). It may be
+ * early -- a timer since cancelled -- never late: the locked tick then
+ * looks at every process and sets it again. */
+static uint64_t alarm_next;
+
+void sched_alarm_armed(uint64_t at)             /* under the kernel lock */
+{
+    if (at && (!alarm_next || at < alarm_next)) alarm_next = at;
+}
+
+static void wake_sleepers(void)
+{
+    uint64_t now = uptime_ms();
+    uint64_t f = spin_lock_irqsave(&sched_lock);
+    for (int i = 1; i < MAX_TASKS; i++)
+        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_ms <= now) make_ready_locked(&tasks[i]);
+    spin_unlock_irqrestore(&sched_lock, f);
 }
 
 /* The boot CPU's tick: timed sleeps and interval timers, then its slice. */
 void sched_tick(void)
 {
     if (!running) return;
-    uint64_t now = uptime_ms();
     uint64_t ms = time_ms();
-    uint64_t f = spin_lock_irqsave(&sched_lock);
-    for (int i = 1; i < MAX_TASKS; i++)
-        if (tasks[i].state == TASK_SLEEPING && tasks[i].wake_ms <= now) make_ready_locked(&tasks[i]);
-    spin_unlock_irqrestore(&sched_lock, f);
+    wake_sleepers();
+    uint64_t next = 0;
     for (int i = 1; i < MAX_TASKS; i++) {
         struct signal_struct *g = tasks[i].signal;      /* ITIMER_REAL: per process, on its leader */
-        if (g && g->alarm_at && ms >= g->alarm_at && tasks[i].pid == tasks[i].tgid &&
-            tasks[i].state != TASK_ZOMBIE && tasks[i].state != TASK_UNUSED) {
+        if (!g || !g->alarm_at || tasks[i].pid != tasks[i].tgid ||
+            tasks[i].state == TASK_ZOMBIE || tasks[i].state == TASK_UNUSED) continue;
+        if (ms >= g->alarm_at) {
             g->alarm_at = g->alarm_every ? ms + g->alarm_every : 0;
             signal_send(&tasks[i], SIGALRM);
         }
+        if (g->alarm_at && (!next || g->alarm_at < next)) next = g->alarm_at;
     }
+    alarm_next = next;
     net_tick();                                 /* received frames or a due timer wake netd */
     sched_tick_local();
+}
+
+/* The boot CPU's tick without the kernel lock (idt.c), when no interval
+ * timer is due (sched_tick_needs_lock): sleepers, the network daemon's
+ * timer, the slice. */
+bool sched_tick_needs_lock(void)
+{
+    uint64_t a = __atomic_load_n(&alarm_next, __ATOMIC_RELAXED);
+    return a && time_ms() >= a;
+}
+
+void sched_tick_boot_fast(void)
+{
+    if (!running) return;
+    wake_sleepers();
+    net_tick();
+    sched_tick_fast();
 }
 
 void sleep_on(void *chan)
@@ -544,6 +574,21 @@ void sleep_on(void *chan)
     block_self(chan, 0);
     schedule();
     cur->wait_chan = NULL;
+}
+
+void sleep_on_locked(void *chan, struct spinlock *l)
+{
+    if (!running || cur->pid == 0) {
+        spin_unlock_keep_irqs(l);
+        sti(); hlt(); cli();
+        spin_lock_irqsave(l);
+        return;
+    }
+    block_self(chan, 0);
+    spin_unlock_keep_irqs(l);
+    schedule();
+    cur->wait_chan = NULL;
+    spin_lock_irqsave(l);                       /* interrupts are off already */
 }
 
 void sleep_on_until(void *chan, uint64_t deadline_ms)
@@ -707,6 +752,7 @@ void task_exit(int code)
     uint64_t f = spin_lock_irqsave(&sched_lock);
     cur->state = TASK_ZOMBIE;
     spin_unlock_irqrestore(&sched_lock, f);
+    __atomic_add_fetch(&zombie_gen, 1, __ATOMIC_RELEASE);
     wakeup(cur);                                /* anyone waiting on us */
     schedule();
     panic("zombie task %d was rescheduled", cur->pid);
@@ -742,31 +788,34 @@ static bool any_ready(void)
     return false;
 }
 
-/* A CPU's idle thread. Entered holding the big kernel lock; it lets go of
- * it while halted, so the other CPUs can run kernel code meanwhile, and
- * takes it back only when there is a task to run: waking for a timer tick
- * with nothing to do costs no trip through the lock. */
+/* A CPU's idle thread. Entered holding the big kernel lock, which it lets
+ * go of at once: it looks for work and switches to it without the lock
+ * (the scheduler has its own), and takes it only to reap the threads that
+ * exited since it last looked. A task that held the lock when it was
+ * switched out queues for it as it comes back (sched_switch_tail). */
 void sched_idle_loop(void)
 {
     struct percpu *c = this_cpu();
+    uint32_t reaped = 0;
+    cli();
+    bkl_release_all();
     for (;;) {
         cli();
-        reap_zombies();
+        uint32_t g = __atomic_load_n(&zombie_gen, __ATOMIC_ACQUIRE);
+        if (g != reaped) { bkl_enter(); reap_zombies(); bkl_exit(); reaped = g; }
         if (any_ready()) { schedule(); continue; }
-        bkl_exit();
         for (;;) {
             /* in_idle before the look at the task table, make_ready() the
              * other way round (smp_kick_idle): one of us sees the other */
             __atomic_store_n(&c->in_idle, true, __ATOMIC_SEQ_CST);
             __atomic_thread_fence(__ATOMIC_SEQ_CST);
-            if (any_ready()) break;
+            if (any_ready() || __atomic_load_n(&zombie_gen, __ATOMIC_RELAXED) != reaped) break;
             c->ks.idle_tsc = rdtsc();
             __asm__ volatile("sti; hlt" ::: "memory");   /* atomic: no lost wakeup */
             cli();
             if (c->ks.idle_tsc) { c->ks.idle_cyc += rdtsc() - c->ks.idle_tsc; c->ks.idle_tsc = 0; }
         }
         __atomic_store_n(&c->in_idle, false, __ATOMIC_RELEASE);
-        bkl_enter();
     }
 }
 

@@ -25,6 +25,7 @@
 #define KESTREL_KSTAT_H
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stddef.h>
 
 /* What a page fault had to do */
@@ -64,6 +65,14 @@ void     kstat_io(uint64_t bytes, uint64_t cyc);        /* current task and CPU 
 uint64_t kstat_us(uint64_t cyc);                        /* cycles -> microseconds */
 
 size_t   kstat_gen(char *buf, size_t cap);              /* /proc/kstat */
+/* Tick profile: every CPU's timer tick counts where it interrupted the
+ * kernel (16-byte slots of kernel text; user mode and the idle threads as
+ * totals). Code running with interrupts off -- spinning for a lock, inside
+ * a spinlock -- is not seen. /proc/kprof: the busiest slots, symbolise them
+ * with addr2line against kernel.elf. */
+void     kstat_prof_tick(uint64_t rip, bool user);
+size_t   kstat_gen_prof(char *buf, size_t cap);         /* /proc/kprof */
+void     kstat_lockwait(uint64_t caller, uint64_t cyc);  /* a contended big-lock acquisition */
 size_t   kstat_gen_process(int tgid, char *buf, size_t cap);   /* /proc/PID/kstat */
 void     kstat_init(void);                              /* the REPORT.TXT section */
 

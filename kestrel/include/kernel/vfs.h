@@ -109,6 +109,7 @@ struct vnode {
     bool        unlinked;           /* removed from its directory: freed
                                        when the last open file closes      */
     bool        loaded;             /* directory: children read (refresh)  */
+    bool        loading;            /* ...being read: by the holder of the fs lock */
     uint32_t    nlink;              /* hard links (0: 1, or 2 for a dir)   */
     uint64_t    atime, ctime;       /* seconds (0: same as mtime)          */
     uint64_t    blocks;             /* 512-byte blocks used (0: from size) */

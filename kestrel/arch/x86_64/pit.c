@@ -20,6 +20,22 @@ bool pit_add_tick_hook(void (*fn)(void))
     return false;
 }
 
+/* The boot CPU's tick without the kernel lock (idt.c): all but every
+ * fourth, which runs the hooks (the xHCI event ring has its own interrupt
+ * by then; this is the fallback and key repeat), and any with an interval
+ * timer due. timer_tick_fast() runs the ones that can. */
+#define HOOK_EVERY 4
+bool timer_tick_needs_lock(void)
+{
+    return (ticks + 1) % HOOK_EVERY == 0 || sched_tick_needs_lock();
+}
+
+void timer_tick_fast(void)
+{
+    ticks++;
+    sched_tick_boot_fast();
+}
+
 void timer_interrupt(bool boot_cpu)
 {
     if (!boot_cpu) { sched_tick_local(); return; }
