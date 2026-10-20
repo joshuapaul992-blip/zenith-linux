@@ -1,0 +1,33 @@
+Windows Registry Editor Version 5.00
+
+; ===========================================================================
+; zenith-install.reg -- register lxinit as a BootExecute program and set its
+; configuration. Import with:  regedit /s zenith-install.reg  (elevated).
+;
+; Prerequisites:
+;   * Copy lxinit.exe to %SystemRoot%\System32\lxinit.exe
+;   * Extract any x86-64 Linux rootfs to the RootfsPath below.
+;
+; WARNING: the BootExecute value below is REG_MULTI_SZ and this file sets the
+; WHOLE value. The bytes encode exactly two entries:
+;     "autocheck autochk *"   (the stock disk-check pass -- keep it!)
+;     "lxinit"
+; If your system has extra BootExecute entries (some AV/backup tools add them),
+; do NOT blind-import this: use zenith-install.cmd instead, which appends
+; lxinit while preserving whatever is already there.
+; ===========================================================================
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager]
+"BootExecute"=hex(7):61,00,75,00,74,00,6f,00,63,00,68,00,65,00,63,00,6b,00,20,00,61,00\
+  75,00,74,00,6f,00,63,00,68,00,6b,00,20,00,2a,00,00,00,6c,00,78,00\
+  69,00,6e,00,69,00,74,00,00,00,00,00
+
+; --- zenith-linux configuration -------------------------------------------
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Zenith]
+; DOS path to the extracted rootfs root (works with any distro):
+"RootfsPath"="C:\\rootfs"
+; Optional explicit init, rootfs-relative. Remove to auto-detect
+; (/sbin/init, busybox, bash, sh, ...):
+; "InitPath"="\\sbin\\init"
+; Set to 1 to request the post-csrss X11/Xorg layer, 0 for text-mode TTY:
+"EnableX11"=dword:00000000
