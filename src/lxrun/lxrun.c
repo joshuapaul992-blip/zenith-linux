@@ -127,7 +127,11 @@ typedef struct {
 /* Linux x86-64 errno subset (returned as negative values) */
 #define L_EPERM   1
 #define L_ENOENT  2
+#define L_ESRCH   3
+#define L_EINTR   4
+#define L_ENOEXEC 8
 #define L_EBADF   9
+#define L_ECHILD  10
 #define L_ENOMEM  12
 #define L_EFAULT  14
 #define L_EINVAL  22
@@ -172,9 +176,26 @@ typedef struct {
 #define SYS_prlimit64 302
 #define SYS_getrandom 318
 #define SYS_rseq 334
+#define SYS_rt_sigreturn 15
+#define SYS_clone 56
+#define SYS_fork 57
+#define SYS_vfork 58
+#define SYS_execve 59
+#define SYS_wait4 61
+#define SYS_kill 62
+#define SYS_getppid 110
+#define SYS_sigaltstack 131
+#define SYS_tgkill 234
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
+
+/* sigaction flags / special handlers */
+#define SA_SIGINFO  0x00000004
+#define SA_RESTORER 0x04000000
+#define SA_NODEFER  0x40000000
+#define SIG_DFL 0
+#define SIG_IGN 1
 
 #define GUEST_STACK_SIZE (8 * 1024 * 1024)
 #define BRK_ARENA_SIZE   (256 * 1024 * 1024)
@@ -190,6 +211,21 @@ static wchar_t  g_root[MAX_PATH] = L"";   /* guest "/" -> this Windows dir   */
 static uint64_t g_brk_base = 0, g_brk_cur = 0, g_brk_end = 0;
 
 static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* image span for VEH filter */
+
+/* Current image regions, for execve teardown. */
+static uint64_t g_image_base = 0;   /* reserved PIE region base; 0 if ET_EXEC */
+static int      g_image_is_dyn = 0;
+
+/* Signal model (single guest thread prototype; see docs/process-model.md). */
+typedef struct { uint64_t handler, flags, restorer, mask; } ksigaction;
+static ksigaction g_sig[65];
+static uint64_t   g_blocked = 0;    /* blocked mask  */
+static uint64_t   g_pending = 0;    /* pending mask  */
+static uint64_t   g_restorer = 0;   /* injected "mov rax,15; ud2" trampoline */
+
+typedef struct { CONTEXT ctx; uint64_t oldblocked; } sigsave_t;
+static sigsave_t g_sigstack[8];     /* saved contexts for rt_sigreturn */
+static int       g_sigsp = 0;
 
 /* fd table: Linux fd -> Windows HANDLE (0/1/2 are the console). */
 #define MAX_FDS 256
@@ -354,6 +390,8 @@ static void load_elf(const wchar_t *path, loaded_t *out)
     uint64_t bias = 0;
     int is_dyn = (eh->e_type == ET_DYN);
 
+    g_image_base = 0;
+    g_image_is_dyn = is_dyn;
     if (is_dyn) {
         /* Reserve the whole span, then commit per segment. Static-PIE
          * relocates itself (PC-relative), so we do NOT apply relocations. */
@@ -361,6 +399,7 @@ static void load_elf(const wchar_t *path, loaded_t *out)
         if (!region) die("VirtualAlloc reserve %llu bytes failed (err %lu)",
                          (unsigned long long)(vhi - vlo), GetLastError());
         bias = (uint64_t)region - vlo;
+        g_image_base = (uint64_t)region;   /* freed on execve */
     }
 
     g_guest_lo = bias + vlo;
@@ -441,19 +480,14 @@ static void load_elf(const wchar_t *path, loaded_t *out)
 /*  Initial stack (System V x86-64 ABI)                                       */
 /* ========================================================================= */
 
-static uint64_t build_stack(const loaded_t *ld, int argc, char **argv)
+static uint64_t build_stack(const loaded_t *ld, int argc, char **argv,
+                            int envc, char **envs)
 {
     void *stk = VirtualAlloc(NULL, GUEST_STACK_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!stk) die("cannot allocate guest stack");
     uint64_t top = (uint64_t)stk + GUEST_STACK_SIZE;
 
-    /* Minimal environment for the guest. */
-    static const char *envs[] = {
-        "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
-        "TERM=linux", "HOME=/root", "PWD=/", "USER=root",
-    };
-    int envc = (int)(sizeof(envs) / sizeof(envs[0]));
-
+    if (envc > 16) envc = 16;
     uint64_t p = top;
     uint64_t argp[64], envp[16];
     if (argc > 64) argc = 64;
@@ -510,6 +544,135 @@ static uint64_t build_stack(const loaded_t *ld, int argc, char **argv)
     for (int i = 0; i < na; i++) sp[idx++] = aux[i];
 
     return rsp;
+}
+
+/* ========================================================================= */
+/*  Process + signal helpers                                                  */
+/* ========================================================================= */
+
+static void init_signals(void)
+{
+    /* Trampoline a handler returns to when no SA_RESTORER is set:
+     * mov rax, 15 (rt_sigreturn) ; ud2  -> our #UD handler restores context. */
+    static const unsigned char code[] = {
+        0x48, 0xC7, 0xC0, 0x0F, 0x00, 0x00, 0x00,   /* mov rax, 15 */
+        0x0F, 0x0B                                   /* ud2         */
+    };
+    void *p = VirtualAlloc(NULL, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!p) die("cannot allocate signal restorer trampoline");
+    memcpy(p, code, sizeof(code));
+    g_restorer = (uint64_t)p;
+    for (int s = 0; s < 65; s++) {
+        g_sig[s].handler = SIG_DFL; g_sig[s].flags = 0;
+        g_sig[s].restorer = 0;      g_sig[s].mask = 0;
+    }
+}
+
+/* Deliver one pending, unblocked signal by building its handler frame. Called
+ * on return to user mode (after each emulated syscall). */
+static void deliver_pending(CONTEXT *c)
+{
+    uint64_t d = g_pending & ~g_blocked;
+    if (!d) return;
+    int sig = 0;
+    for (int i = 0; i < 64; i++) if (d & (1ULL << i)) { sig = i + 1; break; }
+    if (!sig) return;
+    g_pending &= ~(1ULL << (sig - 1));
+
+    ksigaction *sa = &g_sig[sig];
+    uint64_t h = sa->handler;
+    if (h == SIG_IGN) return;
+    if (h == SIG_DFL) {
+        /* default-ignore: SIGCHLD(17) SIGCONT(18) SIGURG(23) SIGWINCH(28) */
+        if (sig == 17 || sig == 18 || sig == 23 || sig == 28) return;
+        fflush(NULL);
+        ExitProcess(128 + sig);          /* default action: terminate */
+    }
+    if (g_sigsp >= (int)(sizeof(g_sigstack) / sizeof(g_sigstack[0]))) return;
+
+    uint64_t sp = c->Rsp;
+    sp -= 128;                            /* preserve the red zone */
+    sp = align_down(sp, 16);
+    uint64_t ret = (sa->flags & SA_RESTORER) ? sa->restorer : g_restorer;
+    sp -= 8;
+    *(uint64_t *)sp = ret;                /* handler returns here -> rt_sigreturn */
+
+    g_sigstack[g_sigsp].ctx = *c;
+    g_sigstack[g_sigsp].oldblocked = g_blocked;
+    g_sigsp++;
+
+    if (!(sa->flags & SA_NODEFER)) g_blocked |= (1ULL << (sig - 1));
+    g_blocked |= sa->mask;
+
+    c->Rsp = sp;
+    c->Rip = h;
+    c->Rdi = (uint64_t)sig;               /* arg1: signo                       */
+    c->Rsi = 0;                           /* arg2: siginfo_t*  (SA_SIGINFO)    */
+    c->Rdx = 0;                           /* arg3: ucontext_t*                 */
+    if (g_verbose) fprintf(stderr, "  [signal] deliver %d -> %p\n", sig, (void *)h);
+}
+
+/* Copy a guest char*[] (NULL-terminated) into a host pool; out[] points in. */
+static int read_guest_strv(uint64_t arr, char **out, int max, char *pool, size_t poolsz)
+{
+    size_t used = 0; int n = 0;
+    if (arr) __try {
+        uint64_t *a = (uint64_t *)arr;
+        for (; n < max - 1 && a[n]; n++) {
+            const char *s = (const char *)a[n];
+            size_t len = strlen(s) + 1;
+            if (used + len > poolsz) break;
+            memcpy(pool + used, s, len);
+            out[n] = pool + used; used += len;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+    out[n] = NULL;
+    return n;
+}
+
+/* execve: replace the image in this address space. Returns 0 (context set to
+ * the new entry) or a negative errno. See docs/process-model.md section 2. */
+static char  g_apool[32768], g_epool[32768];
+static char *g_av[128], *g_ev[128];
+
+static int do_execve(CONTEXT *c)
+{
+    char lpath[1024];
+    if (!guest_strcpy(lpath, sizeof(lpath), c->Rdi)) return -L_EFAULT;
+    wchar_t wp[MAX_PATH];
+    translate_path(lpath, wp, MAX_PATH);
+    if (GetFileAttributesW(wp) == INVALID_FILE_ATTRIBUTES) return -L_ENOENT;
+
+    int ac = read_guest_strv(c->Rsi, g_av, 128, g_apool, sizeof(g_apool));
+    int ec = read_guest_strv(c->Rdx, g_ev, 128, g_epool, sizeof(g_epool));
+    if (ac == 0) { g_av[0] = lpath; g_av[1] = NULL; ac = 1; }
+
+    uint64_t old_image = g_image_base;    /* PIE region base or 0 (ET_EXEC)    */
+    uint64_t old_brk   = g_brk_base;
+
+    loaded_t ld;
+    load_elf(wp, &ld);                    /* NB: malformed ELF die()s (prototype) */
+    uint64_t rsp = build_stack(&ld, ac, g_av, ec, g_ev);
+
+    if (old_image) VirtualFree((void *)old_image, 0, MEM_RELEASE);
+    if (old_brk)   VirtualFree((void *)old_brk, 0, MEM_RELEASE);
+    /* The old stack is abandoned deliberately: we are executing on it. */
+
+    /* Reset dispositions: non-ignored -> default. Mask & pending preserved. */
+    for (int s = 1; s <= 64; s++)
+        if (g_sig[s].handler != SIG_IGN) {
+            g_sig[s].handler = SIG_DFL; g_sig[s].flags = 0;
+            g_sig[s].restorer = 0;      g_sig[s].mask = 0;
+        }
+    g_sigsp = 0;
+
+    c->Rip = ld.entry; c->Rsp = rsp;
+    c->Rax = c->Rbx = c->Rcx = c->Rdx = c->Rsi = c->Rdi = c->Rbp = 0;
+    c->R8 = c->R9 = c->R10 = c->R11 = c->R12 = c->R13 = c->R14 = c->R15 = 0;
+    if (g_verbose)
+        fprintf(stderr, "lxrun: execve -> %ls (%s) entry=%p\n",
+                wp, ld.is_dyn ? "PIE" : "ET_EXEC", (void *)ld.entry);
+    return 0;
 }
 
 /* ========================================================================= */
@@ -691,12 +854,59 @@ static int64_t emulate(CONTEXT *c)
 
     case SYS_set_tid_address: trace("set_tid_address() = 1"); return 1;
     case SYS_set_robust_list: return 0;
-    case SYS_rt_sigaction:    return 0;
-    case SYS_rt_sigprocmask:  return 0;
     case SYS_rseq:            return -L_ENOSYS;
     case SYS_prlimit64:       return 0;
+    case SYS_sigaltstack:     return 0;
+
+    case SYS_rt_sigaction: {
+        if (a0 < 1 || a0 > 64) return -L_EINVAL;
+        if (a2) __try {
+            ksigaction *o = (ksigaction *)a2; *o = g_sig[a0];
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        if (a1) __try {
+            ksigaction *n = (ksigaction *)a1; g_sig[a0] = *n;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        trace("rt_sigaction(%llu)", a0);
+        return 0;
+    }
+
+    case SYS_rt_sigprocmask: {
+        if (a2) __try { *(uint64_t *)a2 = g_blocked; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        if (a1) {
+            uint64_t set;
+            __try { set = *(uint64_t *)a1; }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+            if (a0 == 0)      g_blocked |= set;     /* SIG_BLOCK   */
+            else if (a0 == 1) g_blocked &= ~set;    /* SIG_UNBLOCK */
+            else if (a0 == 2) g_blocked = set;      /* SIG_SETMASK */
+        }
+        g_blocked &= ~((1ULL << 8) | (1ULL << 18)); /* SIGKILL/SIGSTOP unblockable */
+        return 0;
+    }
+
+    case SYS_kill:
+    case SYS_tgkill: {
+        uint64_t sig = (nr == SYS_kill) ? a1 : a2;
+        if (sig == 0) return 0;                 /* existence probe */
+        if (sig < 1 || sig > 64) return -L_EINVAL;
+        g_pending |= 1ULL << (sig - 1);         /* prototype: target is always self */
+        trace("%s(sig=%llu)", nr == SYS_kill ? "kill" : "tgkill", sig);
+        return 0;
+    }
+
+    case SYS_fork:
+    case SYS_vfork:
+    case SYS_clone:
+        fprintf(stderr, "lxrun: fork/clone requires lxcore.sys "
+                        "(see docs/process-model.md) -> -ENOSYS\n");
+        return -L_ENOSYS;
+
+    case SYS_wait4:
+        return -L_ECHILD;                       /* nothing to wait for w/o fork */
 
     case SYS_getpid:  return 1;
+    case SYS_getppid: return 0;
     case SYS_gettid:  return 1;
     case SYS_getuid:  case SYS_geteuid: return 0;
     case SYS_getgid:  case SYS_getegid: return 0;
@@ -790,19 +1000,47 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
         __try { is_ud2 = (p[0] == 0x0F && p[1] == 0x0B); }
         __except (EXCEPTION_EXECUTE_HANDLER) { is_ud2 = 0; }
         if (is_ud2) {
+            uint64_t nr = c->Rax;            /* Linux syscall number */
+
+            if (nr == SYS_rt_sigreturn) {    /* restore pre-signal context */
+                if (g_sigsp > 0) {
+                    g_sigsp--;
+                    uint64_t ob = g_sigstack[g_sigsp].oldblocked;
+                    *c = g_sigstack[g_sigsp].ctx;
+                    g_blocked = ob;
+                }
+                return EXCEPTION_CONTINUE_EXECUTION;   /* c fully restored */
+            }
+
+            if (nr == SYS_execve) {          /* replaces image; sets c on success */
+                int64_t r = do_execve(c);
+                if (r != 0) { c->Rax = (uint64_t)r; c->Rip = rip + 2; }
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
             int64_t r = emulate(c);          /* may ExitProcess for exit_group */
             c->Rax = (uint64_t)r;
             c->Rip = rip + 2;                /* step over the ud2 */
+            deliver_pending(c);              /* signals delivered on return to user */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
 
-    /* A genuine guest fault: report and exit like a Linux signal would. */
+    /* A genuine guest fault -> a synchronous Linux signal. */
     if (rip >= g_guest_lo && rip < g_guest_hi) {
+        int sig = (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)      ? 11  /* SIGSEGV */
+                : (er->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO)    ? 8   /* SIGFPE  */
+                : (er->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION)      ? 4   /* SIGILL  */
+                                                                         : 11;
+        if (g_sig[sig].handler != SIG_DFL && g_sig[sig].handler != SIG_IGN) {
+            g_pending |= 1ULL << (sig - 1);
+            deliver_pending(c);
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         fprintf(stderr, "lxrun: guest fault code=0x%08lx at rip=%p "
-                "(rax=%llx rdi=%llx rsi=%llx)\n",
-                er->ExceptionCode, (void *)rip, c->Rax, c->Rdi, c->Rsi);
-        ExitProcess(139);                    /* 128 + SIGSEGV */
+                "(rax=%llx rdi=%llx rsi=%llx) -> signal %d\n",
+                er->ExceptionCode, (void *)rip, c->Rax, c->Rdi, c->Rsi, sig);
+        ExitProcess(128 + sig);
     }
     return EXCEPTION_CONTINUE_SEARCH;         /* not ours (harness bug) */
 }
@@ -848,6 +1086,8 @@ int main(int argc, char **argv)
     g_err = GetStdHandle(STD_ERROR_HANDLE);
     g_fds[0] = g_in; g_fds[1] = g_out; g_fds[2] = g_err;
 
+    init_signals();
+
     loaded_t ld;
     load_elf(elf_w, &ld);
 
@@ -855,7 +1095,11 @@ int main(int argc, char **argv)
     int gargc = argc - i;
     char *gargv[64];
     for (int k = 0; k < gargc && k < 64; k++) gargv[k] = argv[i + k];
-    uint64_t rsp = build_stack(&ld, gargc, gargv);
+    static char *defenv[] = {
+        "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
+        "TERM=linux", "HOME=/root", "PWD=/", "USER=root",
+    };
+    uint64_t rsp = build_stack(&ld, gargc, gargv, 5, defenv);
 
     if (g_verbose)
         fprintf(stderr, "lxrun: entry=%p rsp=%p (%s)\n",
