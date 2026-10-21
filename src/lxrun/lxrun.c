@@ -771,10 +771,10 @@ static int64_t emulate(CONTEXT *c)
         if (!h) return -L_EBADF;
         int64_t total = 0;
         __try {
-            struct { uint64_t base; uint64_t len; } *iov = (void *)a1;
+            uint64_t *iov = (uint64_t *)a1;   /* iovec = {base, len} pairs */
             for (uint64_t i = 0; i < a2; i++) {
                 DWORD wrote = 0;
-                WriteFile(h, (const void *)iov[i].base, (DWORD)iov[i].len, &wrote, NULL);
+                WriteFile(h, (const void *)iov[i * 2], (DWORD)iov[i * 2 + 1], &wrote, NULL);
                 total += wrote;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
