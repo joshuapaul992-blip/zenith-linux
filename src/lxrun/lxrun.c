@@ -132,7 +132,9 @@ typedef struct {
 #define L_ENOEXEC 8
 #define L_EBADF   9
 #define L_ECHILD  10
+#define L_EAGAIN  11
 #define L_ENOMEM  12
+#define L_ETIMEDOUT 110
 #define L_EFAULT  14
 #define L_EINVAL  22
 #define L_ENOTTY  25
@@ -189,6 +191,29 @@ typedef struct {
 #define SYS_pread64 17
 #define SYS_faccessat 269
 #define SYS_faccessat2 439
+#define SYS_lstat 6
+#define SYS_dup 32
+#define SYS_dup2 33
+#define SYS_dup3 292
+#define SYS_nanosleep 35
+#define SYS_madvise 28
+#define SYS_pipe 22
+#define SYS_pipe2 293
+#define SYS_sched_yield 24
+#define SYS_fcntl 72
+#define SYS_getcwd 79
+#define SYS_chdir 80
+#define SYS_futex 202
+#define SYS_sched_getaffinity 204
+#define SYS_clock_getres 229
+#define SYS_clock_nanosleep 230
+
+/* clone() flags */
+#define CLONE_VM             0x00000100
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -231,7 +256,11 @@ static uint64_t g_brk_base = 0, g_brk_cur = 0, g_brk_end = 0;
 
 static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* main image span (info)     */
 static uint64_t g_self_lo = 0, g_self_hi = 0;    /* lxrun.exe's own module range */
-static uint64_t g_fsbase = 0;                    /* guest %fs base (TLS pointer) */
+/* Per-thread guest state (each Linux thread is a Windows thread). */
+static __declspec(thread) uint64_t t_fsbase = 0;          /* guest %fs base      */
+static __declspec(thread) int      t_tid = 1;             /* Linux tid (main=1)  */
+static __declspec(thread) uint64_t t_clear_child_tid = 0; /* CLONE_CHILD_CLEARTID*/
+static volatile long g_next_tid = 1;                      /* tid allocator       */
 
 /* 64-bit wrfsbase/rdfsbase via a machine-code stub, bypassing compiler
  * intrinsics (VS2012's _writefsbase_u64 can emit the 32-bit form, which
@@ -241,24 +270,36 @@ typedef uint64_t (*rdfs_fn)(void);
 static wrfs_fn g_wrfs = 0;
 static rdfs_fn g_rdfs = 0;
 
+/* Threading primitives resolved at runtime (Win8+ / present on Win11). */
+typedef BOOL (WINAPI *WaitOnAddress_t)(volatile VOID *, PVOID, SIZE_T, DWORD);
+typedef VOID (WINAPI *WakeByAddr_t)(PVOID);
+typedef VOID (NTAPI  *RtlRestoreContext_t)(PCONTEXT, PVOID);
+static WaitOnAddress_t     g_WaitOnAddress = 0;
+static WakeByAddr_t        g_WakeByAddressSingle = 0;
+static WakeByAddr_t        g_WakeByAddressAll = 0;
+static RtlRestoreContext_t g_RtlRestoreContext = 0;
+
 /* Current image regions, for execve teardown. */
 static uint64_t g_image_base = 0;   /* reserved PIE region base; 0 if ET_EXEC */
 static int      g_image_is_dyn = 0;
 
 /* Signal model (single guest thread prototype; see docs/process-model.md). */
 typedef struct { uint64_t handler, flags, restorer, mask; } ksigaction;
-static ksigaction g_sig[65];
-static uint64_t   g_blocked = 0;    /* blocked mask  */
-static uint64_t   g_pending = 0;    /* pending mask  */
+static ksigaction g_sig[65];                           /* dispositions: process-wide */
+static __declspec(thread) uint64_t t_blocked = 0;      /* blocked mask (per-thread)  */
+static __declspec(thread) uint64_t t_pending = 0;      /* pending mask (per-thread)  */
 static uint64_t   g_restorer = 0;   /* injected "mov rax,15; ud2" trampoline */
 
 typedef struct { CONTEXT ctx; uint64_t oldblocked; } sigsave_t;
-static sigsave_t g_sigstack[8];     /* saved contexts for rt_sigreturn */
-static int       g_sigsp = 0;
+/* Shared (not per-thread): avoids aligned-CONTEXT-in-TLS on older MSVC. Fine
+ * until multiple threads take signals concurrently (a later refinement). */
+static sigsave_t t_sigstack[8];     /* saved contexts for sigreturn */
+static int       t_sigsp = 0;
 
 /* fd table: Linux fd -> Windows HANDLE (0/1/2 are the console). */
 #define MAX_FDS 256
 static HANDLE   g_fds[MAX_FDS];
+static CRITICAL_SECTION g_lock;    /* guards fd table + brk across guest threads */
 
 static HANDLE   g_out, g_in, g_err;
 
@@ -440,9 +481,12 @@ static void translate_path(const char *lpath, wchar_t *out, size_t outcap)
 
 static int alloc_fd(HANDLE h)
 {
+    int fd = -1;
+    EnterCriticalSection(&g_lock);
     for (int i = 3; i < MAX_FDS; i++)
-        if (g_fds[i] == NULL) { g_fds[i] = h; return i; }
-    return -1;
+        if (g_fds[i] == NULL) { g_fds[i] = h; fd = i; break; }
+    LeaveCriticalSection(&g_lock);
+    return fd;
 }
 
 /* ========================================================================= */
@@ -729,6 +773,45 @@ static void init_fsbase_stubs(void)
     g_rdfs = (rdfs_fn)(page + 16);
 }
 
+static void init_thread_support(void)
+{
+    HMODULE k = GetModuleHandleW(L"kernel32.dll");
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    if (k) {
+        g_WaitOnAddress       = (WaitOnAddress_t)GetProcAddress(k, "WaitOnAddress");
+        g_WakeByAddressSingle = (WakeByAddr_t)GetProcAddress(k, "WakeByAddressSingle");
+        g_WakeByAddressAll    = (WakeByAddr_t)GetProcAddress(k, "WakeByAddressAll");
+    }
+    if (nt)
+        g_RtlRestoreContext = (RtlRestoreContext_t)GetProcAddress(nt, "RtlRestoreContext");
+    if (!g_WaitOnAddress || !g_RtlRestoreContext)
+        fprintf(stderr, "lxrun: WARNING threading primitives unavailable; "
+                        "clone/futex will be limited\n");
+}
+
+/* A cloned Linux thread: set this thread's TLS base, then enter guest code
+ * with the prepared register context (never returns). */
+typedef struct {
+    CONTEXT  ctx;
+    uint64_t tls;
+    int      tid;
+    uint64_t clear_child_tid;
+} threadarg_t;
+
+static DWORD WINAPI guest_thread_entry(LPVOID arg)
+{
+    threadarg_t *ta = (threadarg_t *)arg;
+    CONTEXT  ctx = ta->ctx;            /* copy off the heap before freeing */
+    uint64_t tls = ta->tls;
+    t_tid = ta->tid;
+    t_clear_child_tid = ta->clear_child_tid;
+    free(ta);
+    t_fsbase = tls;
+    g_wrfs(tls);                       /* this thread's %fs base */
+    if (g_RtlRestoreContext) g_RtlRestoreContext(&ctx, NULL);   /* -> guest */
+    return 0;                          /* unreachable if RtlRestoreContext ran */
+}
+
 static void init_signals(void)
 {
     /* Trampoline a handler returns to when no SA_RESTORER is set:
@@ -751,12 +834,12 @@ static void init_signals(void)
  * on return to user mode (after each emulated syscall). */
 static void deliver_pending(CONTEXT *c)
 {
-    uint64_t d = g_pending & ~g_blocked;
+    uint64_t d = t_pending & ~t_blocked;
     if (!d) return;
     int sig = 0;
     for (int i = 0; i < 64; i++) if (d & (1ULL << i)) { sig = i + 1; break; }
     if (!sig) return;
-    g_pending &= ~(1ULL << (sig - 1));
+    t_pending &= ~(1ULL << (sig - 1));
 
     ksigaction *sa = &g_sig[sig];
     uint64_t h = sa->handler;
@@ -767,7 +850,7 @@ static void deliver_pending(CONTEXT *c)
         fflush(NULL);
         ExitProcess(128 + sig);          /* default action: terminate */
     }
-    if (g_sigsp >= (int)(sizeof(g_sigstack) / sizeof(g_sigstack[0]))) return;
+    if (t_sigsp >= (int)(sizeof(t_sigstack) / sizeof(t_sigstack[0]))) return;
 
     uint64_t sp = c->Rsp;
     sp -= 128;                            /* preserve the red zone */
@@ -776,12 +859,12 @@ static void deliver_pending(CONTEXT *c)
     sp -= 8;
     *(uint64_t *)sp = ret;                /* handler returns here -> rt_sigreturn */
 
-    g_sigstack[g_sigsp].ctx = *c;
-    g_sigstack[g_sigsp].oldblocked = g_blocked;
-    g_sigsp++;
+    t_sigstack[t_sigsp].ctx = *c;
+    t_sigstack[t_sigsp].oldblocked = t_blocked;
+    t_sigsp++;
 
-    if (!(sa->flags & SA_NODEFER)) g_blocked |= (1ULL << (sig - 1));
-    g_blocked |= sa->mask;
+    if (!(sa->flags & SA_NODEFER)) t_blocked |= (1ULL << (sig - 1));
+    t_blocked |= sa->mask;
 
     c->Rsp = sp;
     c->Rip = h;
@@ -843,8 +926,8 @@ static int do_execve(CONTEXT *c)
             g_sig[s].handler = SIG_DFL; g_sig[s].flags = 0;
             g_sig[s].restorer = 0;      g_sig[s].mask = 0;
         }
-    g_sigsp = 0;
-    g_fsbase = 0;          /* new image sets up its own TLS */
+    t_sigsp = 0;
+    t_fsbase = 0;          /* new image sets up its own TLS */
 
     c->Rip = ld.entry; c->Rsp = rsp;
     c->Rax = c->Rbx = c->Rcx = c->Rdx = c->Rsi = c->Rdi = c->Rbp = 0;
@@ -1001,17 +1084,21 @@ static int64_t emulate(CONTEXT *c)
     }
 
     case SYS_brk: {
-        if (a0 == 0) return (int64_t)g_brk_cur;
-        if (a0 < g_brk_base || a0 > g_brk_end) return (int64_t)g_brk_cur;
-        if (a0 > g_brk_cur) {
-            uint64_t from = align_up(g_brk_cur, PAGE), to = align_up(a0, PAGE);
-            if (to > from &&
-                !VirtualAlloc((void *)from, (SIZE_T)(to - from), MEM_COMMIT, PAGE_READWRITE))
-                return (int64_t)g_brk_cur;
+        int64_t ret;
+        EnterCriticalSection(&g_lock);
+        if (a0 == 0 || a0 < g_brk_base || a0 > g_brk_end) { ret = (int64_t)g_brk_cur; }
+        else {
+            if (a0 > g_brk_cur) {
+                uint64_t from = align_up(g_brk_cur, PAGE), to = align_up(a0, PAGE);
+                if (to > from)
+                    VirtualAlloc((void *)from, (SIZE_T)(to - from), MEM_COMMIT, PAGE_READWRITE);
+            }
+            g_brk_cur = a0;
+            ret = (int64_t)g_brk_cur;
         }
-        g_brk_cur = a0;
-        trace("brk(%p) = %p", (void*)a0, (void*)g_brk_cur);
-        return (int64_t)g_brk_cur;
+        LeaveCriticalSection(&g_lock);
+        trace("brk(%p) = %p", (void *)a0, (void *)ret);
+        return ret;
     }
 
     case SYS_mmap: {
@@ -1077,7 +1164,7 @@ static int64_t emulate(CONTEXT *c)
 
     case SYS_arch_prctl:
         if (a0 == ARCH_SET_FS) {
-            g_fsbase = a1;                    /* remember to re-assert on resume */
+            t_fsbase = a1;                    /* remember to re-assert on resume */
             g_wrfs(a1);                       /* set guest thread pointer (64-bit) */
             if (g_verbose) {
                 uint64_t rb = g_rdfs();
@@ -1092,7 +1179,7 @@ static int64_t emulate(CONTEXT *c)
         }
         return -L_EINVAL;
 
-    case SYS_set_tid_address: trace("set_tid_address() = 1"); return 1;
+    case SYS_set_tid_address: t_clear_child_tid = a0; return t_tid;
     case SYS_set_robust_list: return 0;
     case SYS_rseq:            return -L_ENOSYS;
     case SYS_prlimit64:       return 0;
@@ -1111,17 +1198,17 @@ static int64_t emulate(CONTEXT *c)
     }
 
     case SYS_rt_sigprocmask: {
-        if (a2) __try { *(uint64_t *)a2 = g_blocked; }
+        if (a2) __try { *(uint64_t *)a2 = t_blocked; }
                 __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
         if (a1) {
             uint64_t set;
             __try { set = *(uint64_t *)a1; }
             __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
-            if (a0 == 0)      g_blocked |= set;     /* SIG_BLOCK   */
-            else if (a0 == 1) g_blocked &= ~set;    /* SIG_UNBLOCK */
-            else if (a0 == 2) g_blocked = set;      /* SIG_SETMASK */
+            if (a0 == 0)      t_blocked |= set;     /* SIG_BLOCK   */
+            else if (a0 == 1) t_blocked &= ~set;    /* SIG_UNBLOCK */
+            else if (a0 == 2) t_blocked = set;      /* SIG_SETMASK */
         }
-        g_blocked &= ~((1ULL << 8) | (1ULL << 18)); /* SIGKILL/SIGSTOP unblockable */
+        t_blocked &= ~((1ULL << 8) | (1ULL << 18)); /* SIGKILL/SIGSTOP unblockable */
         return 0;
     }
 
@@ -1130,15 +1217,47 @@ static int64_t emulate(CONTEXT *c)
         uint64_t sig = (nr == SYS_kill) ? a1 : a2;
         if (sig == 0) return 0;                 /* existence probe */
         if (sig < 1 || sig > 64) return -L_EINVAL;
-        g_pending |= 1ULL << (sig - 1);         /* prototype: target is always self */
+        t_pending |= 1ULL << (sig - 1);         /* prototype: target is always self */
         trace("%s(sig=%llu)", nr == SYS_kill ? "kill" : "tgkill", sig);
         return 0;
     }
 
+    case SYS_clone: {
+        uint64_t flags = a0, child_stack = a1, ptid = a2, ctid = a3, tls = a4;
+        if (!(flags & CLONE_VM)) {              /* fork-like: separate AS -> driver */
+            fprintf(stderr, "lxrun: fork (clone w/o CLONE_VM) requires lxcore.sys "
+                            "(see docs/process-model.md) -> -ENOSYS\n");
+            return -L_ENOSYS;
+        }
+        if (!g_RtlRestoreContext) return -L_ENOSYS;
+        int tid = (int)InterlockedIncrement(&g_next_tid);
+        threadarg_t *ta = (threadarg_t *)malloc(sizeof(*ta));
+        if (!ta) return -L_ENOMEM;
+        ta->ctx = *c;
+        ta->ctx.Rax = 0;                        /* child sees clone() == 0 */
+        ta->ctx.Rip = c->Rip + 2;               /* resume after the ud2     */
+        ta->ctx.Rsp = child_stack;
+        ta->tls = (flags & CLONE_SETTLS) ? tls : t_fsbase;
+        ta->tid = tid;
+        ta->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
+        if (flags & CLONE_PARENT_SETTID)
+            __try { *(int *)ptid = tid; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (flags & CLONE_CHILD_SETTID)
+            __try { *(int *)ctid = tid; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        HANDLE h = CreateThread(NULL, 0, guest_thread_entry, ta, 0, NULL);
+        if (!h) { free(ta); return -L_ENOMEM; }
+        CloseHandle(h);                         /* detached */
+        trace("clone(thread) tid=%d stack=%p tls=%p", tid,
+              (void *)child_stack, (void *)ta->tls);
+        return tid;
+    }
+
+    case 435: /* clone3: report unsupported so glibc falls back to clone */
+        return -L_ENOSYS;
+
     case SYS_fork:
     case SYS_vfork:
-    case SYS_clone:
-        fprintf(stderr, "lxrun: fork/clone requires lxcore.sys "
+        fprintf(stderr, "lxrun: fork requires lxcore.sys "
                         "(see docs/process-model.md) -> -ENOSYS\n");
         return -L_ENOSYS;
 
@@ -1147,7 +1266,7 @@ static int64_t emulate(CONTEXT *c)
 
     case SYS_getpid:  return 1;
     case SYS_getppid: return 0;
-    case SYS_gettid:  return 1;
+    case SYS_gettid:  return t_tid;
     case SYS_getuid:  case SYS_geteuid: return 0;
     case SYS_getgid:  case SYS_getegid: return 0;
 
@@ -1210,11 +1329,161 @@ static int64_t emulate(CONTEXT *c)
         return (int64_t)t;
     }
 
-    case SYS_exit:
-    case SYS_exit_group:
+    case SYS_exit:                           /* this thread only */
+        if (t_clear_child_tid) {             /* CLONE_CHILD_CLEARTID: wake joiners */
+            __try { *(int *)t_clear_child_tid = 0; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (g_WakeByAddressAll) g_WakeByAddressAll((void *)t_clear_child_tid);
+        }
+        if (g_verbose) fprintf(stderr, "lxrun: thread %d exit(%lld)\n", t_tid, (int64_t)a0);
+        ExitThread((DWORD)a0);               /* does not return */
+
+    case SYS_exit_group:                     /* whole process */
         if (g_verbose) fprintf(stderr, "lxrun: guest exit_group(%lld)\n", (int64_t)a0);
         fflush(NULL);
         ExitProcess((UINT)a0);               /* does not return */
+
+    case SYS_futex: {
+        int op = (int)(a1 & 0x7f);           /* strip PRIVATE/CLOCK_REALTIME */
+        if (op == 0) {                       /* FUTEX_WAIT(uaddr, val, timeout) */
+            if (!g_WaitOnAddress) return -L_ENOSYS;
+            uint32_t val = (uint32_t)a2;
+            DWORD ms = INFINITE;
+            if (a3) __try {
+                uint64_t *ts = (uint64_t *)a3;
+                uint64_t m = ts[0] * 1000ULL + ts[1] / 1000000ULL;
+                ms = (m > 0xFFFFFFFEULL) ? INFINITE : (DWORD)m;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+            BOOL ok;
+            __try { ok = g_WaitOnAddress((volatile VOID *)a0, &val, 4, ms); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+            if (!ok && GetLastError() == ERROR_TIMEOUT) return -L_ETIMEDOUT;
+            return 0;
+        }
+        if (op == 1) {                       /* FUTEX_WAKE(uaddr, n) */
+            if (!g_WakeByAddressAll) return 0;
+            if (a2 == 1) { if (g_WakeByAddressSingle) g_WakeByAddressSingle((void *)a0); }
+            else g_WakeByAddressAll((void *)a0);
+            return (int64_t)a2;
+        }
+        return -L_ENOSYS;                    /* REQUEUE/WAKE_OP/PI unsupported */
+    }
+
+    case SYS_sched_yield:
+        SwitchToThread();
+        return 0;
+
+    case SYS_nanosleep:
+    case SYS_clock_nanosleep: {
+        uint64_t reqp = (nr == SYS_nanosleep) ? a0 : a2;
+        DWORD ms = 0;
+        if (reqp) __try {
+            uint64_t *ts = (uint64_t *)reqp;
+            ms = (DWORD)(ts[0] * 1000ULL + ts[1] / 1000000ULL);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        Sleep(ms);
+        return 0;
+    }
+
+    case SYS_dup: {
+        HANDLE h = (a0 < MAX_FDS) ? g_fds[a0] : NULL;
+        if (!h) return -L_EBADF;
+        HANDLE nh;
+        if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &nh,
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) return -L_EBADF;
+        int fd = alloc_fd(nh);
+        if (fd < 0) { CloseHandle(nh); return -L_ENOMEM; }
+        return fd;
+    }
+
+    case SYS_dup2:
+    case SYS_dup3: {
+        HANDLE h = (a0 < MAX_FDS) ? g_fds[a0] : NULL;
+        if (!h || a1 >= MAX_FDS) return -L_EBADF;
+        if (a0 == a1) return (int64_t)a1;
+        if (g_fds[a1] && a1 > 2) CloseHandle(g_fds[a1]);
+        HANDLE nh;
+        if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &nh,
+                             0, FALSE, DUPLICATE_SAME_ACCESS)) return -L_EBADF;
+        g_fds[a1] = nh;
+        return (int64_t)a1;
+    }
+
+    case SYS_fcntl: {
+        switch ((int)a1) {                   /* cmd */
+        case 0: {                            /* F_DUPFD */
+            HANDLE h = (a0 < MAX_FDS) ? g_fds[a0] : NULL;
+            if (!h) return -L_EBADF;
+            HANDLE nh;
+            if (!DuplicateHandle(GetCurrentProcess(), h, GetCurrentProcess(), &nh,
+                                 0, FALSE, DUPLICATE_SAME_ACCESS)) return -L_EBADF;
+            int fd = alloc_fd(nh);
+            if (fd < 0) { CloseHandle(nh); return -L_ENOMEM; }
+            return fd;
+        }
+        case 1: return 0;                    /* F_GETFD -> no FD_CLOEXEC */
+        case 2: return 0;                    /* F_SETFD */
+        case 3: return 2;                    /* F_GETFL -> O_RDWR */
+        case 4: return 0;                    /* F_SETFL */
+        default: return 0;
+        }
+    }
+
+    case SYS_pipe:
+    case SYS_pipe2: {
+        HANDLE rd = NULL, wr = NULL;
+        if (!CreatePipe(&rd, &wr, NULL, 0)) return -L_ENOMEM;
+        int rfd = alloc_fd(rd), wfd = alloc_fd(wr);
+        if (rfd < 0 || wfd < 0) { CloseHandle(rd); CloseHandle(wr); return -L_ENOMEM; }
+        __try { int *p = (int *)a0; p[0] = rfd; p[1] = wfd; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        return 0;
+    }
+
+    case SYS_stat:
+    case SYS_lstat: {
+        char lp[1024];
+        if (!guest_strcpy(lp, sizeof(lp), a0)) return -L_EFAULT;
+        wchar_t wp[MAX_PATH]; translate_path(lp, wp, MAX_PATH);
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (!GetFileAttributesExW(wp, GetFileExInfoStandard, &fad)) return -L_ENOENT;
+        int isdir = (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        int64_t size = ((int64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+        __try {
+            unsigned char *s = (unsigned char *)a1;
+            memset(s, 0, 144);
+            *(uint32_t *)(s + 24) = (isdir ? 0040000u : 0100000u) | 0644u; /* st_mode */
+            *(int64_t  *)(s + 48) = isdir ? 0 : size;                      /* st_size */
+            *(int64_t  *)(s + 56) = 4096;                                  /* st_blksize */
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        return 0;
+    }
+
+    case SYS_getcwd: {
+        __try {
+            char *b = (char *)a0;
+            if (a1 < 2) return -L_EINVAL;
+            b[0] = '/'; b[1] = 0;            /* cwd tracking is a prototype TODO */
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        return 2;                            /* length incl. NUL */
+    }
+
+    case SYS_chdir:
+        return 0;                            /* accepted, not tracked (prototype) */
+
+    case SYS_madvise:
+        return 0;
+
+    case SYS_sched_getaffinity: {
+        __try { if (a2) { unsigned char *m = (unsigned char *)a2; m[0] = 1; } }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        return 8;                            /* bytes written */
+    }
+
+    case SYS_clock_getres: {
+        if (a1) __try { uint64_t *ts = (uint64_t *)a1; ts[0] = 0; ts[1] = 1; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        return 0;
+    }
 
     default:
         fprintf(stderr, "lxrun: UNIMPLEMENTED syscall %llu "
@@ -1243,20 +1512,20 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
             uint64_t nr = c->Rax;            /* Linux syscall number */
 
             if (nr == SYS_rt_sigreturn) {    /* restore pre-signal context */
-                if (g_sigsp > 0) {
-                    g_sigsp--;
-                    uint64_t ob = g_sigstack[g_sigsp].oldblocked;
-                    *c = g_sigstack[g_sigsp].ctx;
-                    g_blocked = ob;
+                if (t_sigsp > 0) {
+                    t_sigsp--;
+                    uint64_t ob = t_sigstack[t_sigsp].oldblocked;
+                    *c = t_sigstack[t_sigsp].ctx;
+                    t_blocked = ob;
                 }
-                g_wrfs(g_fsbase);
+                g_wrfs(t_fsbase);
                 return EXCEPTION_CONTINUE_EXECUTION;   /* c fully restored */
             }
 
             if (nr == SYS_execve) {          /* replaces image; sets c on success */
                 int64_t r = do_execve(c);
                 if (r != 0) { c->Rax = (uint64_t)r; c->Rip = rip + 2; }
-                g_wrfs(g_fsbase);
+                g_wrfs(t_fsbase);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
@@ -1264,7 +1533,7 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
             c->Rax = (uint64_t)r;
             c->Rip = rip + 2;                /* step over the ud2 */
             deliver_pending(c);              /* signals delivered on return to user */
-            g_wrfs(g_fsbase);      /* re-assert TLS base across the resume */
+            g_wrfs(t_fsbase);      /* re-assert TLS base across the resume */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -1278,9 +1547,9 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
                 : (er->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION)      ? 4   /* SIGILL  */
                                                                          : 11;
         if (g_sig[sig].handler != SIG_DFL && g_sig[sig].handler != SIG_IGN) {
-            g_pending |= 1ULL << (sig - 1);
+            t_pending |= 1ULL << (sig - 1);
             deliver_pending(c);
-            g_wrfs(g_fsbase);
+            g_wrfs(t_fsbase);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -1291,7 +1560,7 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
                     "rax=%llx rdi=%llx rsi=%llx rsp=%p fsbase=%p want=%p -> signal %d\n",
                     acc, (void *)er->ExceptionInformation[1], (void *)rip,
                     c->Rax, c->Rdi, c->Rsi, (void *)c->Rsp,
-                    (void *)g_rdfs(), (void *)g_fsbase, sig);
+                    (void *)g_rdfs(), (void *)t_fsbase, sig);
         } else {
             fprintf(stderr, "lxrun: guest fault code=0x%08lx at rip=%p "
                     "(rax=%llx rdi=%llx rsi=%llx) fsbase=%p -> signal %d\n",
@@ -1356,7 +1625,9 @@ int main(int argc, char **argv)
         g_self_hi = g_self_lo + nt->OptionalHeader.SizeOfImage;
     }
 
+    InitializeCriticalSection(&g_lock);
     init_fsbase_stubs();
+    init_thread_support();
     init_signals();
     load_symlinks();
 

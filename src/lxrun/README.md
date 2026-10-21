@@ -81,15 +81,33 @@ next — expected as real libraries pull in more of the syscall surface.
 
 ## Implemented syscalls
 
-`read write open/openat close lseek pread64 fstat/newfstatat ioctl
-access/faccessat brk mmap mprotect munmap arch_prctl set_tid_address
+`read write open/openat close lseek pread64 stat/lstat/fstat/newfstatat ioctl
+access/faccessat brk mmap mprotect munmap madvise arch_prctl set_tid_address
 set_robust_list getpid/getppid/gettid getuid/geteuid/getgid/getegid uname
-readlink getrandom gettimeofday clock_gettime time prlimit64 rseq
-exit/exit_group`
+readlink getcwd chdir getrandom gettimeofday clock_gettime/clock_getres
+nanosleep/clock_nanosleep time prlimit64 rseq exit/exit_group`
+
+Threads (Step 2): `clone` (thread: `CLONE_VM|CLONE_THREAD|CLONE_SETTLS`, with
+`PARENT_SETTID`/`CHILD_SETTID`/`CHILD_CLEARTID`), `futex` (WAIT/WAKE via
+`WaitOnAddress`/`WakeByAddress`), `sched_yield`, `sched_getaffinity`, plus
+`dup`/`dup2`/`dup3`, `fcntl`, `pipe`/`pipe2`. `exit` ends one thread (and does
+the `CHILD_CLEARTID` futex wake for `pthread_join`); `exit_group` ends the
+process. `fork`/`vfork` and `clone` without `CLONE_VM` still return `-ENOSYS`
+(Step 3 / driver).
+
+Each Linux thread is a Windows thread; per-thread TLS (`%fs` base), signal
+masks and signal frames are thread-local. A critical section guards the fd
+table and `brk`; blocking syscalls (`futex`, `nanosleep`) do not hold it.
 
 `mmap` supports anonymous, file-backed, and the `ld.so`
 reserve-then-`MAP_FIXED` overlay pattern; `mmap`/`mprotect` rewrite `syscall`
 sites in any region that becomes executable (so libraries work).
+
+Thread test — `test/threads.c` (a musl pthreads program):
+
+```
+lxrun -v --root C:\rootfs C:\rootfs\threads     REM expect counter = 400000
+```
 
 Process & signals (see below): `execve rt_sigaction rt_sigprocmask kill tgkill
 rt_sigreturn sigaltstack`. `fork`/`vfork`/`clone` return `-ENOSYS` and `wait4`
