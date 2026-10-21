@@ -225,6 +225,14 @@ static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* main image span (info)     *
 static uint64_t g_self_lo = 0, g_self_hi = 0;    /* lxrun.exe's own module range */
 static uint64_t g_fsbase = 0;                    /* guest %fs base (TLS pointer) */
 
+/* 64-bit wrfsbase/rdfsbase via a machine-code stub, bypassing compiler
+ * intrinsics (VS2012's _writefsbase_u64 can emit the 32-bit form, which
+ * zero-extends and truncates a high TLS pointer). Set up by init_fsbase_stubs. */
+typedef void     (*wrfs_fn)(uint64_t);
+typedef uint64_t (*rdfs_fn)(void);
+static wrfs_fn g_wrfs = 0;
+static rdfs_fn g_rdfs = 0;
+
 /* Current image regions, for execve teardown. */
 static uint64_t g_image_base = 0;   /* reserved PIE region base; 0 if ET_EXEC */
 static int      g_image_is_dyn = 0;
@@ -604,6 +612,21 @@ static uint64_t build_stack(const loaded_t *ld, int argc, char **argv,
 /*  Process + signal helpers                                                  */
 /* ========================================================================= */
 
+static void init_fsbase_stubs(void)
+{
+    /* wrfsbase rcx ; ret   (RCX = Win64 first arg)   -> set 64-bit FS base */
+    static const unsigned char wr[] = { 0xF3, 0x48, 0x0F, 0xAE, 0xD1, 0xC3 };
+    /* rdfsbase rax ; ret                             -> read 64-bit FS base */
+    static const unsigned char rd[] = { 0xF3, 0x48, 0x0F, 0xAE, 0xC0, 0xC3 };
+    unsigned char *page = (unsigned char *)VirtualAlloc(NULL, 0x1000,
+                               MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!page) die("cannot allocate fsbase stub page");
+    memcpy(page, wr, sizeof(wr));
+    memcpy(page + 16, rd, sizeof(rd));
+    g_wrfs = (wrfs_fn)page;
+    g_rdfs = (rdfs_fn)(page + 16);
+}
+
 static void init_signals(void)
 {
     /* Trampoline a handler returns to when no SA_RESTORER is set:
@@ -953,12 +976,16 @@ static int64_t emulate(CONTEXT *c)
     case SYS_arch_prctl:
         if (a0 == ARCH_SET_FS) {
             g_fsbase = a1;                    /* remember to re-assert on resume */
-            _writefsbase_u64(a1);             /* set guest thread pointer */
-            trace("arch_prctl(SET_FS, %p)", (void*)a1);
+            g_wrfs(a1);                       /* set guest thread pointer (64-bit) */
+            if (g_verbose) {
+                uint64_t rb = g_rdfs();
+                fprintf(stderr, "  [tls] arch_prctl(SET_FS, %p) readback=%p%s\n",
+                        (void *)a1, (void *)rb, rb == a1 ? "" : "  <-- TRUNCATED");
+            }
             return 0;
         }
         if (a0 == ARCH_GET_FS) {
-            __try { *(uint64_t *)a1 = _readfsbase_u64(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+            __try { *(uint64_t *)a1 = g_rdfs(); } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
             return 0;
         }
         return -L_EINVAL;
@@ -1120,14 +1147,14 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
                     *c = g_sigstack[g_sigsp].ctx;
                     g_blocked = ob;
                 }
-                _writefsbase_u64(g_fsbase);
+                g_wrfs(g_fsbase);
                 return EXCEPTION_CONTINUE_EXECUTION;   /* c fully restored */
             }
 
             if (nr == SYS_execve) {          /* replaces image; sets c on success */
                 int64_t r = do_execve(c);
                 if (r != 0) { c->Rax = (uint64_t)r; c->Rip = rip + 2; }
-                _writefsbase_u64(g_fsbase);
+                g_wrfs(g_fsbase);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
@@ -1135,7 +1162,7 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
             c->Rax = (uint64_t)r;
             c->Rip = rip + 2;                /* step over the ud2 */
             deliver_pending(c);              /* signals delivered on return to user */
-            _writefsbase_u64(g_fsbase);      /* re-assert TLS base across the resume */
+            g_wrfs(g_fsbase);      /* re-assert TLS base across the resume */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -1151,7 +1178,7 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
         if (g_sig[sig].handler != SIG_DFL && g_sig[sig].handler != SIG_IGN) {
             g_pending |= 1ULL << (sig - 1);
             deliver_pending(c);
-            _writefsbase_u64(g_fsbase);
+            g_wrfs(g_fsbase);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
@@ -1162,12 +1189,12 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
                     "rax=%llx rdi=%llx rsi=%llx rsp=%p fsbase=%p want=%p -> signal %d\n",
                     acc, (void *)er->ExceptionInformation[1], (void *)rip,
                     c->Rax, c->Rdi, c->Rsi, (void *)c->Rsp,
-                    (void *)_readfsbase_u64(), (void *)g_fsbase, sig);
+                    (void *)g_rdfs(), (void *)g_fsbase, sig);
         } else {
             fprintf(stderr, "lxrun: guest fault code=0x%08lx at rip=%p "
                     "(rax=%llx rdi=%llx rsi=%llx) fsbase=%p -> signal %d\n",
                     er->ExceptionCode, (void *)rip, c->Rax, c->Rdi, c->Rsi,
-                    (void *)_readfsbase_u64(), sig);
+                    (void *)g_rdfs(), sig);
         }
         ExitProcess(128 + sig);
     }
@@ -1225,6 +1252,7 @@ int main(int argc, char **argv)
         g_self_hi = g_self_lo + nt->OptionalHeader.SizeOfImage;
     }
 
+    init_fsbase_stubs();
     init_signals();
 
     loaded_t ld;
