@@ -8,7 +8,7 @@ SRC     = lxinit.c
 
 CC      = cl
 LINK    = link
-CFLAGS  = /c /GS- /O2 /Zl /W4 /nologo
+CFLAGS  = /c /GS- /Gs1000000 /O2 /Zl /W4 /nologo
 LFLAGS  = /nologo /SUBSYSTEM:NATIVE,5.02 /ENTRY:NtProcessStartup \
           /NODEFAULTLIB /MACHINE:X64
 LIBS    = ntdll.lib

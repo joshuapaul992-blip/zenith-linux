@@ -20,7 +20,7 @@
  * whichever ELF64 it finds first.
  *
  * Build (Windows DDK / MSVC x64):
- *     cl /c /GS- /O2 /Zl /W4 lxinit.c
+ *     cl /c /GS- /Gs1000000 /O2 /Zl /W4 lxinit.c
  *     link /SUBSYSTEM:NATIVE,5.02 /ENTRY:NtProcessStartup /NODEFAULTLIB ^
  *          /MACHINE:X64 lxinit.obj ntdll.lib /OUT:lxinit.exe
  *
@@ -557,10 +557,13 @@ VOID NTAPI NtProcessStartup(PSTARTUP_ARGUMENTS StartupArguments)
     SIZE_T   imageSize = 0;
     NTSTATUS st;
     WCHAR    hexbuf[19];
-    WCHAR    usedRel[PATH_MAX_WCH];
-    WCHAR    rootfsDos[PATH_MAX_WCH];
-    WCHAR    initRel[PATH_MAX_WCH];
-    WCHAR    ntPrefix[PATH_MAX_WCH];
+    /* static (not stack): keeps this frame under a page so the compiler emits
+     * no __chkstk (unavailable with /NODEFAULTLIB), and spares the limited
+     * boot stack. Safe: NtProcessStartup is the single-threaded entry point. */
+    static WCHAR usedRel[PATH_MAX_WCH];
+    static WCHAR rootfsDos[PATH_MAX_WCH];
+    static WCHAR initRel[PATH_MAX_WCH];
+    static WCHAR ntPrefix[PATH_MAX_WCH];
     ULONG    prefLen = 0;
     ULONG    x11val = 0;
     BOOLEAN  haveInitRel = 0;

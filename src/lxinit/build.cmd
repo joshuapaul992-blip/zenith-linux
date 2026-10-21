@@ -15,11 +15,13 @@ set SRC=lxinit.c
 set OUT=lxinit.exe
 set OBJ=lxinit.obj
 
+rem /Gs1000000 raises the stack-probe threshold so the compiler never emits a
+rem __chkstk call (that routine lives in the CRT, which /NODEFAULTLIB excludes).
 if /i "%~1"=="debug" (
-    set CFLAGS=/c /GS- /Od /Zi /Zl /W4 /nologo
+    set CFLAGS=/c /GS- /Gs1000000 /Od /Zi /Zl /W4 /nologo
     set LFLAGS=/DEBUG
 ) else (
-    set CFLAGS=/c /GS- /O2 /Zl /W4 /nologo
+    set CFLAGS=/c /GS- /Gs1000000 /O2 /Zl /W4 /nologo
     set LFLAGS=
 )
 
