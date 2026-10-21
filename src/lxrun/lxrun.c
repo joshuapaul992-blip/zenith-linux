@@ -223,6 +223,7 @@ static uint64_t g_brk_base = 0, g_brk_cur = 0, g_brk_end = 0;
 
 static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* main image span (info)     */
 static uint64_t g_self_lo = 0, g_self_hi = 0;    /* lxrun.exe's own module range */
+static uint64_t g_fsbase = 0;                    /* guest %fs base (TLS pointer) */
 
 /* Current image regions, for execve teardown. */
 static uint64_t g_image_base = 0;   /* reserved PIE region base; 0 if ET_EXEC */
@@ -718,6 +719,7 @@ static int do_execve(CONTEXT *c)
             g_sig[s].restorer = 0;      g_sig[s].mask = 0;
         }
     g_sigsp = 0;
+    g_fsbase = 0;          /* new image sets up its own TLS */
 
     c->Rip = ld.entry; c->Rsp = rsp;
     c->Rax = c->Rbx = c->Rcx = c->Rdx = c->Rsi = c->Rdi = c->Rbp = 0;
@@ -950,6 +952,7 @@ static int64_t emulate(CONTEXT *c)
 
     case SYS_arch_prctl:
         if (a0 == ARCH_SET_FS) {
+            g_fsbase = a1;                    /* remember to re-assert on resume */
             _writefsbase_u64(a1);             /* set guest thread pointer */
             trace("arch_prctl(SET_FS, %p)", (void*)a1);
             return 0;
@@ -1117,12 +1120,14 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
                     *c = g_sigstack[g_sigsp].ctx;
                     g_blocked = ob;
                 }
+                _writefsbase_u64(g_fsbase);
                 return EXCEPTION_CONTINUE_EXECUTION;   /* c fully restored */
             }
 
             if (nr == SYS_execve) {          /* replaces image; sets c on success */
                 int64_t r = do_execve(c);
                 if (r != 0) { c->Rax = (uint64_t)r; c->Rip = rip + 2; }
+                _writefsbase_u64(g_fsbase);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
 
@@ -1130,6 +1135,7 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
             c->Rax = (uint64_t)r;
             c->Rip = rip + 2;                /* step over the ud2 */
             deliver_pending(c);              /* signals delivered on return to user */
+            _writefsbase_u64(g_fsbase);      /* re-assert TLS base across the resume */
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -1145,11 +1151,24 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
         if (g_sig[sig].handler != SIG_DFL && g_sig[sig].handler != SIG_IGN) {
             g_pending |= 1ULL << (sig - 1);
             deliver_pending(c);
+            _writefsbase_u64(g_fsbase);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
-        fprintf(stderr, "lxrun: guest fault code=0x%08lx at rip=%p "
-                "(rax=%llx rdi=%llx rsi=%llx) -> signal %d\n",
-                er->ExceptionCode, (void *)rip, c->Rax, c->Rdi, c->Rsi, sig);
+        if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+            const char *acc = er->ExceptionInformation[0] == 0 ? "read"
+                            : er->ExceptionInformation[0] == 1 ? "write"
+                            : er->ExceptionInformation[0] == 8 ? "exec" : "?";
+            fprintf(stderr, "lxrun: guest fault AV(%s) addr=%p rip=%p "
+                    "rax=%llx rdi=%llx rsi=%llx rsp=%p fsbase=%p want=%p -> signal %d\n",
+                    acc, (void *)er->ExceptionInformation[1], (void *)rip,
+                    c->Rax, c->Rdi, c->Rsi, (void *)c->Rsp,
+                    (void *)_readfsbase_u64(), (void *)g_fsbase, sig);
+        } else {
+            fprintf(stderr, "lxrun: guest fault code=0x%08lx at rip=%p "
+                    "(rax=%llx rdi=%llx rsi=%llx) fsbase=%p -> signal %d\n",
+                    er->ExceptionCode, (void *)rip, c->Rax, c->Rdi, c->Rsi,
+                    (void *)_readfsbase_u64(), sig);
+        }
         ExitProcess(128 + sig);
     }
     return EXCEPTION_CONTINUE_SEARCH;         /* not ours (harness bug) */
