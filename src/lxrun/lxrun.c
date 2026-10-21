@@ -220,6 +220,13 @@ static int      g_verbose = 0;
 static wchar_t  g_root[MAX_PATH] = L"";   /* guest "/" -> this Windows dir   */
 static char     g_root_mb[MAX_PATH] = ""; /* same, as the caller typed it     */
 
+/* Symlink manifest (<root>/.lxsymlinks): resolve Linux symlinks ourselves
+ * instead of relying on Windows to represent Unix symlinks. */
+#define MAX_LINKS 1024
+static char g_link_from[MAX_LINKS][256];  /* normalized absolute link path     */
+static char g_link_to[MAX_LINKS][256];    /* target (absolute or relative)     */
+static int  g_nlinks = 0;
+
 static uint64_t g_brk_base = 0, g_brk_cur = 0, g_brk_end = 0;
 
 static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* main image span (info)     */
@@ -320,12 +327,106 @@ static int guest_strcpy(char *dst, size_t cap, uint64_t gptr)
     }
 }
 
-/* Translate a Linux path under g_root into a Windows path. */
+/* Normalize an absolute-ish Linux path: collapse //, resolve . and .. */
+static void norm_abs(const char *in, char *out, size_t cap)
+{
+    const char *seg[128]; int slen[128], n = 0;
+    const char *p = in;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *s = p;
+        while (*p && *p != '/') p++;
+        int len = (int)(p - s);
+        if (len == 1 && s[0] == '.') continue;
+        if (len == 2 && s[0] == '.' && s[1] == '.') { if (n > 0) n--; continue; }
+        if (n < 128) { seg[n] = s; slen[n] = len; n++; }
+    }
+    size_t j = 0;
+    if (j < cap - 1) out[j++] = '/';
+    for (int k = 0; k < n; k++) {
+        if (k > 0 && j < cap - 1) out[j++] = '/';
+        for (int m = 0; m < slen[k] && j < cap - 1; m++) out[j++] = seg[k][m];
+    }
+    out[j] = 0;
+}
+
+/* Resolve any symlinks in a Linux path using the manifest (bounded loop). */
+static void resolve_symlinks(const char *lpath, char *out, size_t cap)
+{
+    char cur[1024];
+    norm_abs(lpath, cur, sizeof(cur));
+    for (int it = 0; it < 20 && g_nlinks; it++) {
+        int f = -1;
+        for (int k = 0; k < g_nlinks; k++)
+            if (strcmp(g_link_from[k], cur) == 0) { f = k; break; }
+        if (f < 0) break;
+        const char *t = g_link_to[f];
+        char next[1024];
+        if (t[0] == '/') {
+            _snprintf(next, sizeof(next), "%s", t);
+        } else {                              /* relative to the link's dir */
+            char dir[1024];
+            _snprintf(dir, sizeof(dir), "%s", cur);
+            char *s = strrchr(dir, '/'); if (s) *s = 0; else dir[0] = 0;
+            _snprintf(next, sizeof(next), "%s/%s", dir, t);
+        }
+        next[sizeof(next) - 1] = 0;
+        norm_abs(next, cur, sizeof(cur));
+    }
+    _snprintf(out, cap, "%s", cur);
+    out[cap - 1] = 0;
+}
+
+/* Load <root>/.lxsymlinks: lines of "linkpath\ttarget". */
+static void load_symlinks(void)
+{
+    if (!g_root[0]) return;
+    wchar_t wp[MAX_PATH];
+    _snwprintf(wp, MAX_PATH, L"%s\\.lxsymlinks", g_root); wp[MAX_PATH - 1] = 0;
+    HANDLE h = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ, NULL,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (1 << 24)) {
+        CloseHandle(h); return;
+    }
+    char *buf = (char *)malloc((size_t)sz.QuadPart + 1);
+    if (!buf) { CloseHandle(h); return; }
+    DWORD got = 0; size_t tot = 0;
+    while (tot < (size_t)sz.QuadPart) {
+        if (!ReadFile(h, buf + tot, (DWORD)(sz.QuadPart - tot), &got, NULL) || !got) break;
+        tot += got;
+    }
+    buf[tot] = 0; CloseHandle(h);
+
+    char *line = buf;
+    while (*line && g_nlinks < MAX_LINKS) {
+        char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0;
+        char *tab = strchr(line, '\t');
+        if (tab) {
+            *tab = 0;
+            norm_abs(line, g_link_from[g_nlinks], sizeof(g_link_from[0]));
+            _snprintf(g_link_to[g_nlinks], sizeof(g_link_to[0]), "%s", tab + 1);
+            g_link_to[g_nlinks][sizeof(g_link_to[0]) - 1] = 0;
+            g_nlinks++;
+        }
+        if (!nl) break;
+        line = nl + 1;
+        while (*line == '\r' || *line == '\n') line++;
+    }
+    free(buf);
+    if (g_verbose) fprintf(stderr, "lxrun: loaded %d symlink manifest entries\n", g_nlinks);
+}
+
+/* Translate a Linux path under g_root into a Windows path (resolving symlinks). */
 static void translate_path(const char *lpath, wchar_t *out, size_t outcap)
 {
+    char resolved[1024];
+    resolve_symlinks(lpath, resolved, sizeof(resolved));
     wchar_t rel[MAX_PATH];
     size_t i = 0;
-    const char *p = lpath;
+    const char *p = resolved;
     if (*p == '/') p++;                       /* strip leading slash */
     for (; p[i] && i + 1 < MAX_PATH; i++)
         rel[i] = (p[i] == '/') ? L'\\' : (wchar_t)(unsigned char)p[i];
@@ -1257,22 +1358,14 @@ int main(int argc, char **argv)
 
     init_fsbase_stubs();
     init_signals();
+    load_symlinks();
 
-    loaded_t ld;
-    load_elf(elf_w, &ld);
-
-    /* Guest argv = [elf basename or path] + remaining host args. */
-    int gargc = argc - i;
-    char *gargv[64];
-    for (int k = 0; k < gargc && k < 64; k++) gargv[k] = argv[i + k];
-
-    /* Guest argv[0] must look like a Linux path, not the Windows one we were
-     * invoked with -- otherwise argv[0]-dispatching programs (busybox) can't
-     * find their applet. Strip the --root prefix and flip '\\' to '/'; fall
-     * back to the basename. */
+    /* Derive the guest argv[0] as a Linux path (not the Windows invocation
+     * path), so argv[0]-dispatching programs (busybox) find their applet.
+     * Strip the --root prefix and flip '\\' to '/'; basename fallback. */
     static char argv0[1024];
     {
-        const char *elf = gargv[0];
+        const char *elf = elf_mb;
         size_t rl = strlen(g_root_mb);
         if (rl && _strnicmp(elf, g_root_mb, (int)rl) == 0) {
             const char *rest = elf + rl;
@@ -1288,9 +1381,22 @@ int main(int argc, char **argv)
             for (const char *p = elf; *p; p++) if (*p == '\\' || *p == '/') bn = p + 1;
             strncpy(argv0, bn, sizeof(argv0) - 1); argv0[sizeof(argv0) - 1] = 0;
         }
-        gargv[0] = argv0;
         if (g_verbose) fprintf(stderr, "lxrun: guest argv[0] = \"%s\"\n", argv0);
     }
+
+    /* Load the binary through the symlink resolver: /bin/sh -> real busybox,
+     * while argv[0] stays /bin/sh so busybox runs the sh applet. */
+    if (g_root[0]) translate_path(argv0, elf_w, MAX_PATH);
+
+    loaded_t ld;
+    load_elf(elf_w, &ld);
+
+    /* Guest argv = [argv0] + remaining host args. */
+    int gargc = argc - i;
+    char *gargv[64];
+    for (int k = 0; k < gargc && k < 64; k++) gargv[k] = argv[i + k];
+    gargv[0] = argv0;
+
     static char *defenv[] = {
         "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
         "TERM=linux", "HOME=/root", "PWD=/", "USER=root",
