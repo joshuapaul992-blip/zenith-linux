@@ -218,6 +218,7 @@ typedef struct {
 
 static int      g_verbose = 0;
 static wchar_t  g_root[MAX_PATH] = L"";   /* guest "/" -> this Windows dir   */
+static char     g_root_mb[MAX_PATH] = ""; /* same, as the caller typed it     */
 
 static uint64_t g_brk_base = 0, g_brk_cur = 0, g_brk_end = 0;
 
@@ -1220,7 +1221,9 @@ int main(int argc, char **argv)
     for (; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0) g_verbose = 1;
         else if (strcmp(argv[i], "--root") == 0 && i + 1 < argc) {
-            MultiByteToWideChar(CP_UTF8, 0, argv[++i], -1, g_root, MAX_PATH);
+            i++;
+            MultiByteToWideChar(CP_UTF8, 0, argv[i], -1, g_root, MAX_PATH);
+            strncpy(g_root_mb, argv[i], MAX_PATH - 1); g_root_mb[MAX_PATH - 1] = 0;
         } else break;
     }
     if (i >= argc) {
@@ -1262,6 +1265,32 @@ int main(int argc, char **argv)
     int gargc = argc - i;
     char *gargv[64];
     for (int k = 0; k < gargc && k < 64; k++) gargv[k] = argv[i + k];
+
+    /* Guest argv[0] must look like a Linux path, not the Windows one we were
+     * invoked with -- otherwise argv[0]-dispatching programs (busybox) can't
+     * find their applet. Strip the --root prefix and flip '\\' to '/'; fall
+     * back to the basename. */
+    static char argv0[1024];
+    {
+        const char *elf = gargv[0];
+        size_t rl = strlen(g_root_mb);
+        if (rl && _strnicmp(elf, g_root_mb, (int)rl) == 0) {
+            const char *rest = elf + rl;
+            size_t j = 0; argv0[j++] = '/';
+            for (const char *p = rest; *p && j < sizeof(argv0) - 1; p++) {
+                char c = (*p == '\\') ? '/' : *p;
+                if (c == '/' && j > 0 && argv0[j - 1] == '/') continue;  /* collapse */
+                argv0[j++] = c;
+            }
+            argv0[j] = 0;
+        } else {
+            const char *bn = elf;
+            for (const char *p = elf; *p; p++) if (*p == '\\' || *p == '/') bn = p + 1;
+            strncpy(argv0, bn, sizeof(argv0) - 1); argv0[sizeof(argv0) - 1] = 0;
+        }
+        gargv[0] = argv0;
+        if (g_verbose) fprintf(stderr, "lxrun: guest argv[0] = \"%s\"\n", argv0);
+    }
     static char *defenv[] = {
         "PATH=/bin:/sbin:/usr/bin:/usr/sbin",
         "TERM=linux", "HOME=/root", "PWD=/", "USER=root",
