@@ -186,6 +186,9 @@ typedef struct {
 #define SYS_getppid 110
 #define SYS_sigaltstack 131
 #define SYS_tgkill 234
+#define SYS_pread64 17
+#define SYS_faccessat 269
+#define SYS_faccessat2 439
 
 #define ARCH_SET_FS 0x1002
 #define ARCH_GET_FS 0x1003
@@ -196,6 +199,14 @@ typedef struct {
 #define SA_NODEFER  0x40000000
 #define SIG_DFL 0
 #define SIG_IGN 1
+
+/* mmap flags / prot bits */
+#define MAP_PRIVATE   0x02
+#define MAP_FIXED     0x10
+#define MAP_ANONYMOUS 0x20
+#define PROT_READ  1
+#define PROT_WRITE 2
+#define PROT_EXEC  4
 
 #define GUEST_STACK_SIZE (8 * 1024 * 1024)
 #define BRK_ARENA_SIZE   (256 * 1024 * 1024)
@@ -210,7 +221,8 @@ static wchar_t  g_root[MAX_PATH] = L"";   /* guest "/" -> this Windows dir   */
 
 static uint64_t g_brk_base = 0, g_brk_cur = 0, g_brk_end = 0;
 
-static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* image span for VEH filter */
+static uint64_t g_guest_lo = 0, g_guest_hi = 0;  /* main image span (info)     */
+static uint64_t g_self_lo = 0, g_self_hi = 0;    /* lxrun.exe's own module range */
 
 /* Current image regions, for execve teardown. */
 static uint64_t g_image_base = 0;   /* reserved PIE region base; 0 if ET_EXEC */
@@ -327,11 +339,26 @@ static int alloc_fd(HANDLE h)
 /* ========================================================================= */
 
 typedef struct {
-    uint64_t entry;       /* absolute entry point (bias applied)            */
-    uint64_t phdr_va;     /* absolute address of program headers in memory  */
+    uint64_t entry;       /* where to jump (interpreter entry if dynamic)   */
+    uint64_t main_entry;  /* the main executable's own entry (AT_ENTRY)     */
+    uint64_t at_base;     /* interpreter load base (AT_BASE), 0 if static   */
+    uint64_t phdr_va;     /* main executable's program headers in memory    */
     uint16_t phent, phnum;
     int      is_dyn;
 } loaded_t;
+
+/* One mapped ELF object (main executable or the ld.so interpreter). */
+typedef struct {
+    uint64_t bias;        /* load bias (0 for ET_EXEC)                      */
+    uint64_t base;        /* lowest mapped address                          */
+    uint64_t load_hi;     /* highest mapped address                         */
+    uint64_t entry;       /* bias + e_entry                                 */
+    uint64_t phdr_va;     /* program headers in memory                      */
+    uint16_t phent, phnum;
+    int      is_dyn;
+    int      has_interp;
+    char     interp[256]; /* PT_INTERP path, if present                     */
+} objinfo_t;
 
 static unsigned char *read_file(const wchar_t *path, size_t *outlen)
 {
@@ -353,30 +380,48 @@ static unsigned char *read_file(const wchar_t *path, size_t *outlen)
     return buf;
 }
 
-static void load_elf(const wchar_t *path, loaded_t *out)
+/* Rewrite every Linux syscall (0F 05) to ud2 (0F 0B) in a region. Used for
+ * loaded images and for executable memory the guest maps itself (libraries). */
+static int patch_syscalls(void *base, size_t len)
+{
+    unsigned char *b = (unsigned char *)base;
+    int n = 0;
+    for (size_t i = 0; i + 1 < len; i++)
+        if (b[i] == 0x0F && b[i + 1] == 0x05) { b[i + 1] = 0x0B; n++; }
+    return n;
+}
+
+/* Map one ELF object into memory: segments at bias, bss zeroed, syscalls
+ * rewritten, final protections applied. Static-PIE / dynamic objects are not
+ * relocated here (ld.so / self-reloc handle that). die()s on malformed input. */
+static void map_object(const wchar_t *path, objinfo_t *info)
 {
     size_t flen = 0;
     unsigned char *f = read_file(path, &flen);
-    if (flen < sizeof(Elf64_Ehdr)) die("file too small for ELF header");
+    if (flen < sizeof(Elf64_Ehdr)) die("file too small for ELF header: %ls", path);
 
     Elf64_Ehdr *eh = (Elf64_Ehdr *)f;
     if (!(eh->e_ident[0] == 0x7F && eh->e_ident[1] == 'E' &&
           eh->e_ident[2] == 'L' && eh->e_ident[3] == 'F'))
-        die("not an ELF file");
-    if (eh->e_ident[4] != 2)       die("not ELFCLASS64 (need 64-bit)");
-    if (eh->e_ident[5] != 1)       die("not little-endian");
-    if (eh->e_machine != EM_X86_64) die("not x86-64 (e_machine=0x%x)", eh->e_machine);
+        die("not an ELF file: %ls", path);
+    if (eh->e_ident[4] != 2)        die("not ELFCLASS64: %ls", path);
+    if (eh->e_ident[5] != 1)        die("not little-endian: %ls", path);
+    if (eh->e_machine != EM_X86_64) die("not x86-64 (e_machine=0x%x): %ls", eh->e_machine, path);
     if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN)
-        die("unsupported e_type %u (need ET_EXEC or static-PIE ET_DYN)", eh->e_type);
+        die("unsupported e_type %u: %ls", eh->e_type, path);
 
     Elf64_Phdr *ph = (Elf64_Phdr *)(f + eh->e_phoff);
+    memset(info, 0, sizeof(*info));
 
     for (int i = 0; i < eh->e_phnum; i++)
-        if (ph[i].p_type == PT_INTERP)
-            die("binary requests a dynamic loader (PT_INTERP) -- only static "
-                "binaries are supported; use a *static* busybox/init");
+        if (ph[i].p_type == PT_INTERP) {
+            size_t n = (size_t)ph[i].p_filesz;
+            if (n >= sizeof(info->interp)) n = sizeof(info->interp) - 1;
+            memcpy(info->interp, f + ph[i].p_offset, n);
+            info->interp[n] = 0;
+            info->has_interp = 1;
+        }
 
-    /* Compute vaddr span across PT_LOAD. */
     uint64_t vmin = ~0ULL, vmax = 0;
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
@@ -384,96 +429,104 @@ static void load_elf(const wchar_t *path, loaded_t *out)
         uint64_t end = ph[i].p_vaddr + ph[i].p_memsz;
         if (end > vmax) vmax = end;
     }
-    if (vmin == ~0ULL) die("no PT_LOAD segments");
+    if (vmin == ~0ULL) die("no PT_LOAD segments: %ls", path);
 
     uint64_t vlo = align_down(vmin, PAGE), vhi = align_up(vmax, PAGE);
-    uint64_t bias = 0;
     int is_dyn = (eh->e_type == ET_DYN);
-
-    g_image_base = 0;
-    g_image_is_dyn = is_dyn;
+    uint64_t bias = 0;
     if (is_dyn) {
-        /* Reserve the whole span, then commit per segment. Static-PIE
-         * relocates itself (PC-relative), so we do NOT apply relocations. */
         void *region = VirtualAlloc(NULL, (SIZE_T)(vhi - vlo), MEM_RESERVE, PAGE_NOACCESS);
-        if (!region) die("VirtualAlloc reserve %llu bytes failed (err %lu)",
-                         (unsigned long long)(vhi - vlo), GetLastError());
+        if (!region) die("reserve %llu bytes failed (err %lu): %ls",
+                         (unsigned long long)(vhi - vlo), GetLastError(), path);
         bias = (uint64_t)region - vlo;
-        g_image_base = (uint64_t)region;   /* freed on execve */
     }
 
-    g_guest_lo = bias + vlo;
-    g_guest_hi = bias + vhi;
-
-    /* Keep segment descriptors to apply final protections after patching. */
     typedef struct { uint64_t va; size_t len; uint32_t flags; } seg_t;
     seg_t segs[32]; int nseg = 0;
-
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
-        uint64_t seg_lo = align_down(ph[i].p_vaddr, PAGE);
-        uint64_t seg_hi = align_up(ph[i].p_vaddr + ph[i].p_memsz, PAGE);
-        void *addr = (void *)(bias + seg_lo);
-        DWORD atype = is_dyn ? MEM_COMMIT : (MEM_RESERVE | MEM_COMMIT);
-        void *got = VirtualAlloc(addr, (SIZE_T)(seg_hi - seg_lo), atype, PAGE_READWRITE);
-        if (!got || (uint64_t)got != (bias + seg_lo))
-            die("VirtualAlloc for segment at %p failed (err %lu)", addr, GetLastError());
-        /* copy file bytes; bss (memsz>filesz) is already zero-filled by VirtualAlloc */
+        uint64_t slo = align_down(ph[i].p_vaddr, PAGE);
+        uint64_t shi = align_up(ph[i].p_vaddr + ph[i].p_memsz, PAGE);
+        void *addr = (void *)(bias + slo);
+        DWORD at = is_dyn ? MEM_COMMIT : (MEM_RESERVE | MEM_COMMIT);
+        void *got = VirtualAlloc(addr, (SIZE_T)(shi - slo), at, PAGE_READWRITE);
+        if (!got || (uint64_t)got != bias + slo)
+            die("VirtualAlloc seg %p failed (err %lu): %ls", addr, GetLastError(), path);
         memcpy((void *)(bias + ph[i].p_vaddr), f + ph[i].p_offset, (size_t)ph[i].p_filesz);
         if (nseg < 32) {
-            segs[nseg].va = bias + seg_lo;
-            segs[nseg].len = (size_t)(seg_hi - seg_lo);
-            segs[nseg].flags = ph[i].p_flags;
-            nseg++;
+            segs[nseg].va = bias + slo; segs[nseg].len = (size_t)(shi - slo);
+            segs[nseg].flags = ph[i].p_flags; nseg++;
         }
     }
 
-    /* Rewrite syscall (0F 05) -> ud2 (0F 0B) in executable segments. */
     int patched = 0;
+    for (int s = 0; s < nseg; s++)
+        if (segs[s].flags & PF_X) patched += patch_syscalls((void *)segs[s].va, segs[s].len);
     for (int s = 0; s < nseg; s++) {
-        if (!(segs[s].flags & PF_X)) continue;
-        unsigned char *b = (unsigned char *)segs[s].va;
-        for (size_t i = 0; i + 1 < segs[s].len; i++) {
-            if (b[i] == 0x0F && b[i + 1] == 0x05) {
-                b[i + 1] = 0x0B;   /* 0F 05 -> 0F 0B */
-                patched++;
-            }
-        }
+        DWORD op;
+        if (!VirtualProtect((void *)segs[s].va, segs[s].len, prot_to_win(segs[s].flags), &op))
+            die("VirtualProtect failed (err %lu): %ls", GetLastError(), path);
     }
-    if (g_verbose) fprintf(stderr, "lxrun: rewrote %d syscall site(s) to ud2\n", patched);
+    if (g_verbose)
+        fprintf(stderr, "lxrun: mapped %ls bias=%p (%d syscall site(s))\n",
+                path, (void *)bias, patched);
 
-    /* Apply final page protections. */
-    for (int s = 0; s < nseg; s++) {
-        DWORD oldp, newp = prot_to_win(segs[s].flags);
-        if (!VirtualProtect((void *)segs[s].va, segs[s].len, newp, &oldp))
-            die("VirtualProtect failed (err %lu)", GetLastError());
-    }
-
-    /* AT_PHDR: locate the PT_LOAD that maps e_phoff, map it to a vaddr. */
-    uint64_t phdr_va = bias + eh->e_phoff;   /* fallback */
+    uint64_t phdr_va = bias + eh->e_phoff;
     for (int i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type != PT_LOAD) continue;
-        if (eh->e_phoff >= ph[i].p_offset &&
-            eh->e_phoff <  ph[i].p_offset + ph[i].p_filesz) {
+        if (eh->e_phoff >= ph[i].p_offset && eh->e_phoff < ph[i].p_offset + ph[i].p_filesz) {
             phdr_va = bias + ph[i].p_vaddr + (eh->e_phoff - ph[i].p_offset);
             break;
         }
     }
 
-    out->entry   = bias + eh->e_entry;
-    out->phdr_va = phdr_va;
-    out->phent   = eh->e_phentsize;
-    out->phnum   = eh->e_phnum;
-    out->is_dyn  = is_dyn;
+    info->bias = bias; info->base = bias + vlo; info->load_hi = bias + vhi;
+    info->entry = bias + eh->e_entry; info->phdr_va = phdr_va;
+    info->phent = eh->e_phentsize; info->phnum = eh->e_phnum; info->is_dyn = is_dyn;
+    free(f);
+}
 
-    /* Program break starts above the image. */
-    void *arena = VirtualAlloc((void *)g_guest_hi, BRK_ARENA_SIZE, MEM_RESERVE, PAGE_NOACCESS);
+static void load_elf(const wchar_t *path, loaded_t *out)
+{
+    objinfo_t m;
+    map_object(path, &m);
+
+    g_image_base   = m.is_dyn ? m.base : 0;   /* PIE region, freed on execve */
+    g_image_is_dyn = m.is_dyn;
+    g_guest_lo = m.base; g_guest_hi = m.load_hi;
+
+    uint64_t jump_entry = m.entry, at_base = 0, brk_anchor = m.load_hi;
+
+    if (m.has_interp) {
+        wchar_t wp[MAX_PATH];
+        translate_path(m.interp, wp, MAX_PATH);
+        objinfo_t it;
+        map_object(wp, &it);               /* the ld.so interpreter */
+        jump_entry = it.entry;             /* control starts in ld.so */
+        at_base    = it.base;              /* AT_BASE                 */
+        if (it.load_hi > brk_anchor) brk_anchor = it.load_hi;
+        if (it.base    < g_guest_lo) g_guest_lo = it.base;
+        if (it.load_hi > g_guest_hi) g_guest_hi = it.load_hi;
+        if (g_verbose)
+            fprintf(stderr, "lxrun: dynamic; interp=%s base=%p entry=%p\n",
+                    m.interp, (void *)at_base, (void *)jump_entry);
+    }
+
+    out->entry      = jump_entry;
+    out->main_entry = m.entry;
+    out->at_base    = at_base;
+    out->phdr_va    = m.phdr_va;
+    out->phent      = m.phent;
+    out->phnum      = m.phnum;
+    out->is_dyn     = m.is_dyn;
+
+    /* Program break above everything mapped. */
+    void *arena = VirtualAlloc((void *)align_up(brk_anchor, PAGE), BRK_ARENA_SIZE,
+                               MEM_RESERVE, PAGE_NOACCESS);
     if (!arena) arena = VirtualAlloc(NULL, BRK_ARENA_SIZE, MEM_RESERVE, PAGE_NOACCESS);
     if (!arena) die("cannot reserve brk arena");
     g_brk_base = g_brk_cur = (uint64_t)arena;
     g_brk_end  = g_brk_base + BRK_ARENA_SIZE;
-
-    free(f);
 }
 
 /* ========================================================================= */
@@ -518,9 +571,9 @@ static uint64_t build_stack(const loaded_t *ld, int argc, char **argv,
     AUX(AT_PHENT, ld->phent);
     AUX(AT_PHNUM, ld->phnum);
     AUX(AT_PAGESZ, PAGE);
-    AUX(AT_BASE, 0);
+    AUX(AT_BASE, ld->at_base);
     AUX(AT_FLAGS, 0);
-    AUX(AT_ENTRY, ld->entry);
+    AUX(AT_ENTRY, ld->main_entry);
     AUX(AT_UID, 0); AUX(AT_EUID, 0); AUX(AT_GID, 0); AUX(AT_EGID, 0);
     AUX(AT_CLKTCK, 100);
     AUX(AT_HWCAP, 0);
@@ -795,7 +848,30 @@ static int64_t emulate(CONTEXT *c)
         return -L_ENOTTY;
 
     case SYS_access:
-        return -L_ENOENT;
+    case SYS_faccessat:
+    case SYS_faccessat2: {
+        uint64_t pathp = (nr == SYS_access) ? a0 : a1;
+        char lp[1024];
+        if (!guest_strcpy(lp, sizeof(lp), pathp)) return -L_EFAULT;
+        wchar_t wp[MAX_PATH]; translate_path(lp, wp, MAX_PATH);
+        DWORD attr = GetFileAttributesW(wp);
+        return (attr == INVALID_FILE_ATTRIBUTES) ? -L_ENOENT : 0;
+    }
+
+    case SYS_pread64: {
+        HANDLE h = (a0 < MAX_FDS) ? g_fds[a0] : NULL;
+        if (!h) return -L_EBADF;
+        DWORD got = 0;
+        __try {
+            OVERLAPPED ov; memset(&ov, 0, sizeof(ov));
+            ov.Offset = (DWORD)a3; ov.OffsetHigh = (DWORD)(a3 >> 32);
+            if (!ReadFile(h, (void *)a1, (DWORD)a2, &got, &ov)) {
+                if (GetLastError() == ERROR_HANDLE_EOF) return 0;
+                return -L_EINVAL;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return -L_EFAULT; }
+        return (int64_t)got;
+    }
 
     case SYS_brk: {
         if (a0 == 0) return (int64_t)g_brk_cur;
@@ -813,25 +889,57 @@ static int64_t emulate(CONTEXT *c)
 
     case SYS_mmap: {
         uint64_t len = align_up(a1, PAGE);
-        DWORD prot = mmap_prot_to_win(a2);
-        int fixed = (a3 & 0x10) != 0;         /* MAP_FIXED */
-        void *want = fixed ? (void *)a0 : NULL;
-        void *got = VirtualAlloc(want, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, prot);
-        if (!got) return -L_ENOMEM;
-        /* File-backed: read the requested range into the mapping. */
+        if (len == 0) return -L_EINVAL;
+        int fixed = (a3 & MAP_FIXED) != 0;
+        int anon  = (a3 & MAP_ANONYMOUS) != 0;
         int64_t fd = (int64_t)a4;
-        if (fd >= 0 && fd < MAX_FDS && g_fds[fd]) {
-            LARGE_INTEGER off; off.QuadPart = (int64_t)a5;
-            SetFilePointerEx(g_fds[fd], off, NULL, FILE_BEGIN);
-            DWORD rd = 0; ReadFile(g_fds[fd], got, (DWORD)a1, &rd, NULL);
+        void *want = (fixed || a0) ? (void *)a0 : NULL;
+        DWORD finalprot = mmap_prot_to_win(a2);
+        void *got;
+
+        /* Pure reservation (ld.so reserves a library's whole span first). */
+        if (anon && a2 == 0 && !fixed) {
+            got = VirtualAlloc(want, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS);
+            if (!got && want) got = VirtualAlloc(NULL, (SIZE_T)len, MEM_RESERVE, PAGE_NOACCESS);
+            if (!got) return -L_ENOMEM;
+            trace("mmap(reserve %p, %llu) = %p", want, len, got);
+            return (int64_t)(uint64_t)got;
         }
-        trace("mmap(%p, %llu, prot=%llu) = %p", (void*)a0, a1, a2, got);
+
+        if (fixed) {   /* commit into an already-reserved region (MAP_FIXED overlay) */
+            got = VirtualAlloc(want, (SIZE_T)len, MEM_COMMIT, PAGE_READWRITE);
+            if (!got) got = VirtualAlloc(want, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        } else {
+            got = VirtualAlloc(want, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            if (!got && want) got = VirtualAlloc(NULL, (SIZE_T)len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
+        if (!got) return -L_ENOMEM;
+
+        if (!anon && fd >= 0 && fd < MAX_FDS && g_fds[fd]) {
+            __try {
+                OVERLAPPED ov; memset(&ov, 0, sizeof(ov));
+                ov.Offset = (DWORD)a5; ov.OffsetHigh = (DWORD)(a5 >> 32);
+                DWORD rd = 0; ReadFile(g_fds[fd], got, (DWORD)a1, &rd, &ov);
+            } __except (EXCEPTION_EXECUTE_HANDLER) { }
+        }
+
+        if (a2 & PROT_EXEC) patch_syscalls(got, (size_t)len);   /* libraries have syscalls too */
+        if (finalprot != PAGE_READWRITE) { DWORD op; VirtualProtect(got, (SIZE_T)len, finalprot, &op); }
+
+        trace("mmap(%p, %llu, prot=%llu, flags=0x%llx, fd=%lld) = %p",
+              (void *)a0, a1, a2, a3, fd, got);
         return (int64_t)(uint64_t)got;
     }
 
     case SYS_mprotect: {
+        uint64_t len = align_up(a1, PAGE);
         DWORD oldp, newp = mmap_prot_to_win(a2);
-        if (!VirtualProtect((void *)a0, (SIZE_T)align_up(a1, PAGE), newp, &oldp))
+        if (a2 & PROT_EXEC) {   /* gaining +X: make writable, patch, then set target */
+            DWORD tmp;
+            if (VirtualProtect((void *)a0, (SIZE_T)len, PAGE_EXECUTE_READWRITE, &tmp))
+                patch_syscalls((void *)a0, (size_t)len);
+        }
+        if (!VirtualProtect((void *)a0, (SIZE_T)len, newp, &oldp))
             return -L_EINVAL;
         return 0;
     }
@@ -1026,8 +1134,10 @@ static LONG CALLBACK veh(PEXCEPTION_POINTERS ep)
         }
     }
 
-    /* A genuine guest fault -> a synchronous Linux signal. */
-    if (rip >= g_guest_lo && rip < g_guest_hi) {
+    /* A genuine guest fault -> a synchronous Linux signal. Anything outside
+     * lxrun's own module is guest code (main image, ld.so, mapped libraries,
+     * the guest stack); a fault inside lxrun itself is a harness bug. */
+    if (rip < g_self_lo || rip >= g_self_hi) {
         int sig = (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)      ? 11  /* SIGSEGV */
                 : (er->ExceptionCode == EXCEPTION_INT_DIVIDE_BY_ZERO)    ? 8   /* SIGFPE  */
                 : (er->ExceptionCode == EXCEPTION_PRIV_INSTRUCTION)      ? 4   /* SIGILL  */
@@ -1085,6 +1195,16 @@ int main(int argc, char **argv)
     g_in  = GetStdHandle(STD_INPUT_HANDLE);
     g_err = GetStdHandle(STD_ERROR_HANDLE);
     g_fds[0] = g_in; g_fds[1] = g_out; g_fds[2] = g_err;
+
+    /* Record lxrun's own module range so the fault handler can tell guest
+     * code (everything else) from a harness bug (inside lxrun). */
+    {
+        HMODULE self = GetModuleHandleW(NULL);
+        IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)self;
+        IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS *)((unsigned char *)self + dos->e_lfanew);
+        g_self_lo = (uint64_t)self;
+        g_self_hi = g_self_lo + nt->OptionalHeader.SizeOfImage;
+    }
 
     init_signals();
 

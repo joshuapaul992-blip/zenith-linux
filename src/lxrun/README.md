@@ -1,8 +1,9 @@
-# lxrun — user-mode static-ELF loader + syscall emulator
+# lxrun — user-mode ELF loader + syscall emulator
 
 The zenith-linux **execution engine**, prototyped in user mode. `lxrun.exe`
-loads a statically-linked x86-64 Linux binary into a Windows x64 process and
-actually runs it, emulating Linux syscalls against NT/Win32. Its purpose is to
+loads an x86-64 Linux binary — static or dynamically-linked (via its `ld.so`) —
+into a Windows x64 process and actually runs it, emulating Linux syscalls
+against NT/Win32. Its purpose is to
 prove the execution path end-to-end and to print the exact syscall surface a
 target binary needs — the spec a future kernel-side provider must implement.
 
@@ -33,8 +34,13 @@ auxv so libc never takes a vDSO fast path that would bypass the rewrite.
   `CR4.FSGSBASE`). `lxrun` warns if the CPU/OS lacks it — TLS-using guests then
   fault. (The eventual XP target handles TLS in a driver instead; this harness
   is a dev tool.)
-- Only **statically-linked** guests. A binary with `PT_INTERP` (needs `ld.so`)
-  is rejected with a clear message.
+- **Static and dynamically-linked** guests are both supported. For a dynamic
+  binary, `lxrun` maps the `ld.so` named in its `PT_INTERP` and hands control to
+  it, so **`--root` must point at a rootfs that actually contains that
+  interpreter and the shared libraries** (`ld-linux-x86-64.so.2` + `libc.so.6`,
+  or `ld-musl-x86_64.so.1`). `ld.so` then loads libraries itself via the
+  emulated `openat`/`mmap`/`mprotect` path (and `lxrun` rewrites `syscall`
+  sites in those libraries as they are mapped).
 
 ## Build
 
@@ -50,8 +56,8 @@ Zero-dependency smoke test (no rootfs, no libc, no TLS) — see `test/hello.c`:
 lxrun -v hello_exec        REM expect the greeting + exit code 7
 ```
 
-Fuller test with a **static musl** busybox (Alpine's is ideal — musl static
-startup is light and traps cleanly):
+Static busybox (Alpine's **static musl** build is ideal — light startup, traps
+cleanly):
 
 ```
 lxrun --root C:\rootfs C:\rootfs\bin\busybox true
@@ -59,15 +65,31 @@ lxrun --root C:\rootfs C:\rootfs\bin\busybox echo hello
 lxrun -v --root C:\rootfs C:\rootfs\bin\busybox uname -a
 ```
 
-`-v` prints the syscall trace; any `UNIMPLEMENTED syscall N` line tells you
-exactly what to add to `emulate()` next.
+**Dynamic** binary (Step 1 milestone — exercises `ld.so` + shared libraries).
+Point `--root` at a rootfs that has the matching interpreter and libs, e.g. an
+Alpine rootfs for a dynamic musl build, or a Debian/Ubuntu rootfs for glibc:
+
+```
+lxrun -v --root C:\alpine C:\alpine\bin\busybox echo hi    REM musl ld
+lxrun -v --root C:\debian C:\debian\bin\echo hello         REM glibc ld.so
+```
+
+With `-v` you'll see `lxrun: dynamic; interp=... base=...` then `ld.so` mapping
+`libc` before the program's own output. `-v` prints the full syscall trace; any
+`UNIMPLEMENTED syscall N` line tells you exactly what to add to `emulate()`
+next — expected as real libraries pull in more of the syscall surface.
 
 ## Implemented syscalls
 
-`read write open/openat close lseek fstat/newfstatat ioctl access brk mmap
-mprotect munmap arch_prctl set_tid_address set_robust_list getpid/getppid/gettid
-getuid/geteuid/getgid/getegid uname readlink getrandom gettimeofday
-clock_gettime time prlimit64 rseq exit/exit_group`
+`read write open/openat close lseek pread64 fstat/newfstatat ioctl
+access/faccessat brk mmap mprotect munmap arch_prctl set_tid_address
+set_robust_list getpid/getppid/gettid getuid/geteuid/getgid/getegid uname
+readlink getrandom gettimeofday clock_gettime time prlimit64 rseq
+exit/exit_group`
+
+`mmap` supports anonymous, file-backed, and the `ld.so`
+reserve-then-`MAP_FIXED` overlay pattern; `mmap`/`mprotect` rewrite `syscall`
+sites in any region that becomes executable (so libraries work).
 
 Process & signals (see below): `execve rt_sigaction rt_sigprocmask kill tgkill
 rt_sigreturn sigaltstack`. `fork`/`vfork`/`clone` return `-ENOSYS` and `wait4`
