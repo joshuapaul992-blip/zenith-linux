@@ -293,7 +293,7 @@ static NTSTATUS OpenZenithKey(PHANDLE outKey)
         L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Control"
         L"\\Session Manager\\Zenith");
     InitializeObjectAttributes(&oa, &keyName,
-        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, 0, 0);
+        OBJ_CASE_INSENSITIVE, 0, 0);
     return NtOpenKey(outKey, KEY_READ, &oa);
 }
 
@@ -380,7 +380,7 @@ static VOID ReportDistro(PCWSTR ntPrefix)
 
     RtlInitUnicodeString(&name, path);
     InitializeObjectAttributes(&oa, &name,
-        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, 0, 0);
+        OBJ_CASE_INSENSITIVE, 0, 0);
 
     st = NtOpenFile(&hFile, FILE_READ_DATA | SYNCHRONIZE, &oa, &iosb,
                     FILE_SHARE_READ,
@@ -443,7 +443,7 @@ static NTSTATUS MapLinuxImage(PCWSTR ntPath, PPVOID outBase, PSIZE_T outSize)
 
     RtlInitUnicodeString(&name, (PWSTR)ntPath);
     InitializeObjectAttributes(&oa, &name,
-        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, 0, 0);
+        OBJ_CASE_INSENSITIVE, 0, 0);
 
     st = NtOpenFile(&hFile,
                     FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -575,6 +575,10 @@ VOID NTAPI NtProcessStartup(PSTARTUP_ARGUMENTS StartupArguments)
     Display(L"zenith-linux: native-mode bootstrap (lxinit) starting\r\n");
     Display(L"zenith-linux: NT 5.2 BootExecute stage, pre-csrss\r\n");
 
+    /* Numbered step markers: on a bugcheck, the last line shown (on screen or
+     * in the kernel debugger) is the step whose Nt* call faulted. */
+    Display(L"zenith-linux: [1] reading registry config\r\n");
+
     /* --- (3) configuration ------------------------------------------- */
     rootfsDos[0] = 0;
     initRel[0]   = 0;
@@ -599,9 +603,11 @@ VOID NTAPI NtProcessStartup(PSTARTUP_ARGUMENTS StartupArguments)
     Display(L"\r\n");
 
     /* --- distro banner (best effort) --------------------------------- */
+    Display(L"zenith-linux: [2] reading /etc/os-release\r\n");
     ReportDistro(ntPrefix);
 
     /* --- (2) locate + map the rootfs init ---------------------------- */
+    Display(L"zenith-linux: [3] locating + mapping init\r\n");
     usedRel[0] = 0;
     st = ResolveAndMapInit(ntPrefix, haveInitRel ? initRel : 0,
                            usedRel, PATH_MAX_WCH, &imageBase, &imageSize);
@@ -648,7 +654,7 @@ VOID NTAPI NtProcessStartup(PSTARTUP_ARGUMENTS StartupArguments)
         Display(L"zenith-linux: text-mode TTY active on native console\r\n");
     }
 
-    Display(L"zenith-linux: bootstrap complete, returning control to smss\r\n");
+    Display(L"zenith-linux: [4] bootstrap complete, returning control to smss\r\n");
 
     /*
      * Terminating is the one supported way to tell smss "proceed" -- it
