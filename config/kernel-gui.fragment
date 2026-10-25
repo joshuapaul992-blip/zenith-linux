@@ -1,0 +1,74 @@
+# Zenith Linux GUI-tier kernel fragment.
+#
+# Merged ON TOP OF config/kernel.fragment. Adds what an Xorg desktop and a
+# live SquashFS+overlay boot need, while staying monolithic (=y, no modules).
+#
+# GPU scope for v1: the generic framebuffer path (like DSL's own Xvesa) plus
+# the small QEMU DRM drivers. Real-hardware accel drivers (i915/amdgpu/
+# radeon/nouveau) are intentionally left out here to keep the image small and
+# CI fast; add them later when targeting accelerated desktops.
+
+# --- Process/threading primitives userland (musl, Xorg) relies on -----------
+CONFIG_MULTIUSER=y
+CONFIG_FUTEX=y
+CONFIG_EPOLL=y
+CONFIG_SIGNALFD=y
+CONFIG_TIMERFD=y
+CONFIG_EVENTFD=y
+CONFIG_AIO=y
+CONFIG_POSIX_TIMERS=y
+CONFIG_FHANDLE=y
+CONFIG_INOTIFY_USER=y
+
+# --- SysV IPC + shared memory (X MIT-SHM, udev) -----------------------------
+CONFIG_SYSVIPC=y
+CONFIG_SHMEM=y
+
+# --- Networking: X uses a UNIX-domain socket --------------------------------
+CONFIG_NET=y
+CONFIG_UNIX=y
+CONFIG_PACKET=y
+CONFIG_INET=y
+
+# --- DRM / KMS for QEMU + generic framebuffer -------------------------------
+CONFIG_PCI=y
+CONFIG_DRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_BOCHS=y
+CONFIG_DRM_QXL=y
+
+# --- VirtIO (virtio-gpu, virtio-blk) ----------------------------------------
+# VIRTIO_MENU gates the whole virtio driver menu; without it the drivers below
+# are silently dropped by olddefconfig.
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_DRM_VIRTIO_GPU=y
+
+# --- Framebuffer console (Xorg fbdev/vesa fallback everywhere) ---------------
+CONFIG_FB=y
+CONFIG_FB_EFI=y
+CONFIG_FB_VESA=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_MTRR=y
+
+# --- Input (evdev + mouse for libinput) -------------------------------------
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_MOUSEDEV=y
+
+# --- GPU firmware loading (from rootfs /lib/firmware at runtime) -------------
+CONFIG_FW_LOADER=y
+
+# --- Live media: SquashFS + overlay + loop ----------------------------------
+# SquashFS lives under "Miscellaneous filesystems", which tinyconfig disables;
+# enable the parent menu or SQUASHFS is silently dropped.
+CONFIG_MISC_FILESYSTEMS=y
+CONFIG_SQUASHFS=y
+CONFIG_SQUASHFS_XZ=y
+CONFIG_SQUASHFS_ZSTD=y
+CONFIG_OVERLAY_FS=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_RD_XZ=y

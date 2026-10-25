@@ -14,7 +14,7 @@ set -euo pipefail
 # PROJECT_ROOT is the repo root regardless of where a script is invoked from.
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${BUILD_DIR:=${PROJECT_ROOT}/build}"       # all intermediate artifacts (gitignored)
-: "${CACHE_DIR:=${BUILD_DIR}/cache}"          # downloaded tarballs (gitignored)
+: "${CACHE_DIR:=${PROJECT_ROOT}/build/cache}" # downloaded tarballs, shared across tiers (gitignored)
 : "${OUTPUT_DIR:=${PROJECT_ROOT}/output}"     # final ISO (gitignored)
 : "${ROOTFS_STAGE:=${BUILD_DIR}/rootfs}"      # assembled root filesystem
 : "${JOBS:=$(nproc 2>/dev/null || echo 2)}"
@@ -31,6 +31,16 @@ BUSYBOX_URL="https://busybox.net/downloads/${BUSYBOX_TARBALL}"
 KERNEL_IMAGE="${BUILD_DIR}/vmlinuz"
 INITRAMFS="${BUILD_DIR}/initramfs.cpio.gz"
 ISO_IMAGE="${OUTPUT_DIR}/zenith_linux.iso"
+
+# --- GUI tier (zenith-gui.iso): Alpine-based live X desktop -----------------
+: "${ALPINE_BRANCH:=v3.24}"
+: "${ALPINE_VERSION:=3.24.3}"
+: "${ALPINE_SHA256:=f8e1cafba9b1b283b5d30d06f9885c8d2bc161ffe9083ade8e2e157813a53407}"
+ALPINE_TARBALL="alpine-minirootfs-${ALPINE_VERSION}-x86_64.tar.gz"
+ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/x86_64/${ALPINE_TARBALL}"
+GUI_ROOTFS="${BUILD_DIR}/gui-rootfs"
+SQUASHFS="${BUILD_DIR}/rootfs.squashfs"
+GUI_ISO="${OUTPUT_DIR}/zenith-gui.iso"
 
 # --- Logging --------------------------------------------------------------
 _c_blue=$'\033[1;34m'; _c_green=$'\033[1;32m'; _c_yellow=$'\033[1;33m'

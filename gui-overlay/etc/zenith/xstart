@@ -1,0 +1,9 @@
+#!/bin/sh
+# Launch the X session on tty1. Respawned by init, so logging out of the WM
+# brings the desktop straight back.
+export HOME=/root
+export USER=root
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+
+# Avoid a tight respawn loop if X can't start (e.g. no usable video device).
+exec startx /etc/X11/xinit/xinitrc -- :0 vt1 >/var/log/xstart.log 2>&1

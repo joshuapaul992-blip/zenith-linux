@@ -11,7 +11,7 @@ if command -v apt-get >/dev/null 2>&1; then
   $SUDO apt-get install -y --no-install-recommends \
     build-essential bc bison flex \
     libelf-dev libssl-dev \
-    cpio xz-utils gzip \
+    cpio xz-utils gzip squashfs-tools \
     wget curl ca-certificates \
     xorriso isolinux syslinux-common \
     qemu-system-x86
@@ -19,7 +19,7 @@ elif command -v dnf >/dev/null 2>&1; then
   $SUDO dnf install -y \
     gcc gcc-c++ make bc bison flex \
     elfutils-libelf-devel openssl-devel \
-    cpio xz gzip \
+    cpio xz gzip squashfs-tools \
     wget curl ca-certificates \
     xorriso syslinux \
     qemu-system-x86
@@ -27,7 +27,7 @@ elif command -v pacman >/dev/null 2>&1; then
   $SUDO pacman -Sy --needed --noconfirm \
     base-devel bc bison flex \
     libelf openssl \
-    cpio xz gzip \
+    cpio xz gzip squashfs-tools \
     wget curl \
     xorriso syslinux \
     qemu-system-x86

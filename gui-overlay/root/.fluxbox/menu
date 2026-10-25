@@ -1,0 +1,17 @@
+# Zenith Linux Fluxbox menu (DSL-style alternative WM).
+[begin] (Zenith Linux)
+    [exec] (Terminal) {xterm}
+    [exec] (File Manager) {xfe}
+    [separator]
+    [submenu] (Window Manager)
+        [exec] (Switch to JWM) {/etc/zenith/setwm jwm}
+        [exec] (Switch to Fluxbox) {/etc/zenith/setwm fluxbox}
+    [end]
+    [separator]
+    [config] (Configure)
+    [workspaces] (Workspaces)
+    [separator]
+    [restart] (Restart Fluxbox)
+    [exec] (Reboot) {reboot}
+    [exec] (Shut Down) {poweroff}
+[end]
