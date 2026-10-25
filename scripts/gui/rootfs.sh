@@ -18,7 +18,7 @@ require curl tar chroot xorriso extract_compressed_fs
 XORG_PKGS="xserver-xorg-core xserver-xorg-video-fbdev xserver-xorg-video-vesa \
 xserver-xorg-input-libinput xinit x11-xserver-utils xserver-xorg-legacy xauth \
 xfonts-base xfonts-75dpi xfonts-100dpi"
-BASE_PKGS="udev kmod ca-certificates"
+BASE_PKGS="udev kmod ca-certificates isc-dhcp-client iproute2"
 I386_PKGS="libc6:i386 libx11-6:i386 libxpm4:i386 libxext6:i386 libxi6:i386 \
 libsm6:i386 libice6:i386 libxau6:i386 libxdmcp6:i386"
 
@@ -77,6 +77,12 @@ chroot "$GUI_ROOTFS" /bin/bash -c "
 "
 cleanup; trap - EXIT
 rm -rf "$GUI_ROOTFS"/var/lib/apt/lists/* "$GUI_ROOTFS"/var/cache/apt/archives/*.deb 2>/dev/null || true
+# Remove apt/dpkg lock files left from the build: baked into the read-only
+# squashfs they break apt/dpkg on the live system (copy-up/flock failures,
+# "lock was locked by another process", "Permission denied"). Fresh ones are
+# created on the writable overlay at runtime.
+rm -f "$GUI_ROOTFS"/var/lib/dpkg/lock "$GUI_ROOTFS"/var/lib/dpkg/lock-frontend \
+      "$GUI_ROOTFS"/var/lib/apt/lists/lock "$GUI_ROOTFS"/var/cache/apt/archives/lock 2>/dev/null || true
 
 # --- 3. Overlay the DSL filesystem at /opt/dsl ------------------------------
 log "overlaying DSL 4.4.10 at /opt/dsl"

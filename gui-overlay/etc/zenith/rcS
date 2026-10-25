@@ -14,6 +14,15 @@ chmod 1777 /tmp /dev/shm /tmp/.X11-unix 2>/dev/null
 
 hostname zenith 2>/dev/null
 
+# Bring up wired interfaces + DHCP (best-effort) so networking/apt work.
+ip link set lo up 2>/dev/null
+for ifp in /sys/class/net/*; do
+  ifn=$(basename "$ifp")
+  case "$ifn" in lo) continue ;; esac
+  ip link set "$ifn" up 2>/dev/null
+done
+dhclient -nw 2>/dev/null || true
+
 # udev for input + DRM device discovery that Xorg/libinput need.
 UDEVD=
 for c in /lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd /sbin/udevd; do
