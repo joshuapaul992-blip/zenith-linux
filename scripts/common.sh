@@ -32,13 +32,19 @@ KERNEL_IMAGE="${BUILD_DIR}/vmlinuz"
 INITRAMFS="${BUILD_DIR}/initramfs.cpio.gz"
 ISO_IMAGE="${OUTPUT_DIR}/zenith_linux.iso"
 
-# --- GUI tier (zenith-gui.iso): Alpine-based live X desktop -----------------
-: "${ALPINE_BRANCH:=v3.24}"
-: "${ALPINE_VERSION:=3.24.3}"
-: "${ALPINE_SHA256:=f8e1cafba9b1b283b5d30d06f9885c8d2bc161ffe9083ade8e2e157813a53407}"
-ALPINE_TARBALL="alpine-minirootfs-${ALPINE_VERSION}-x86_64.tar.gz"
-ALPINE_URL="https://dl-cdn.alpinelinux.org/alpine/${ALPINE_BRANCH}/releases/x86_64/${ALPINE_TARBALL}"
+# --- GUI tier (zenith-gui.iso): Ubuntu base + original DSL 4.4.10 desktop ----
+# Ubuntu 26.10 provides the live base and the X server; the genuine 32-bit
+# DSL 4.4.10 filesystem is overlaid at /opt/dsl and run in a chroot.
+: "${UBUNTU_VERSION:=26.10}"
+UBUNTU_TARBALL="ubuntu-base-${UBUNTU_VERSION}-base-amd64.tar.gz"
+UBUNTU_URL="https://cdimage.ubuntu.com/ubuntu-base/releases/${UBUNTU_VERSION}/release/${UBUNTU_TARBALL}"
+
+: "${DSL_VERSION:=4.4.10}"
+DSL_ISO="dsl-${DSL_VERSION}.iso"
+DSL_URL="https://archive.org/download/dsl-${DSL_VERSION}/${DSL_ISO}"
+
 GUI_ROOTFS="${BUILD_DIR}/gui-rootfs"
+DSL_ROOT="${BUILD_DIR}/dsl-root"          # extracted DSL filesystem
 SQUASHFS="${BUILD_DIR}/rootfs.squashfs"
 GUI_ISO="${OUTPUT_DIR}/zenith-gui.iso"
 

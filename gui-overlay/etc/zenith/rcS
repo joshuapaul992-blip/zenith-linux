@@ -1,26 +1,29 @@
 #!/bin/sh
-# Zenith Linux GUI startup (run once by busybox init).
+# Zenith Linux GUI startup (run once by busybox init) on the Ubuntu base.
 
 # Pseudo-filesystems (proc/sys/dev are carried over by the live initramfs,
 # so these are best-effort top-ups).
 mount -t proc     proc     /proc    2>/dev/null
 mount -t sysfs    sysfs    /sys     2>/dev/null
 mount -t devtmpfs devtmpfs /dev     2>/dev/null
-mkdir -p /dev/pts /dev/shm /tmp /run
+mkdir -p /dev/pts /dev/shm /run /tmp /tmp/.X11-unix
 mount -t devpts devpts /dev/pts     2>/dev/null
 mount -t tmpfs  tmpfs  /dev/shm     2>/dev/null
-mount -t tmpfs  tmpfs  /tmp         2>/dev/null
 mount -t tmpfs  tmpfs  /run         2>/dev/null
+chmod 1777 /tmp /dev/shm /tmp/.X11-unix 2>/dev/null
 
 hostname zenith 2>/dev/null
 
-# Device manager for input + DRM nodes that Xorg/libinput need.
-if [ -x /sbin/udevd ]; then
-  /sbin/udevd --daemon 2>/dev/null
+# udev for input + DRM device discovery that Xorg/libinput need.
+UDEVD=
+for c in /lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd /sbin/udevd; do
+  [ -x "$c" ] && { UDEVD="$c"; break; }
+done
+if [ -n "$UDEVD" ]; then
+  "$UDEVD" --daemon 2>/dev/null
   udevadm trigger --action=add 2>/dev/null
   udevadm settle --timeout=10 2>/dev/null
-else
-  mdev -s 2>/dev/null
 fi
 
-echo "Zenith Linux GUI - starting desktop on tty1 (rescue shells on tty2/ttyS0)"
+echo "Zenith Linux (Ubuntu base + DSL 4.4.10) - starting desktop on tty1"
+echo "Rescue shells on tty2 / ttyS0."

@@ -21,14 +21,15 @@ Zenith ships as tiered ISOs that share the same from-scratch kernel:
 | ISO | Build | What it is | Size |
 |-----|-------|-----------|------|
 | `zenith_linux.iso` | `./build.sh` | Tiny RAM-resident BusyBox core — "damn small" | ~4 MB |
-| `zenith-gui.iso` | `sudo ./build-gui.sh` | Live **DSL 4.4.10-style desktop**: Xorg + JWM/Fluxbox + xfe + conky | ~110 MB |
+| `zenith-gui.iso` | `sudo ./build-gui.sh` | Live **original DSL 4.4.10 desktop** (genuine binaries) on an Ubuntu 26.10 base | ~180 MB |
 
 ## Versions
 | Component | Version | Override |
 |-----------|---------|----------|
 | Linux kernel | `6.18` | `KERNEL_VERSION=` |
 | BusyBox | `1.37.0` | `BUSYBOX_VERSION=` |
-| Alpine (GUI userland) | `3.24.3` | `ALPINE_VERSION=` |
+| Ubuntu (GUI base) | `26.10` | `UBUNTU_VERSION=` |
+| Damn Small Linux (GUI desktop) | `4.4.10` | `DSL_VERSION=` |
 
 ## Building
 
@@ -59,25 +60,32 @@ removes build artifacts; `make distclean` also drops the cache.
 > releases tagged `v*`).
 
 ## The GUI edition (`zenith-gui.iso`)
-A faithful recreation of the **Damn Small Linux 4.4.10** desktop on the modern
-kernel — the classic JWM bottom panel, a torsmo-style monitor floating
-top-right, the blue DSL backdrop — rebuilt from current components:
+The **genuine Damn Small Linux 4.4.10 desktop** — its real 2008 binaries,
+configs, menus, icons and wallpaper — running on a modern base:
 
-- **Xorg** on the generic framebuffer/VESA path (just like DSL's own Xvesa), so
-  it boots without GPU-specific drivers.
-- **JWM** (default) and **Fluxbox**, switchable at runtime from the menu.
-- **xfe** file manager, **xterm**, and a **conky** system monitor.
-- A small **Alpine (musl)** userland, delivered as a compressed SquashFS that is
-  overlaid with a tmpfs at boot (live-CD style — the system runs from RAM).
+- **Base + X server:** **Ubuntu 26.10** (`ubuntu-base`) and its Xorg packages,
+  on the framebuffer/VESA path (like DSL's own Xvesa), so it needs no
+  GPU-specific drivers.
+- **Desktop:** the complete DSL 4.4.10 filesystem is extracted from the real ISO
+  and placed at `/opt/dsl`; the session runs it in a chroot, so **JWM**,
+  **torsmo**, **dfm** (desktop icons), **aterm** and the authentic `.jwmrc`
+  menu all run exactly as they did in 2008.
+- **How the old binaries run:** they are 32-bit (i386). The kernel enables
+  `IA32_EMULATION`, and a modern 32-bit glibc is injected into the DSL tree so
+  its 2008 loader works on the 6.18 kernel, while DSL keeps its own old
+  X11/GTK libraries. DSL's clients talk to Ubuntu's X server over the socket.
+- Delivered as a compressed SquashFS overlaid with a tmpfs at boot (live-CD
+  style — runs from RAM).
 
 It is a separate, larger ISO; the tiny core edition is unchanged. No browser or
-game clients are included yet.
+game clients are added on top.
 
 ```bash
-sudo ./build-gui.sh          # the rootfs stage needs root (chroot/apk)
+sudo ./build-gui.sh          # needs root (chroot/apt) + cloop-utils, xorriso
 qemu-system-x86_64 -m 1024 -cdrom output/zenith-gui.iso -vga std
 ```
-You boot straight to the desktop on tty1 (rescue shells on tty2 and ttyS0).
+You boot straight to the DSL desktop on tty1 (rescue shells on tty2 and ttyS0).
+The build downloads Ubuntu's base rootfs and the DSL 4.4.10 ISO.
 
 ## How to Test
 Boot the core ISO in QEMU:
@@ -107,8 +115,8 @@ scripts/
   03-rootfs.sh           # core rootfs + initramfs stage
   04-iso.sh              # core ISO stage
   common.sh              # shared config + helpers
-  gui/                   # GUI stages: rootfs (Alpine), squashfs, initramfs, iso
+  gui/                   # GUI stages: rootfs (Ubuntu+DSL), squashfs, initramfs, iso
 rootfs/                  # core root filesystem skeleton (init, /etc, ...)
 rootfs-live/             # live initramfs PID 1 (squashfs + overlay + switch_root)
-gui-overlay/             # DSL-style desktop theme laid over the Alpine rootfs
+gui-overlay/             # Zenith init + DSL chroot session launcher (over Ubuntu)
 ```

@@ -8,7 +8,12 @@
 # radeon/nouveau) are intentionally left out here to keep the image small and
 # CI fast; add them later when targeting accelerated desktops.
 
-# --- Process/threading primitives userland (musl, Xorg) relies on -----------
+# --- 32-bit (i386) ELF support, for the original DSL 4.4.10 binaries ---------
+# The DSL desktop (jwm, torsmo, dfm, aterm, ...) is 32-bit; without this the
+# binaries cannot exec at all.
+CONFIG_IA32_EMULATION=y
+
+# --- Process/threading primitives userland (glibc, Xorg) relies on ----------
 CONFIG_MULTIUSER=y
 CONFIG_FUTEX=y
 CONFIG_EPOLL=y

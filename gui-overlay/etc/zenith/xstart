@@ -1,27 +1,43 @@
 #!/bin/sh
-# Launch the X session on tty1. Respawned by init, so logging out of the WM
-# brings the desktop straight back. On failure, surface the Xorg log and drop
-# to a shell (instead of looping) so problems are diagnosable on the console.
-export HOME=/root
-export USER=root
+# Start Ubuntu's Xorg server, then run the genuine DSL 4.4.10 desktop inside a
+# chroot of /opt/dsl (its 32-bit clients connect over the shared X socket).
+# Respawned by init; on failure, surface logs and drop to a shell.
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+LOG=/var/log/xstart.log
+D=/opt/dsl
 
-startx /etc/X11/xinit/xinitrc -- :0 vt1 >/var/log/xstart.log 2>&1
-rc=$?
-[ "$rc" -eq 0 ] && exit 0      # clean logout -> let init respawn the desktop
+# Access control is off: this is a single-user live system and the DSL clients
+# live in a chroot that shares only the X socket.
+X :0 vt1 -ac -nolisten tcp >"$LOG" 2>&1 &
+XPID=$!
+
+ok=0
+for _ in $(seq 1 40); do [ -S /tmp/.X11-unix/X0 ] && { ok=1; break; }; sleep 0.25; done
+
+rc=1
+if [ "$ok" -eq 1 ]; then
+  mkdir -p "$D/tmp/.X11-unix"
+  mount --bind /tmp/.X11-unix "$D/tmp/.X11-unix" 2>/dev/null
+  mount --bind /proc "$D/proc" 2>/dev/null
+  mount --bind /sys  "$D/sys"  2>/dev/null
+  mount --bind /dev  "$D/dev"  2>/dev/null
+  chroot "$D" /bin/sh /dsl-session.sh >>"$LOG" 2>&1
+  rc=$?
+  umount "$D/tmp/.X11-unix" "$D/proc" "$D/sys" "$D/dev" 2>/dev/null
+fi
+
+kill "$XPID" 2>/dev/null
+[ "$rc" -eq 0 ] && exit 0
 
 {
   echo ""
-  echo "=============== Zenith: X failed to start (rc=${rc}) ==============="
-  echo "Available DRM cards:"; ls -l /dev/dri/ 2>/dev/null || echo "  (none)"
-  echo "Framebuffers:";        ls -l /dev/fb* 2>/dev/null || echo "  (none)"
-  echo "---- /var/log/Xorg.0.log (tail) ----"
-  tail -n 30 /var/log/Xorg.0.log 2>/dev/null
-  echo "---- startx output (tail) ----"
-  tail -n 15 /var/log/xstart.log 2>/dev/null
+  echo "=============== Zenith: desktop failed to start (rc=${rc}) ==============="
+  echo "DRM cards:";    ls -l /dev/dri/ 2>/dev/null || echo "  (none)"
+  echo "Framebuffers:"; ls -l /dev/fb*  2>/dev/null || echo "  (none)"
+  echo "---- /var/log/Xorg.0.log (tail) ----"; tail -n 25 /var/log/Xorg.0.log 2>/dev/null
+  echo "---- session log (tail) ----";         tail -n 20 "$LOG" 2>/dev/null
   echo "Try the 'safe graphics' or 'pick a screen mode' boot entry."
-  echo "Run 'startx' to retry. Rescue shells are also on tty2 / ttyS0."
-  echo "==================================================================="
+  echo "Rescue shells are on tty2 / ttyS0."
+  echo "========================================================================"
 } > /dev/tty1 2>&1
-
-exec /bin/sh </dev/tty1 >/dev/tty1 2>&1
+exec /bin/bash </dev/tty1 >/dev/tty1 2>&1

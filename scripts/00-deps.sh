@@ -11,7 +11,7 @@ if command -v apt-get >/dev/null 2>&1; then
   $SUDO apt-get install -y --no-install-recommends \
     build-essential bc bison flex \
     libelf-dev libssl-dev \
-    cpio xz-utils gzip squashfs-tools \
+    cpio xz-utils gzip squashfs-tools cloop-utils \
     wget curl ca-certificates \
     xorriso isolinux syslinux-common \
     qemu-system-x86

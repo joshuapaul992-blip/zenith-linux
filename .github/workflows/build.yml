@@ -53,8 +53,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libelf-dev libssl-dev \
-            cpio xz-utils gzip squashfs-tools wget curl ca-certificates \
-            xorriso isolinux syslinux-common
+            cpio xz-utils gzip squashfs-tools cloop-utils \
+            wget curl ca-certificates xorriso isolinux syslinux-common
 
       - name: Build GUI ISO
         run: sudo -E ./build-gui.sh all

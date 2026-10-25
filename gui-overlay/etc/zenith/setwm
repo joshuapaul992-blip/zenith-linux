@@ -1,9 +1,0 @@
-#!/bin/sh
-# Switch window managers. Writes the choice, then ends the current session so
-# init respawns the X desktop with the new WM.
-case "$1" in
-  jwm|fluxbox) echo "$1" > /etc/zenith/wm ;;
-  *) echo "usage: setwm jwm|fluxbox" >&2; exit 1 ;;
-esac
-pkill -x jwm     2>/dev/null
-pkill -x fluxbox 2>/dev/null
