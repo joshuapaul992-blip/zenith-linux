@@ -23,9 +23,16 @@ if [ "$ok" -eq 1 ]; then
   mount --bind /proc "$D/proc" 2>/dev/null
   mount --bind /sys  "$D/sys"  2>/dev/null
   mount --bind /dev  "$D/dev"  2>/dev/null
+  # Also expose the unix socket as a fallback (the session prefers TCP).
+  mkdir -p "$D/tmp/.X11-unix"
+  mount --bind /tmp/.X11-unix "$D/tmp/.X11-unix" 2>/dev/null
+  echo "=== xstart: X is up; entering DSL chroot session ===" >>"$LOG"
   chroot "$D" /bin/sh /dsl-session.sh >>"$LOG" 2>&1
   rc=$?
-  umount "$D/proc" "$D/sys" "$D/dev" 2>/dev/null
+  echo "=== xstart: DSL session exited rc=$rc ===" >>"$LOG"
+  umount "$D/tmp/.X11-unix" "$D/proc" "$D/sys" "$D/dev" 2>/dev/null
+else
+  echo "=== xstart: X server never created its socket (did not start) ===" >>"$LOG"
 fi
 
 kill "$XPID" 2>/dev/null
