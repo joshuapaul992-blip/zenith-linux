@@ -57,7 +57,7 @@ jobs:
             wget curl ca-certificates xorriso isolinux syslinux-common
 
       - name: Build GUI ISO
-        run: sudo -E ./build-gui.sh all
+        run: sudo ./build-gui.sh all
 
       - name: Report GUI artifact sizes
         run: |

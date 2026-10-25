@@ -41,7 +41,7 @@ case "$cmd" in
   run)     shift; run_qemu "$@" ;;
   clean)   rm -rf "$BUILD_DIR" "$GUI_ISO"; ok "cleaned GUI build" ;;
   all)
-    log "Building Zenith Linux GUI ISO (kernel ${KERNEL_VERSION}, Alpine ${ALPINE_VERSION})"
+    log "Building Zenith Linux GUI ISO (kernel ${KERNEL_VERSION}, Ubuntu ${UBUNTU_VERSION} + DSL ${DSL_VERSION})"
     stage kernel         scripts/01-kernel.sh
     stage busybox        scripts/02-busybox.sh
     stage gui-rootfs     scripts/gui/rootfs.sh
