@@ -13,7 +13,7 @@ echo "X unix sockets visible: $(ls /tmp/.X11-unix/ 2>/dev/null || echo none)"
 
 # Probe candidate displays; the first that accepts a connection wins.
 DISPLAY_OK=""
-for disp in "127.0.0.1:0" ":0" "unix:0"; do
+for disp in ":0" "unix:0" "127.0.0.1:0"; do
   if DISPLAY="$disp" "$XSETROOT" -solid "#36566f" 2>/tmp/xconn.err; then
     DISPLAY_OK="$disp"
     echo "connected to X via DISPLAY=$disp"

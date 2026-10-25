@@ -26,6 +26,11 @@ if [ "$ok" -eq 1 ]; then
   # Also expose the unix socket as a fallback (the session prefers TCP).
   mkdir -p "$D/tmp/.X11-unix"
   mount --bind /tmp/.X11-unix "$D/tmp/.X11-unix" 2>/dev/null
+  # Make DSL's own X fonts (e.g. smoothansi) available to the Ubuntu X server.
+  for fd in "$D"/usr/X11R6/lib/X11/fonts/*/; do
+    [ -f "${fd}fonts.dir" ] && DISPLAY=:0 xset +fp "$fd" >/dev/null 2>&1
+  done
+  DISPLAY=:0 xset fp rehash >/dev/null 2>&1
   echo "=== xstart: X is up; entering DSL chroot session ===" >>"$LOG"
   chroot "$D" /bin/sh /dsl-session.sh >>"$LOG" 2>&1
   rc=$?

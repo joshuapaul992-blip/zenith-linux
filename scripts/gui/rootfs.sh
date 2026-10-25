@@ -95,6 +95,12 @@ done
 # DSL's own old X11/GTK libraries work fine against the injected modern glibc
 # (verified), so nothing else needs replacing.
 
+# DSL symlinks /tmp -> /var/tmp. That absolute symlink resolves OUTSIDE the
+# chroot, so bind-mounting the X socket onto /opt/dsl/tmp/.X11-unix lands on the
+# host's /var/tmp and the chrooted client sees an empty /tmp. Replace it with a
+# real directory so the X unix socket is actually shared into the chroot.
+rm -f "$GUI_ROOTFS/opt/dsl/tmp"
+mkdir -p "$GUI_ROOTFS/opt/dsl/tmp"; chmod 1777 "$GUI_ROOTFS/opt/dsl/tmp"
 # Bind-mount points for the chroot session (DSL's tree lacks /sys).
 mkdir -p "$GUI_ROOTFS/opt/dsl/proc" "$GUI_ROOTFS/opt/dsl/sys" "$GUI_ROOTFS/opt/dsl/dev"
 
