@@ -2,8 +2,10 @@
 # The genuine DSL 4.4.10 desktop session, run inside the /opt/dsl chroot.
 # Reproduces DSL's own startup: wallpaper + torsmo + dfm + JWM (the authentic
 # default), using DSL's real binaries and config files.
+# Connect over TCP: a bind-mounted unix X socket is not reachable from a
+# chroot, so the Ubuntu X server listens on TCP and we reach it via localhost.
 export HOME=/home/dsl
-export DISPLAY=:0
+export DISPLAY=127.0.0.1:0
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/X11R6/bin:/usr/games:/sbin
 cd "$HOME" 2>/dev/null || cd /
 

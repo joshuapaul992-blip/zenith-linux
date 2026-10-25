@@ -6,9 +6,11 @@ export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 LOG=/var/log/xstart.log
 D=/opt/dsl
 
-# Access control is off: this is a single-user live system and the DSL clients
-# live in a chroot that shares only the X socket.
-X :0 vt1 -ac -nolisten tcp >"$LOG" 2>&1 &
+# X listens on TCP (localhost); the DSL clients run in a chroot and reach it
+# via DISPLAY=127.0.0.1:0. A bind-mounted unix socket is NOT connectable from
+# inside the chroot (connect() -> ENOENT), so TCP is used instead. Access
+# control is off: this is an ephemeral single-user live system.
+X :0 vt1 -ac -listen tcp >"$LOG" 2>&1 &
 XPID=$!
 
 ok=0
@@ -16,14 +18,12 @@ for _ in $(seq 1 40); do [ -S /tmp/.X11-unix/X0 ] && { ok=1; break; }; sleep 0.2
 
 rc=1
 if [ "$ok" -eq 1 ]; then
-  mkdir -p "$D/tmp/.X11-unix"
-  mount --bind /tmp/.X11-unix "$D/tmp/.X11-unix" 2>/dev/null
   mount --bind /proc "$D/proc" 2>/dev/null
   mount --bind /sys  "$D/sys"  2>/dev/null
   mount --bind /dev  "$D/dev"  2>/dev/null
   chroot "$D" /bin/sh /dsl-session.sh >>"$LOG" 2>&1
   rc=$?
-  umount "$D/tmp/.X11-unix" "$D/proc" "$D/sys" "$D/dev" 2>/dev/null
+  umount "$D/proc" "$D/sys" "$D/dev" 2>/dev/null
 fi
 
 kill "$XPID" 2>/dev/null

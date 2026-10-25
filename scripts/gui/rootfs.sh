@@ -95,6 +95,9 @@ done
 # DSL's own old X11/GTK libraries work fine against the injected modern glibc
 # (verified), so nothing else needs replacing.
 
+# Bind-mount points for the chroot session (DSL's tree lacks /sys).
+mkdir -p "$GUI_ROOTFS/opt/dsl/proc" "$GUI_ROOTFS/opt/dsl/sys" "$GUI_ROOTFS/opt/dsl/dev"
+
 # Seed the DSL home from its skeleton so the real configs are in place.
 mkdir -p "$GUI_ROOTFS/opt/dsl/home/dsl"
 cp -a "$GUI_ROOTFS/opt/dsl/etc/skel/." "$GUI_ROOTFS/opt/dsl/home/dsl/" 2>/dev/null || true
