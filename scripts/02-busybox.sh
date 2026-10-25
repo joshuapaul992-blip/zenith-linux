@@ -23,9 +23,10 @@ sed -i 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config
 sed -i 's/^CONFIG_TC=y/# CONFIG_TC is not set/' .config
 # PIE + fully static don't mix on all toolchains; keep it plain static.
 sed -i 's/^CONFIG_PIE=y/# CONFIG_PIE is not set/' .config
-# BusyBox kconfig has no 'olddefconfig' target (that's kernel-only); feed
-# empty lines to oldconfig to accept defaults for any newly-exposed symbols.
-yes "" | make oldconfig >/dev/null
+# BusyBox kconfig has no 'olddefconfig' target (that's kernel-only). Run
+# oldconfig with stdin at EOF so it accepts the default for any newly-exposed
+# symbol; piping `yes` instead trips SIGPIPE (141) under `set -o pipefail`.
+make oldconfig </dev/null >/dev/null
 
 log "building busybox with ${JOBS} jobs"
 make -j"${JOBS}"
