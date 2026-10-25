@@ -21,7 +21,7 @@ for ifp in /sys/class/net/*; do
   case "$ifn" in lo) continue ;; esac
   ip link set "$ifn" up 2>/dev/null
 done
-dhclient -nw 2>/dev/null || true
+dhcpcd -b 2>/dev/null || true   # background DHCP on all interfaces
 
 # udev for input + DRM device discovery that Xorg/libinput need.
 UDEVD=
