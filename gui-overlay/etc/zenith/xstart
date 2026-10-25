@@ -1,9 +1,27 @@
 #!/bin/sh
 # Launch the X session on tty1. Respawned by init, so logging out of the WM
-# brings the desktop straight back.
+# brings the desktop straight back. On failure, surface the Xorg log and drop
+# to a shell (instead of looping) so problems are diagnosable on the console.
 export HOME=/root
 export USER=root
 export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
-# Avoid a tight respawn loop if X can't start (e.g. no usable video device).
-exec startx /etc/X11/xinit/xinitrc -- :0 vt1 >/var/log/xstart.log 2>&1
+startx /etc/X11/xinit/xinitrc -- :0 vt1 >/var/log/xstart.log 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && exit 0      # clean logout -> let init respawn the desktop
+
+{
+  echo ""
+  echo "=============== Zenith: X failed to start (rc=${rc}) ==============="
+  echo "Available DRM cards:"; ls -l /dev/dri/ 2>/dev/null || echo "  (none)"
+  echo "Framebuffers:";        ls -l /dev/fb* 2>/dev/null || echo "  (none)"
+  echo "---- /var/log/Xorg.0.log (tail) ----"
+  tail -n 30 /var/log/Xorg.0.log 2>/dev/null
+  echo "---- startx output (tail) ----"
+  tail -n 15 /var/log/xstart.log 2>/dev/null
+  echo "Try the 'safe graphics' or 'pick a screen mode' boot entry."
+  echo "Run 'startx' to retry. Rescue shells are also on tty2 / ttyS0."
+  echo "==================================================================="
+} > /dev/tty1 2>&1
+
+exec /bin/sh </dev/tty1 >/dev/tty1 2>&1
