@@ -1,0 +1,96 @@
+# Zenith Linux kernel configuration fragment.
+#
+# This is MERGED on top of `make tinyconfig`, so we start from almost nothing
+# and switch on only what a tiny, monolithic, RAM-resident distro needs.
+# Everything is built in (=y), never as modules, so the single bzImage stays
+# small and needs no separate /lib/modules tree.
+
+# --- Core architecture ----------------------------------------------------
+CONFIG_64BIT=y
+CONFIG_SMP=y
+
+# --- Early boot / console -------------------------------------------------
+CONFIG_PRINTK=y
+CONFIG_TTY=y
+CONFIG_VT=y
+CONFIG_VT_CONSOLE=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_PRINTK_TIME=y
+
+# --- EFI + legacy BIOS boot ----------------------------------------------
+CONFIG_PCI=y
+CONFIG_EFI=y
+CONFIG_EFI_STUB=y
+
+# --- Framebuffer console (EFI/VESA, modern simpledrm) ---------------------
+CONFIG_SYSFB_SIMPLEFB=y
+CONFIG_DRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_FB=y
+CONFIG_FB_EFI=y
+CONFIG_FB_VESA=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+
+# --- Userspace execution (needed to run BusyBox!) -------------------------
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# --- Essential virtual filesystems ----------------------------------------
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+
+# --- Initramfs support ----------------------------------------------------
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+
+# --- Input (PS/2 + USB keyboards) -----------------------------------------
+CONFIG_INPUT=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_INPUT_KEYBOARD=y
+CONFIG_KEYBOARD_ATKBD=y
+CONFIG_SERIO=y
+CONFIG_SERIO_I8042=y
+
+# --- Block layer + SCSI stack ---------------------------------------------
+CONFIG_BLOCK=y
+CONFIG_SCSI=y
+CONFIG_BLK_DEV_SD=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_BLK_DEV_LOOP=y
+
+# --- SATA / IDE (AHCI + QEMU's PIIX) --------------------------------------
+CONFIG_ATA=y
+CONFIG_SATA_AHCI=y
+CONFIG_ATA_PIIX=y
+
+# --- NVMe storage ---------------------------------------------------------
+CONFIG_NVME_CORE=y
+CONFIG_BLK_DEV_NVME=y
+
+# --- USB 2.0 / 3.0 + mass storage + HID -----------------------------------
+CONFIG_USB_SUPPORT=y
+CONFIG_USB=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_OHCI_HCD=y
+CONFIG_USB_UHCI_HCD=y
+CONFIG_USB_STORAGE=y
+CONFIG_USB_HID=y
+CONFIG_HID_GENERIC=y
+
+# --- Filesystems ----------------------------------------------------------
+CONFIG_EXT4_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_ISO9660_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+
+# --- Size / stripping -----------------------------------------------------
+# No loadable module support keeps the image monolithic and compact.
+# CONFIG_MODULES is not set

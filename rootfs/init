@@ -1,0 +1,18 @@
+#!/bin/sh
+# Zenith Linux PID 1.
+# The kernel execs this directly from the initramfs. We bring up the core
+# virtual filesystems, then hand off to BusyBox init for service management.
+
+/bin/busybox mkdir -p /proc /sys /dev /tmp /run
+
+/bin/busybox mount -t proc     proc     /proc
+/bin/busybox mount -t sysfs    sysfs    /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev 2>/dev/null \
+  || /bin/busybox mdev -s
+/bin/busybox mount -t tmpfs    tmpfs    /tmp
+/bin/busybox mount -t tmpfs    tmpfs    /run
+
+# Kernel log chatter would otherwise scribble over the shell.
+/bin/busybox dmesg -n 1 2>/dev/null || true
+
+exec /sbin/init

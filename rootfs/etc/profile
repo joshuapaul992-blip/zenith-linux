@@ -1,0 +1,8 @@
+# Zenith Linux login shell environment.
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export HOME=/root
+export PS1='zenith:\w\$ '
+export PAGER=more
+umask 022
+
+alias ll='ls -lah'

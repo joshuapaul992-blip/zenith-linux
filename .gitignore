@@ -1,0 +1,7 @@
+# Build artifacts and downloads
+/build/
+/output/
+*.iso
+*.cpio.gz
+*.o
+*.tmp

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Zenith Linux system startup, run once by BusyBox init.
+
+# Device node hotplug via mdev.
+echo /sbin/mdev > /proc/sys/kernel/hotplug 2>/dev/null || true
+mdev -s 2>/dev/null || true
+
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts 2>/dev/null || true
+
+# Identity + loopback network.
+hostname zenith
+ip link set lo up 2>/dev/null || ifconfig lo 127.0.0.1 up 2>/dev/null || true
+
+# Greeting.
+[ -f /etc/motd ] && cat /etc/motd

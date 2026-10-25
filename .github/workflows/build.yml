@@ -1,0 +1,43 @@
+name: Build Zenith Linux ISO
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex libelf-dev libssl-dev \
+            cpio xz-utils gzip wget curl ca-certificates \
+            xorriso isolinux syslinux-common
+
+      - name: Build ISO
+        run: ./build.sh all
+
+      - name: Report artifact sizes
+        run: |
+          ls -lh build/vmlinuz build/initramfs.cpio.gz output/zenith_linux.iso
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zenith-linux-iso
+          path: output/zenith_linux.iso
+          if-no-files-found: error
+
+      - name: Attach ISO to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/zenith_linux.iso

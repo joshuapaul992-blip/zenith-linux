@@ -1,0 +1,15 @@
+# /etc/inittab for Zenith Linux (BusyBox init).
+# Field format:  <id>::<action>:<process>
+
+# Run the startup script once.
+::sysinit:/etc/init.d/rcS
+
+# Interactive root shells on the framebuffer console and the serial port.
+# The leading '-' makes each a login shell so /etc/profile is sourced.
+tty1::respawn:-/bin/sh
+ttyS0::respawn:-/bin/sh
+
+# Clean shutdown / reboot handling.
+::ctrlaltdel:/sbin/reboot
+::shutdown:/bin/umount -a -r
+::restart:/sbin/init
