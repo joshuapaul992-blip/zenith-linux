@@ -12,6 +12,12 @@
 # The DSL desktop (jwm, torsmo, dfm, aterm, ...) is 32-bit; without this the
 # binaries cannot exec at all.
 CONFIG_IA32_EMULATION=y
+# tinyconfig drops these, which makes 32-bit clients hit ENOSYS at runtime
+# (e.g. Xlib: "fatal IO error 38 (Function not implemented)"). 32-bit time
+# syscalls and rseq (used by modern glibc) must be present.
+CONFIG_COMPAT_32BIT_TIME=y
+CONFIG_RSEQ=y
+CONFIG_POSIX_MQUEUE=y
 
 # --- Process/threading primitives userland (glibc, Xorg) relies on ----------
 CONFIG_MULTIUSER=y
