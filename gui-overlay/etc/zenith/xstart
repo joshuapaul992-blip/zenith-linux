@@ -10,7 +10,9 @@ D=/opt/dsl
 # via DISPLAY=127.0.0.1:0. A bind-mounted unix socket is NOT connectable from
 # inside the chroot (connect() -> ENOENT), so TCP is used instead. Access
 # control is off: this is an ephemeral single-user live system.
-X :0 vt1 -ac -listen tcp >"$LOG" 2>&1 &
+# Use a FREE VT (vt7), not vt1 where this launcher itself runs under init --
+# telling X to grab its own controlling tty makes it fail to open the console.
+X :0 vt7 -ac -listen tcp >"$LOG" 2>&1 &
 XPID=$!
 
 ok=0
