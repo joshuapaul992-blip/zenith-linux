@@ -1,0 +1,25 @@
+{
+	"name": "DonationCentral",
+	"tree": {
+		"$className": "DataModel",
+		"ReplicatedStorage": {
+			"$className": "ReplicatedStorage",
+			"DonationShared": {
+				"$className": "Folder",
+				"Config": { "$path": "src/shared/Config.luau" },
+				"Net": { "$path": "src/shared/Net.luau" }
+			}
+		},
+		"ServerScriptService": {
+			"$className": "ServerScriptService",
+			"DonationCentral": { "$path": "src/server" }
+		},
+		"StarterPlayer": {
+			"$className": "StarterPlayer",
+			"StarterPlayerScripts": {
+				"$className": "StarterPlayerScripts",
+				"DonationClient": { "$path": "src/client/init.client.luau" }
+			}
+		}
+	}
+}

@@ -1,0 +1,2559 @@
+<?xml version="1.0" encoding="utf-8"?>
+<roblox xmlns:xmime="http://www.w3.org/2005/05/xmlmime" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://www.roblox.com/roblox.xsd" version="4">
+	<Meta name="ExplicitAutoJoints">true</Meta>
+	<Item class="ReplicatedStorage" referent="RBX00000001">
+		<Properties>
+		</Properties>
+		<Item class="Folder" referent="RBX00000002">
+			<Properties>
+				<string name="Name">DonationShared</string>
+			</Properties>
+			<Item class="ModuleScript" referent="RBX00000003">
+				<Properties>
+					<string name="Name">Config</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Config
+	------
+	Central settings for the donation game. Everything a game owner needs to
+	tweak lives here. This module is shared (ReplicatedStorage) so the client
+	UI and the server logic agree on the same numbers and colours.
+
+	ALL visuals are built from solid colours + gradients in code, so there are
+	NO external image/decal asset IDs anywhere in this project. Nothing here is
+	copied from another experience.
+]]
+
+local Config = {}
+
+-- Roblox userIds that may open the owner dashboard. Add yours here.
+-- Find your id at https://www.roblox.com/users/profile (it's in the URL).
+Config.OwnerUserIds = {
+	-- 123456789,
+} :: { number }
+
+-- If your experience is published under a GROUP, set this to that group id so
+-- players can link group-owned game passes. Leave 0 to allow only passes a
+-- player created on their own account.
+Config.AllowedGroupId = 0
+
+-- Game-pass price guard rails (in Robux).
+Config.MinPassPrice = 1
+Config.MaxPassPrice = 100000
+
+-- How many passes a single player may link to their stand.
+Config.MaxPassesPerPlayer = 12
+
+-- Global leaderboards.
+Config.LeaderboardSize = 25 -- entries shown
+Config.LeaderboardRefresh = 30 -- seconds between refreshes
+
+-- Roblox marketplace fee. Sellers NET this much less than the sticker price.
+-- Used for display only ("you'll receive ~70%").
+Config.MarketplaceFee = 0.30
+
+-- -------------------------------------------------------------- in-game events
+-- Rotating, server-wide events (like Donation Central's live events). These are
+-- social/hype mechanics: Roblox won't let a script change a pass price or mint
+-- Robux, so events spotlight players, run mini-competitions, and announce
+-- winners rather than altering real payouts.
+Config.Events = {
+	Enabled = true,
+	Intermission = 150, -- seconds of quiet between events
+	StartupDelay = 45, -- grace period after the server boots
+}
+
+-- Each event: id, title, blurb (shown in the banner), duration (seconds),
+-- weight (relative pick chance) and an accent colour name from Theme.
+Config.EventList = {
+	{
+		id = "rush",
+		title = "💸 DONATION RUSH",
+		blurb = "Every donation in the next window counts toward the Rush crown!",
+		duration = 90,
+		weight = 3,
+		accent = "Accent",
+	},
+	{
+		id = "spotlight",
+		title = "🌟 DONOR SPOTLIGHT",
+		blurb = "One generous player is in the spotlight - show them love!",
+		duration = 60,
+		weight = 2,
+		accent = "Gold",
+	},
+	{
+		id = "lucky",
+		title = "🍀 LUCKY STAND",
+		blurb = "A random stand is glowing lucky - donate there for good karma!",
+		duration = 60,
+		weight = 2,
+		accent = "Accent2",
+	},
+	{
+		id = "generosity",
+		title = "🎉 GENEROSITY HOUR",
+		blurb = "Spread kindness! The most generous donor this window gets a shoutout.",
+		duration = 120,
+		weight = 2,
+		accent = "Warn",
+	},
+}
+
+-- Original, code-drawn theme. Swap these to re-skin the whole game.
+Config.Theme = {
+	Background = Color3.fromRGB(16, 18, 27),
+	Panel = Color3.fromRGB(27, 30, 44),
+	Panel2 = Color3.fromRGB(37, 41, 59),
+	Stroke = Color3.fromRGB(58, 64, 90),
+	Accent = Color3.fromRGB(112, 138, 255),
+	Accent2 = Color3.fromRGB(86, 226, 176),
+	Good = Color3.fromRGB(86, 226, 176),
+	Warn = Color3.fromRGB(255, 190, 96),
+	Bad = Color3.fromRGB(255, 108, 124),
+	Text = Color3.fromRGB(237, 240, 249),
+	SubText = Color3.fromRGB(150, 158, 182),
+	Gold = Color3.fromRGB(255, 209, 102),
+	Silver = Color3.fromRGB(205, 214, 230),
+	Bronze = Color3.fromRGB(214, 149, 102),
+}
+
+return Config
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX00000004">
+				<Properties>
+					<string name="Name">Net</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Net
+	---
+	Creates (server) and resolves (client) the RemoteEvents / RemoteFunctions
+	used by the game, so neither side hard-codes instance paths. The remotes
+	are generated at runtime, which keeps the place file script-only.
+
+	Direction key:
+	  S->C events : ProfileUpdated, Notify, LeaderboardUpdated
+	  C->S event  : RequestDonation
+	  functions   : GetProfile, GetStand, RegisterPass, UnregisterPass,
+	                GetLeaderboards, GetAdminStats
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Net = {}
+
+local FOLDER_NAME = "DonationNet"
+
+local EVENTS = {
+	"ProfileUpdated",
+	"Notify",
+	"LeaderboardUpdated",
+	"GameEvent",
+	"RequestDonation",
+}
+
+local FUNCTIONS = {
+	"GetProfile",
+	"GetStand",
+	"RegisterPass",
+	"UnregisterPass",
+	"GetLeaderboards",
+	"GetAdminStats",
+}
+
+-- Server: build the remote folder. Call once on startup.
+function Net.setup(): Folder
+	local folder = Instance.new("Folder")
+	folder.Name = FOLDER_NAME
+
+	for _, name in EVENTS do
+		local e = Instance.new("RemoteEvent")
+		e.Name = name
+		e.Parent = folder
+	end
+	for _, name in FUNCTIONS do
+		local f = Instance.new("RemoteFunction")
+		f.Name = name
+		f.Parent = folder
+	end
+
+	folder.Parent = ReplicatedStorage
+	return folder
+end
+
+local function folder(): Folder
+	return ReplicatedStorage:WaitForChild(FOLDER_NAME) :: Folder
+end
+
+function Net.event(name: string): RemoteEvent
+	return folder():WaitForChild(name) :: RemoteEvent
+end
+
+function Net.func(name: string): RemoteFunction
+	return folder():WaitForChild(name) :: RemoteFunction
+end
+
+return Net
+]]></ProtectedString>
+				</Properties>
+			</Item>
+		</Item>
+	</Item>
+	<Item class="ServerScriptService" referent="RBX00000005">
+		<Properties>
+		</Properties>
+		<Item class="Script" referent="RBX00000006">
+			<Properties>
+				<string name="Name">DonationCentral</string>
+				<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	DonationCentral - server bootstrap
+	----------------------------------
+	Wires up networking, persistence, the donation logic, leaderboards, the
+	procedural world, live events and the owner dashboard. This Script lives in
+	ServerScriptService; its sibling ModuleScripts are the subsystems.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Net = require(game:GetService("ReplicatedStorage"):WaitForChild("DonationShared"):WaitForChild("Net"))
+
+local Data = require(script.Data)
+local Donations = require(script.Donations)
+local Leaderboards = require(script.Leaderboards)
+local Stands = require(script.Stands)
+local Events = require(script.Events)
+local Admin = require(script.Admin)
+
+-- 1. Remotes first, so clients can bind immediately.
+Net.setup()
+
+-- 2. Build the world.
+Stands.buildWorld()
+
+-- 3. Players.
+local function onJoin(player: Player)
+	Data.load(player)
+	Donations.pushProfile(player)
+	Stands.createStand(player)
+end
+
+local function onLeave(player: Player)
+	Stands.removeStand(player)
+	-- Push the player's final totals to the leaderboards before releasing.
+	local profile = Data.get(player.UserId)
+	if profile then
+		Leaderboards.setEarned(player.UserId, profile.earnedRobux)
+		Leaderboards.setDonated(player.UserId, profile.donatedRobux)
+	end
+	Data.release(player.UserId)
+end
+
+Players.PlayerAdded:Connect(onJoin)
+Players.PlayerRemoving:Connect(onLeave)
+for _, player in Players:GetPlayers() do
+	task.spawn(onJoin, player)
+end
+
+-- 4. Remote handlers.
+Net.func("GetProfile").OnServerInvoke = function(player)
+	return Data.get(player.UserId)
+end
+
+Net.func("GetStand").OnServerInvoke = function(player, sellerUserId)
+	return Donations.getStand(player.UserId, sellerUserId)
+end
+
+Net.func("RegisterPass").OnServerInvoke = function(player, passId)
+	return Donations.registerPass(player, passId)
+end
+
+Net.func("UnregisterPass").OnServerInvoke = function(player, passId)
+	return Donations.unregisterPass(player, passId)
+end
+
+Net.func("GetLeaderboards").OnServerInvoke = function()
+	return Leaderboards.get()
+end
+
+Net.func("GetAdminStats").OnServerInvoke = function(player)
+	return Admin.getStats(player)
+end
+
+Net.event("RequestDonation").OnServerEvent:Connect(function(player, sellerUserId, passId)
+	local result = Donations.requestDonation(player, sellerUserId, passId)
+	if not result.ok and result.err then
+		Net.event("Notify"):FireClient(player, { kind = "bad", text = result.err })
+	end
+end)
+
+-- 5. Start subsystems.
+Donations.start()
+Leaderboards.start()
+Stands.start()
+Events.start()
+
+-- 6. Autosave loop.
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for _, player in Players:GetPlayers() do
+			Data.save(player.UserId)
+		end
+	end
+end)
+
+-- 7. Flush everything on shutdown.
+game:BindToClose(function()
+	if RunService:IsStudio() then
+		return
+	end
+	for _, player in Players:GetPlayers() do
+		local profile = Data.get(player.UserId)
+		if profile then
+			Leaderboards.setEarned(player.UserId, profile.earnedRobux)
+			Leaderboards.setDonated(player.UserId, profile.donatedRobux)
+		end
+		Data.release(player.UserId)
+	end
+	task.wait(2)
+end)
+
+print("[DonationCentral] Server ready.")
+]]></ProtectedString>
+				<token name="RunContext">0</token>
+			</Properties>
+			<Item class="ModuleScript" referent="RBX00000007">
+				<Properties>
+					<string name="Name">Data</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Data
+	----
+	Per-player persistence built on DataStoreService, plus a small global store
+	mapping a game-pass id -> the userId that linked it (so we can credit a
+	seller even while they are offline).
+
+	Design notes:
+	  * In-memory cache per online player, flushed on autosave / leave / close.
+	  * Retries with backoff around every DataStore call.
+	  * Offline sellers are credited with UpdateAsync (atomic read-modify-write).
+	  * No external dependencies - pure DataStoreService.
+]]
+
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+
+local Data = {}
+
+local PROFILE_STORE = "DonationProfiles_v2"
+local OWNER_STORE = "PassOwners_v2"
+
+local profileStore = DataStoreService:GetDataStore(PROFILE_STORE)
+local ownerStore = DataStoreService:GetDataStore(OWNER_STORE)
+
+export type Pass = {
+	id: number,
+	price: number,
+	name: string,
+}
+
+export type Profile = {
+	linkedPasses: { Pass },
+	donatedRobux: number, -- gross Robux this player has donated to others
+	earnedRobux: number, -- gross Robux others have donated to this player
+	donationCount: number, -- how many donations this player made
+	receivedCount: number, -- how many donations this player received
+	boughtPasses: { [string]: boolean }, -- dedupe guard, keyed by passId
+}
+
+local function defaultProfile(): Profile
+	return {
+		linkedPasses = {},
+		donatedRobux = 0,
+		earnedRobux = 0,
+		donationCount = 0,
+		receivedCount = 0,
+		boughtPasses = {},
+	}
+end
+
+-- userId -> Profile (only for online players)
+local cache: { [number]: Profile } = {}
+local dirty: { [number]: boolean } = {}
+
+-- Retry helper: runs fn() up to `tries` times with exponential backoff.
+local function withRetry(tries: number, fn: () -> any): (boolean, any)
+	local attempt = 0
+	local lastErr
+	while attempt < tries do
+		attempt += 1
+		local ok, result = pcall(fn)
+		if ok then
+			return true, result
+		end
+		lastErr = result
+		task.wait(2 ^ attempt * 0.25) -- 0.5s, 1s, 2s, ...
+	end
+	return false, lastErr
+end
+
+-- Normalise whatever came back from the store into a complete Profile.
+local function sanitize(raw: any): Profile
+	local p = defaultProfile()
+	if type(raw) == "table" then
+		if type(raw.linkedPasses) == "table" then
+			for _, entry in raw.linkedPasses do
+				if type(entry) == "table" and type(entry.id) == "number" then
+					table.insert(p.linkedPasses, {
+						id = entry.id,
+						price = tonumber(entry.price) or 0,
+						name = tostring(entry.name or "Game Pass"),
+					})
+				end
+			end
+		end
+		p.donatedRobux = tonumber(raw.donatedRobux) or 0
+		p.earnedRobux = tonumber(raw.earnedRobux) or 0
+		p.donationCount = tonumber(raw.donationCount) or 0
+		p.receivedCount = tonumber(raw.receivedCount) or 0
+		if type(raw.boughtPasses) == "table" then
+			for k, v in raw.boughtPasses do
+				if v then
+					p.boughtPasses[tostring(k)] = true
+				end
+			end
+		end
+	end
+	return p
+end
+
+function Data.load(player: Player): Profile
+	local key = "u_" .. player.UserId
+	local ok, raw = withRetry(5, function()
+		return profileStore:GetAsync(key)
+	end)
+	if not ok then
+		warn(("[Data] load failed for %d: %s"):format(player.UserId, tostring(raw)))
+	end
+	local profile = sanitize(ok and raw or nil)
+	cache[player.UserId] = profile
+	return profile
+end
+
+function Data.get(userId: number): Profile?
+	return cache[userId]
+end
+
+function Data.markDirty(userId: number)
+	dirty[userId] = true
+end
+
+local function writeProfile(userId: number, profile: Profile): boolean
+	local key = "u_" .. userId
+	local ok, err = withRetry(5, function()
+		profileStore:SetAsync(key, profile, { userId })
+	end)
+	if not ok then
+		warn(("[Data] save failed for %d: %s"):format(userId, tostring(err)))
+	end
+	return ok
+end
+
+function Data.save(userId: number)
+	local profile = cache[userId]
+	if profile and dirty[userId] then
+		if writeProfile(userId, profile) then
+			dirty[userId] = nil
+		end
+	end
+end
+
+function Data.release(userId: number)
+	Data.save(userId)
+	cache[userId] = nil
+	dirty[userId] = nil
+end
+
+-- Credit a SELLER who just received a donation. Works whether or not they are
+-- currently in the server. Returns the seller's new gross earned total so the
+-- caller can update the leaderboard.
+function Data.creditSeller(userId: number, grossPrice: number): number
+	local profile = cache[userId]
+	if profile then
+		profile.earnedRobux += grossPrice
+		profile.receivedCount += 1
+		Data.markDirty(userId)
+		return profile.earnedRobux
+	end
+
+	-- Offline: atomic update so we never lose a concurrent donation.
+	local key = "u_" .. userId
+	local newTotal = grossPrice
+	withRetry(5, function()
+		profileStore:UpdateAsync(key, function(raw)
+			local p = sanitize(raw)
+			p.earnedRobux += grossPrice
+			p.receivedCount += 1
+			newTotal = p.earnedRobux
+			return p
+		end)
+	end)
+	return newTotal
+end
+
+-- Record / look up which player linked a given pass id.
+function Data.setPassOwner(passId: number, userId: number)
+	withRetry(5, function()
+		ownerStore:SetAsync("p_" .. passId, userId)
+	end)
+end
+
+function Data.getPassOwner(passId: number): number?
+	local ok, result = withRetry(5, function()
+		return ownerStore:GetAsync("p_" .. passId)
+	end)
+	if ok and type(result) == "number" then
+		return result
+	end
+	return nil
+end
+
+return Data
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX00000008">
+				<Properties>
+					<string name="Name">Donations</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Donations
+	---------
+	The heart of the game. Players link their OWN game passes to their stand;
+	other players buy those passes through the UI. Because each pass is owned by
+	the seller, Roblox pays the seller directly (minus the marketplace fee) -
+	there is no manual payout step. We just verify ownership, prevent stat
+	spoofing, and record totals for the leaderboards + dashboard.
+]]
+
+local MarketplaceService = game:GetService("MarketplaceService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local shared = ReplicatedStorage:WaitForChild("DonationShared")
+local Config = require(shared:WaitForChild("Config"))
+local Net = require(shared:WaitForChild("Net"))
+
+local Data = require(script.Parent.Data)
+local Leaderboards = require(script.Parent.Leaderboards)
+
+local Donations = {}
+
+type Result = { ok: boolean, err: string?, pass: Data.Pass? }
+
+-- Running totals since the server started (for the owner dashboard).
+Donations.session = { donated = 0, count = 0 }
+
+-- Listeners notified every time a donation is credited (used by the Events
+-- system to run mini-competitions). Signature: (buyerId, sellerId, price).
+local donationListeners: { (number, number, number) -> () } = {}
+function Donations.onDonation(callback: (number, number, number) -> ())
+	table.insert(donationListeners, callback)
+end
+
+-- Short-lived cache of pass metadata to avoid hammering GetProductInfo.
+local infoCache: { [number]: { price: number, name: string, creatorType: string, creatorId: number, onSale: boolean } } = {}
+
+local function fetchInfo(passId: number)
+	local ok, info = pcall(function()
+		return MarketplaceService:GetProductInfo(passId, Enum.InfoType.GamePass)
+	end)
+	if not ok or type(info) ~= "table" then
+		return nil
+	end
+	local creator = info.Creator or {}
+	local data = {
+		price = tonumber(info.PriceInRobux) or 0,
+		name = tostring(info.Name or "Game Pass"),
+		creatorType = tostring(creator.CreatorType or "User"),
+		creatorId = tonumber(creator.CreatorTargetId) or tonumber(creator.Id) or 0,
+		onSale = info.IsForSale == true and (tonumber(info.PriceInRobux) or 0) > 0,
+	}
+	infoCache[passId] = data
+	return data
+end
+
+local function notify(player: Player?, kind: string, text: string)
+	if player and player.Parent then
+		Net.event("Notify"):FireClient(player, { kind = kind, text = text })
+	end
+end
+
+function Donations.pushProfile(player: Player)
+	local profile = Data.get(player.UserId)
+	if profile then
+		Net.event("ProfileUpdated"):FireClient(player, profile)
+	end
+end
+
+-- Verify the pass is owned by this player (or the allowed group) so nobody can
+-- link someone else's pass to steal leaderboard credit. (Robux always goes to
+-- the true owner regardless - this only protects the stats.)
+local function ownsPass(player: Player, info): boolean
+	if info.creatorType == "Group" then
+		return Config.AllowedGroupId ~= 0 and info.creatorId == Config.AllowedGroupId
+	end
+	return info.creatorId == player.UserId
+end
+
+function Donations.registerPass(player: Player, rawId: any): Result
+	local passId = tonumber(rawId)
+	if not passId or passId <= 0 or passId % 1 ~= 0 then
+		return { ok = false, err = "Enter a valid game pass id." }
+	end
+
+	local profile = Data.get(player.UserId)
+	if not profile then
+		return { ok = false, err = "Your data is still loading - try again." }
+	end
+
+	if #profile.linkedPasses >= Config.MaxPassesPerPlayer then
+		return { ok = false, err = ("You can link at most %d passes."):format(Config.MaxPassesPerPlayer) }
+	end
+	for _, p in profile.linkedPasses do
+		if p.id == passId then
+			return { ok = false, err = "You already linked that pass." }
+		end
+	end
+
+	local info = fetchInfo(passId)
+	if not info then
+		return { ok = false, err = "Couldn't find that game pass. Check the id." }
+	end
+	if not info.onSale then
+		return { ok = false, err = "That pass isn't on sale. Enable 'For Sale' and set a price." }
+	end
+	if not ownsPass(player, info) then
+		return { ok = false, err = "You can only link passes YOU created." }
+	end
+	if info.price < Config.MinPassPrice or info.price > Config.MaxPassPrice then
+		return { ok = false, err = ("Price must be between %d and %d R$."):format(Config.MinPassPrice, Config.MaxPassPrice) }
+	end
+
+	local pass: Data.Pass = { id = passId, price = info.price, name = info.name }
+	table.insert(profile.linkedPasses, pass)
+	Data.markDirty(player.UserId)
+	Data.setPassOwner(passId, player.UserId)
+	Donations.pushProfile(player)
+	return { ok = true, pass = pass }
+end
+
+function Donations.unregisterPass(player: Player, rawId: any): Result
+	local passId = tonumber(rawId)
+	local profile = Data.get(player.UserId)
+	if not passId or not profile then
+		return { ok = false, err = "Invalid request." }
+	end
+	for i, p in profile.linkedPasses do
+		if p.id == passId then
+			table.remove(profile.linkedPasses, i)
+			Data.markDirty(player.UserId)
+			Donations.pushProfile(player)
+			return { ok = true }
+		end
+	end
+	return { ok = false, err = "Pass not found." }
+end
+
+-- Return a seller's public stand (their linked passes) for the donate screen.
+function Donations.getStand(viewerUserId: number, rawSellerId: any)
+	local sellerId = tonumber(rawSellerId)
+	if not sellerId then
+		return nil
+	end
+	local profile = Data.get(sellerId)
+	if not profile then
+		return nil
+	end
+	local seller = Players:GetPlayerByUserId(sellerId)
+	return {
+		userId = sellerId,
+		name = seller and seller.DisplayName or ("User" .. sellerId),
+		earnedRobux = profile.earnedRobux,
+		receivedCount = profile.receivedCount,
+		passes = profile.linkedPasses,
+	}
+end
+
+-- A buyer asks to donate to a seller via one of the seller's passes.
+function Donations.requestDonation(buyer: Player, rawSellerId: any, rawPassId: any): Result
+	local sellerId = tonumber(rawSellerId)
+	local passId = tonumber(rawPassId)
+	if not sellerId or not passId then
+		return { ok = false, err = "Invalid request." }
+	end
+	if sellerId == buyer.UserId then
+		return { ok = false, err = "You can't donate to yourself." }
+	end
+
+	local sellerProfile = Data.get(sellerId)
+	if not sellerProfile then
+		return { ok = false, err = "That player's stand isn't available right now." }
+	end
+	local found = false
+	for _, p in sellerProfile.linkedPasses do
+		if p.id == passId then
+			found = true
+			break
+		end
+	end
+	if not found then
+		return { ok = false, err = "That pass is no longer on this stand." }
+	end
+
+	-- A game pass can only be owned once; tell the buyer nicely.
+	local ownsOk, owns = pcall(function()
+		return MarketplaceService:UserOwnsGamePassAsync(buyer.UserId, passId)
+	end)
+	if ownsOk and owns then
+		return { ok = false, err = "You already own this pass (already donated with it)." }
+	end
+
+	MarketplaceService:PromptGamePassPurchase(buyer, passId)
+	return { ok = true }
+end
+
+-- Fired by Roblox after any game-pass purchase prompt resolves.
+local function onPurchaseFinished(buyer: Player, passId: number, wasPurchased: boolean)
+	if not wasPurchased then
+		return
+	end
+	local sellerId = Data.getPassOwner(passId)
+	if not sellerId then
+		return -- not a pass tracked by this game
+	end
+
+	local buyerProfile = Data.get(buyer.UserId)
+	if not buyerProfile then
+		return
+	end
+
+	local key = tostring(passId)
+	if buyerProfile.boughtPasses[key] then
+		return -- already credited (guards against duplicate events)
+	end
+
+	local info = fetchInfo(passId)
+	local price = info and info.price or 0
+	if price <= 0 then
+		return
+	end
+
+	buyerProfile.boughtPasses[key] = true
+	buyerProfile.donatedRobux += price
+	buyerProfile.donationCount += 1
+	Data.markDirty(buyer.UserId)
+
+	Donations.session.donated += price
+	Donations.session.count += 1
+
+	local sellerTotal = Data.creditSeller(sellerId, price)
+
+	Leaderboards.setDonated(buyer.UserId, buyerProfile.donatedRobux)
+	Leaderboards.setEarned(sellerId, sellerTotal)
+
+	local net = math.floor(price * (1 - Config.MarketplaceFee))
+	notify(buyer, "good", ("Donated %d R$ - thank you! 💖"):format(price))
+	Donations.pushProfile(buyer)
+
+	local seller = Players:GetPlayerByUserId(sellerId)
+	if seller then
+		notify(seller, "good", ("%s donated %d R$ to you (~%d after fees)!"):format(buyer.DisplayName, price, net))
+		Donations.pushProfile(seller)
+	end
+
+	for _, listener in donationListeners do
+		task.spawn(listener, buyer.UserId, sellerId, price)
+	end
+end
+
+function Donations.start()
+	MarketplaceService.PromptGamePassPurchaseFinished:Connect(onPurchaseFinished)
+end
+
+return Donations
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX00000009">
+				<Properties>
+					<string name="Name">Leaderboards</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Leaderboards
+	------------
+	Global "Top Earners" and "Top Donors" boards backed by OrderedDataStores.
+	Totals are pushed to clients on an interval and re-rendered onto any
+	physical board surfaces registered by the Stands module.
+]]
+
+local DataStoreService = game:GetService("DataStoreService")
+local Players = game:GetService("Players")
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local shared = ReplicatedStorage:WaitForChild("DonationShared")
+local Config = require(shared:WaitForChild("Config"))
+local Net = require(shared:WaitForChild("Net"))
+
+local Leaderboards = {}
+
+local earnedStore = DataStoreService:GetOrderedDataStore("LB_Earned_v2")
+local donatedStore = DataStoreService:GetOrderedDataStore("LB_Donated_v2")
+
+export type Entry = { userId: number, name: string, value: number }
+export type Snapshot = { topEarners: { Entry }, topDonors: { Entry } }
+
+local snapshot: Snapshot = { topEarners = {}, topDonors = {} }
+local nameCache: { [number]: string } = {}
+local refreshSubs: { (Snapshot) -> () } = {}
+
+local function withRetry(tries: number, fn: () -> any): (boolean, any)
+	local attempt = 0
+	local lastErr
+	while attempt < tries do
+		attempt += 1
+		local ok, result = pcall(fn)
+		if ok then
+			return true, result
+		end
+		lastErr = result
+		task.wait(2 ^ attempt * 0.25)
+	end
+	return false, lastErr
+end
+
+local function resolveName(userId: number): string
+	if nameCache[userId] then
+		return nameCache[userId]
+	end
+	local ok, name = pcall(function()
+		return Players:GetNameFromUserIdAsync(userId)
+	end)
+	local resolved = (ok and name) or ("User" .. userId)
+	nameCache[userId] = resolved
+	return resolved
+end
+
+-- Write an absolute total for a player into an ordered store.
+local function setOrdered(store: OrderedDataStore, userId: number, total: number)
+	-- OrderedDataStores only accept integers.
+	local value = math.max(0, math.floor(total))
+	withRetry(4, function()
+		store:SetAsync(tostring(userId), value)
+	end)
+end
+
+function Leaderboards.setEarned(userId: number, total: number)
+	setOrdered(earnedStore, userId, total)
+end
+
+function Leaderboards.setDonated(userId: number, total: number)
+	setOrdered(donatedStore, userId, total)
+end
+
+local function readTop(store: OrderedDataStore): { Entry }
+	local entries: { Entry } = {}
+	local ok, pages = withRetry(4, function()
+		return store:GetSortedAsync(false, Config.LeaderboardSize)
+	end)
+	if not ok or not pages then
+		return entries
+	end
+	local page = pages:GetCurrentPage()
+	for _, item in page do
+		local userId = tonumber(item.key)
+		if userId then
+			table.insert(entries, {
+				userId = userId,
+				name = resolveName(userId),
+				value = tonumber(item.value) or 0,
+			})
+		end
+	end
+	return entries
+end
+
+function Leaderboards.refresh(): Snapshot
+	snapshot = {
+		topEarners = readTop(earnedStore),
+		topDonors = readTop(donatedStore),
+	}
+	for _, sub in refreshSubs do
+		task.spawn(sub, snapshot)
+	end
+	Net.event("LeaderboardUpdated"):FireAllClients(snapshot)
+	return snapshot
+end
+
+function Leaderboards.get(): Snapshot
+	return snapshot
+end
+
+-- Let other systems (e.g. physical boards) redraw when data refreshes.
+function Leaderboards.onRefresh(callback: (Snapshot) -> ())
+	table.insert(refreshSubs, callback)
+	callback(snapshot)
+end
+
+function Leaderboards.start()
+	task.spawn(function()
+		while true do
+			Leaderboards.refresh()
+			task.wait(Config.LeaderboardRefresh)
+		end
+	end)
+end
+
+return Leaderboards
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX0000000A">
+				<Properties>
+					<string name="Name">Stands</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Stands
+	------
+	Builds the physical world entirely from code (no imported models): a floor,
+	a spawn, two glowing leaderboard pillars, and a personal podium for each
+	player arranged in a ring. Walking up to a podium and pressing the prompt
+	opens that player's donation stand on the client.
+]]
+
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local shared = ReplicatedStorage:WaitForChild("DonationShared")
+local Config = require(shared:WaitForChild("Config"))
+
+local Data = require(script.Parent.Data)
+local Leaderboards = require(script.Parent.Leaderboards)
+
+local Stands = {}
+
+local T = Config.Theme
+local RING_RADIUS = 32
+local MAX_SLOTS = 24
+
+local worldFolder: Folder
+local stands: { [number]: Model } = {}
+local slotTaken: { [number]: boolean } = {}
+
+local function makePart(props: { [string]: any }): Part
+	local p = Instance.new("Part")
+	p.Anchored = true
+	p.Material = Enum.Material.SmoothPlastic
+	for k, v in props do
+		(p :: any)[k] = v
+	end
+	return p
+end
+
+local function roundify(gui: Instance, radius: number)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = gui
+end
+
+-- ---------------------------------------------------------------- world base
+function Stands.buildWorld()
+	worldFolder = Instance.new("Folder")
+	worldFolder.Name = "DonationWorld"
+
+	local floor = makePart({
+		Name = "Floor",
+		Size = Vector3.new(220, 2, 220),
+		Position = Vector3.new(0, -1, 0),
+		Color = Color3.fromRGB(32, 35, 50),
+		Material = Enum.Material.Concrete,
+	})
+	floor.Parent = worldFolder
+
+	-- Decorative accent ring on the floor.
+	local ring = makePart({
+		Name = "AccentRing",
+		Shape = Enum.PartType.Cylinder,
+		Size = Vector3.new(0.4, RING_RADIUS * 2 + 10, RING_RADIUS * 2 + 10),
+		CFrame = CFrame.new(0, 0.1, 0) * CFrame.Angles(0, 0, math.rad(90)),
+		Color = T.Accent,
+		Material = Enum.Material.Neon,
+		Transparency = 0.4,
+	})
+	ring.Parent = worldFolder
+
+	local spawn = Instance.new("SpawnLocation")
+	spawn.Name = "Spawn"
+	spawn.Anchored = true
+	spawn.Size = Vector3.new(10, 1, 10)
+	spawn.Position = Vector3.new(0, 0.5, 0)
+	spawn.Color = T.Accent2
+	spawn.Material = Enum.Material.Neon
+	spawn.Neutral = true
+	spawn.Duration = 0
+	spawn.Parent = worldFolder
+
+	-- A welcome sign over spawn.
+	local pole = makePart({
+		Name = "SignPole",
+		Size = Vector3.new(1, 14, 1),
+		Position = Vector3.new(0, 7, 0),
+		Color = Color3.fromRGB(45, 49, 68),
+	})
+	pole.Parent = worldFolder
+	local board = makePart({
+		Name = "WelcomeBoard",
+		Size = Vector3.new(24, 7, 1),
+		Position = Vector3.new(0, 15, 0),
+		Color = T.Panel,
+	})
+	board.Parent = worldFolder
+	local sg = Instance.new("SurfaceGui")
+	sg.Face = Enum.NormalId.Front
+	sg.CanvasSize = Vector2.new(480, 140)
+	sg.Parent = board
+	local title = Instance.new("TextLabel")
+	title.Size = UDim2.fromScale(1, 0.6)
+	title.BackgroundTransparency = 1
+	title.Font = Enum.Font.GothamBlack
+	title.Text = "DONATION PLAZA"
+	title.TextColor3 = T.Text
+	title.TextScaled = true
+	title.Parent = sg
+	local sub = Instance.new("TextLabel")
+	sub.Position = UDim2.fromScale(0, 0.6)
+	sub.Size = UDim2.fromScale(1, 0.4)
+	sub.BackgroundTransparency = 1
+	sub.Font = Enum.Font.GothamMedium
+	sub.Text = "Walk to a stand to donate • Link your passes to earn"
+	sub.TextColor3 = T.SubText
+	sub.TextScaled = true
+	sub.Parent = sg
+
+	Stands.buildLeaderboardPillars(worldFolder)
+
+	worldFolder.Parent = Workspace
+
+	-- Pleasant lighting.
+	Lighting.ClockTime = 15
+	Lighting.Brightness = 2
+	Lighting.Ambient = Color3.fromRGB(70, 72, 90)
+	Lighting.OutdoorAmbient = Color3.fromRGB(90, 94, 120)
+end
+
+-- --------------------------------------------------------- leaderboard boards
+local function renderBoard(surface: SurfaceGui, heading: string, accent: Color3, entries)
+	for _, child in surface:GetChildren() do
+		child:Destroy()
+	end
+
+	local header = Instance.new("TextLabel")
+	header.Size = UDim2.new(1, -16, 0, 48)
+	header.Position = UDim2.new(0, 8, 0, 8)
+	header.BackgroundColor3 = accent
+	header.Font = Enum.Font.GothamBlack
+	header.Text = heading
+	header.TextColor3 = Color3.fromRGB(20, 22, 32)
+	header.TextScaled = true
+	header.Parent = surface
+	roundify(header, 8)
+
+	local list = Instance.new("Frame")
+	list.Size = UDim2.new(1, -16, 1, -68)
+	list.Position = UDim2.new(0, 8, 0, 64)
+	list.BackgroundTransparency = 1
+	list.Parent = surface
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.Parent = list
+
+	if #entries == 0 then
+		local empty = Instance.new("TextLabel")
+		empty.Size = UDim2.new(1, 0, 0, 40)
+		empty.BackgroundTransparency = 1
+		empty.Font = Enum.Font.GothamMedium
+		empty.Text = "No donations yet - be the first!"
+		empty.TextColor3 = T.SubText
+		empty.TextScaled = true
+		empty.Parent = list
+		return
+	end
+
+	for rank, entry in entries do
+		if rank > 10 then
+			break
+		end
+		local row = Instance.new("TextLabel")
+		row.Size = UDim2.new(1, 0, 0, 34)
+		row.BackgroundColor3 = T.Panel2
+		row.BackgroundTransparency = 0.2
+		row.Font = Enum.Font.GothamMedium
+		row.TextColor3 = T.Text
+		row.TextScaled = true
+		row.TextXAlignment = Enum.TextXAlignment.Left
+		row.Text = ("  #%d  %s"):format(rank, entry.name)
+		row.Parent = list
+		roundify(row, 6)
+
+		local amount = Instance.new("TextLabel")
+		amount.Size = UDim2.new(0.4, 0, 1, 0)
+		amount.Position = UDim2.new(0.6, 0, 0, 0)
+		amount.BackgroundTransparency = 1
+		amount.Font = Enum.Font.GothamBold
+		amount.TextColor3 = accent
+		amount.TextScaled = true
+		amount.TextXAlignment = Enum.TextXAlignment.Right
+		amount.Text = ("%s R$  "):format(Stands.comma(entry.value))
+		amount.Parent = row
+	end
+end
+
+function Stands.comma(n: number): string
+	local s = tostring(math.floor(n))
+	local formatted = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	return (formatted:gsub("^,", ""))
+end
+
+function Stands.buildLeaderboardPillars(parent: Instance)
+	local defs = {
+		{ heading = "TOP EARNERS", accent = T.Accent2, pos = Vector3.new(-14, 9, -24), key = "topEarners" },
+		{ heading = "TOP DONORS", accent = T.Accent, pos = Vector3.new(14, 9, -24), key = "topDonors" },
+	}
+	local surfaces = {}
+	for _, def in defs do
+		local pillar = makePart({
+			Name = def.heading,
+			Size = Vector3.new(16, 18, 1),
+			Position = def.pos,
+			Color = T.Panel,
+		})
+		pillar.Parent = parent
+		local sg = Instance.new("SurfaceGui")
+		sg.Face = Enum.NormalId.Front
+		sg.CanvasSize = Vector2.new(360, 420)
+		sg.Parent = pillar
+		surfaces[def.key] = { gui = sg, heading = def.heading, accent = def.accent }
+		renderBoard(sg, def.heading, def.accent, {})
+	end
+
+	Leaderboards.onRefresh(function(snapshot)
+		for key, info in surfaces do
+			renderBoard(info.gui, info.heading, info.accent, (snapshot :: any)[key] or {})
+		end
+	end)
+end
+
+-- --------------------------------------------------------------- player stands
+local function freeSlot(): number?
+	for i = 0, MAX_SLOTS - 1 do
+		if not slotTaken[i] then
+			slotTaken[i] = true
+			return i
+		end
+	end
+	return nil
+end
+
+local function slotCFrame(slot: number): CFrame
+	local angle = (slot / MAX_SLOTS) * math.pi * 2
+	local pos = Vector3.new(math.cos(angle) * RING_RADIUS, 1.5, math.sin(angle) * RING_RADIUS)
+	return CFrame.lookAt(pos, Vector3.new(0, 1.5, 0))
+end
+
+function Stands.createStand(player: Player)
+	local slot = freeSlot()
+	if not slot then
+		return
+	end
+
+	local model = Instance.new("Model")
+	model.Name = "Stand_" .. player.UserId
+	model:SetAttribute("OwnerUserId", player.UserId)
+	model:SetAttribute("Slot", slot)
+
+	local cframe = slotCFrame(slot)
+
+	local base = makePart({
+		Name = "Base",
+		Size = Vector3.new(6, 3, 6),
+		CFrame = cframe,
+		Color = T.Panel,
+	})
+	base.Parent = model
+
+	local top = makePart({
+		Name = "Top",
+		Size = Vector3.new(6, 0.4, 6),
+		CFrame = cframe * CFrame.new(0, 1.7, 0),
+		Color = player.UserId % 2 == 0 and T.Accent or T.Accent2,
+		Material = Enum.Material.Neon,
+	})
+	top.Parent = model
+
+	-- Floating name + earnings sign.
+	local sign = makePart({
+		Name = "Sign",
+		Size = Vector3.new(0.5, 0.5, 0.5),
+		CFrame = cframe * CFrame.new(0, 4.5, 0),
+		Transparency = 1,
+		CanCollide = false,
+	})
+	sign.Parent = model
+
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "Nameplate"
+	bb.Size = UDim2.fromScale(7, 2.6)
+	bb.StudsOffsetWorldSpace = Vector3.new(0, 0, 0)
+	bb.AlwaysOnTop = false
+	bb.MaxDistance = 80
+	bb.Parent = sign
+
+	local card = Instance.new("Frame")
+	card.Size = UDim2.fromScale(1, 1)
+	card.BackgroundColor3 = T.Panel
+	card.BackgroundTransparency = 0.1
+	card.Parent = bb
+	roundify(card, 10)
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = T.Stroke
+	stroke.Thickness = 2
+	stroke.Parent = card
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, -12, 0.55, 0)
+	nameLabel.Position = UDim2.new(0, 6, 0, 2)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.Text = player.DisplayName
+	nameLabel.TextColor3 = T.Text
+	nameLabel.TextScaled = true
+	nameLabel.Parent = card
+
+	local earnLabel = Instance.new("TextLabel")
+	earnLabel.Name = "Earned"
+	earnLabel.Size = UDim2.new(1, -12, 0.45, 0)
+	earnLabel.Position = UDim2.new(0, 6, 0.55, 0)
+	earnLabel.BackgroundTransparency = 1
+	earnLabel.Font = Enum.Font.GothamMedium
+	earnLabel.Text = "Raised: 0 R$"
+	earnLabel.TextColor3 = T.Accent2
+	earnLabel.TextScaled = true
+	earnLabel.Parent = card
+
+	-- Interaction prompt. The client reads OwnerUserId to open the stand UI.
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.Name = "DonatePrompt"
+	prompt.ActionText = "Donate"
+	prompt.ObjectText = player.DisplayName .. "'s Stand"
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 12
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = base
+
+	model.PrimaryPart = base
+	model.Parent = worldFolder
+	stands[player.UserId] = model
+end
+
+-- Visually flag a stand during events (spotlight / lucky).
+function Stands.setHighlight(userId: number, enabled: boolean, color: Color3?)
+	local model = stands[userId]
+	if not model then
+		return
+	end
+	local existing = model:FindFirstChild("EventHighlight")
+	if enabled then
+		local hl = existing :: Highlight
+		if not hl then
+			hl = Instance.new("Highlight")
+			hl.Name = "EventHighlight"
+			hl.FillTransparency = 0.6
+			hl.OutlineTransparency = 0
+			hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			hl.Parent = model
+		end
+		hl.FillColor = color or T.Gold
+		hl.OutlineColor = color or T.Gold
+	elseif existing then
+		existing:Destroy()
+	end
+end
+
+function Stands.clearAllHighlights()
+	for userId in stands do
+		Stands.setHighlight(userId, false)
+	end
+end
+
+function Stands.removeStand(player: Player)
+	local model = stands[player.UserId]
+	if model then
+		local slot = model:GetAttribute("Slot")
+		if type(slot) == "number" then
+			slotTaken[slot] = nil
+		end
+		model:Destroy()
+		stands[player.UserId] = nil
+	end
+end
+
+-- Keep the nameplate earnings fresh.
+function Stands.start()
+	task.spawn(function()
+		while true do
+			for userId, model in stands do
+				local profile = Data.get(userId)
+				local label = model:FindFirstChild("Sign")
+					and (model.Sign :: any).Nameplate
+					and (model.Sign :: any).Nameplate:FindFirstChild("Frame")
+				local earned = label and label:FindFirstChild("Earned")
+				if profile and earned then
+					earned.Text = "Raised: " .. Stands.comma(profile.earnedRobux) .. " R$"
+				end
+			end
+			task.wait(4)
+		end
+	end)
+end
+
+return Stands
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX0000000B">
+				<Properties>
+					<string name="Name">Events</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Events
+	------
+	Rotating, server-wide live events (Donation Central style). Because a script
+	can't change real pass prices or mint Robux, these are hype + social
+	mechanics: they spotlight players, run donation mini-competitions during a
+	window, and crown a winner. Everything is announced to all clients via the
+	GameEvent remote, which drives the on-screen banner + countdown.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local shared = ReplicatedStorage:WaitForChild("DonationShared")
+local Config = require(shared:WaitForChild("Config"))
+local Net = require(shared:WaitForChild("Net"))
+
+local Data = require(script.Parent.Data)
+local Donations = require(script.Parent.Donations)
+local Stands = require(script.Parent.Stands)
+
+local Events = {}
+
+local T = Config.Theme
+
+-- State for the event currently running (nil during intermission).
+local active: {
+	id: string,
+	capture: { [number]: number }, -- buyerId -> Robux donated during window
+	targetUserId: number?,
+}? = nil
+
+local function accent(name: string): Color3
+	return (T :: any)[name] or T.Accent
+end
+
+local function broadcast(payload: { [string]: any })
+	Net.event("GameEvent"):FireAllClients(payload)
+end
+
+local function pickWeighted()
+	local total = 0
+	for _, def in Config.EventList do
+		total += def.weight
+	end
+	local roll = math.random() * total
+	local acc = 0
+	for _, def in Config.EventList do
+		acc += def.weight
+		if roll <= acc then
+			return def
+		end
+	end
+	return Config.EventList[1]
+end
+
+local function onlinePlayers(): { Player }
+	return Players:GetPlayers()
+end
+
+local function highestEarnerOnline(): Player?
+	local best: Player? = nil
+	local bestVal = -1
+	for _, player in onlinePlayers() do
+		local p = Data.get(player.UserId)
+		if p and p.earnedRobux > bestVal then
+			bestVal = p.earnedRobux
+			best = player
+		end
+	end
+	return best
+end
+
+-- Track donations while a competition event is live.
+Donations.onDonation(function(buyerId, _sellerId, price)
+	if active and (active.id == "rush" or active.id == "generosity") then
+		active.capture[buyerId] = (active.capture[buyerId] or 0) + price
+	end
+end)
+
+local function resultForCompetition(): string
+	if not active then
+		return "No winner this time."
+	end
+	local winnerId, winnerVal = nil, 0
+	for buyerId, amount in active.capture do
+		if amount > winnerVal then
+			winnerVal = amount
+			winnerId = buyerId
+		end
+	end
+	if not winnerId then
+		return "Nobody donated this round - next time!"
+	end
+	local winner = Players:GetPlayerByUserId(winnerId)
+	local name = winner and winner.DisplayName or ("User" .. winnerId)
+	if winner then
+		Net.event("Notify"):FireClient(winner, {
+			kind = "good",
+			text = ("🏆 You won the event with %d R$ donated!"):format(winnerVal),
+		})
+	end
+	return ("🏆 %s donated the most (%d R$)!"):format(name, winnerVal)
+end
+
+local function runEvent(def)
+	local players = onlinePlayers()
+	if #players == 0 then
+		return
+	end
+
+	active = { id = def.id, capture = {}, targetUserId = nil }
+	local targetName: string? = nil
+
+	if def.id == "spotlight" then
+		local target = highestEarnerOnline() or players[math.random(#players)]
+		if target then
+			active.targetUserId = target.UserId
+			targetName = target.DisplayName
+			Stands.setHighlight(target.UserId, true, accent(def.accent))
+		end
+	elseif def.id == "lucky" then
+		local target = players[math.random(#players)]
+		active.targetUserId = target.UserId
+		targetName = target.DisplayName
+		Stands.setHighlight(target.UserId, true, accent(def.accent))
+	end
+
+	broadcast({
+		phase = "start",
+		id = def.id,
+		title = def.title,
+		blurb = def.blurb,
+		duration = def.duration,
+		accent = accent(def.accent),
+		targetName = targetName,
+	})
+
+	task.wait(def.duration)
+
+	local resultText
+	if def.id == "rush" or def.id == "generosity" then
+		resultText = resultForCompetition()
+	elseif targetName then
+		resultText = ("Thanks for supporting %s! 💖"):format(targetName)
+	else
+		resultText = "Thanks for playing along!"
+	end
+
+	if active and active.targetUserId then
+		Stands.setHighlight(active.targetUserId, false)
+	end
+	Stands.clearAllHighlights()
+
+	broadcast({
+		phase = "end",
+		id = def.id,
+		title = def.title,
+		resultText = resultText,
+	})
+
+	active = nil
+end
+
+function Events.start()
+	if not Config.Events.Enabled then
+		return
+	end
+	task.spawn(function()
+		task.wait(Config.Events.StartupDelay)
+		while true do
+			local def = pickWeighted()
+			runEvent(def)
+			task.wait(Config.Events.Intermission)
+		end
+	end)
+end
+
+return Events
+]]></ProtectedString>
+				</Properties>
+			</Item>
+			<Item class="ModuleScript" referent="RBX0000000C">
+				<Properties>
+					<string name="Name">Admin</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	Admin
+	-----
+	Owner-only dashboard data. Because gamepass donations pay each seller
+	directly through Roblox, there is nothing to "pay out" by hand - this panel
+	is an at-a-glance view of how the game is performing: who's earning, who's
+	donating, and the live totals for this server.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local shared = ReplicatedStorage:WaitForChild("DonationShared")
+local Config = require(shared:WaitForChild("Config"))
+
+local Data = require(script.Parent.Data)
+local Donations = require(script.Parent.Donations)
+local Leaderboards = require(script.Parent.Leaderboards)
+
+local Admin = {}
+
+local ownerSet: { [number]: boolean } = {}
+for _, id in Config.OwnerUserIds do
+	ownerSet[id] = true
+end
+
+function Admin.isOwner(player: Player): boolean
+	if ownerSet[player.UserId] then
+		return true
+	end
+	-- The experience creator is always an owner, even if not listed in Config.
+	if game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then
+		return true
+	end
+	return false
+end
+
+function Admin.getStats(requester: Player)
+	if not Admin.isOwner(requester) then
+		return { ok = false, err = "Owner only." }
+	end
+
+	local online = {}
+	for _, player in Players:GetPlayers() do
+		local p = Data.get(player.UserId)
+		if p then
+			table.insert(online, {
+				name = player.DisplayName,
+				userId = player.UserId,
+				earnedRobux = p.earnedRobux,
+				donatedRobux = p.donatedRobux,
+				linkedPasses = #p.linkedPasses,
+			})
+		end
+	end
+	table.sort(online, function(a, b)
+		return a.earnedRobux > b.earnedRobux
+	end)
+
+	local lb = Leaderboards.get()
+	return {
+		ok = true,
+		feePct = math.floor(Config.MarketplaceFee * 100),
+		session = {
+			donated = Donations.session.donated,
+			count = Donations.session.count,
+			players = #Players:GetPlayers(),
+		},
+		online = online,
+		topEarners = lb.topEarners,
+		topDonors = lb.topDonors,
+	}
+end
+
+return Admin
+]]></ProtectedString>
+				</Properties>
+			</Item>
+		</Item>
+	</Item>
+	<Item class="StarterPlayer" referent="RBX0000000D">
+		<Properties>
+		</Properties>
+		<Item class="StarterPlayerScripts" referent="RBX0000000E">
+			<Properties>
+			</Properties>
+			<Item class="LocalScript" referent="RBX0000000F">
+				<Properties>
+					<string name="Name">DonationClient</string>
+					<ProtectedString name="Source"><![CDATA[--!strict
+--[[
+	DonationCentral - client
+	------------------------
+	Builds the entire UI in code (no imported images/decals) and wires it to the
+	server remotes. Panels: My Stand, Donate, Leaderboards and an owner-only
+	Dashboard, plus toast notifications and the live-event banner + countdown.
+]]
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local LocalPlayer = Players.LocalPlayer
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local shared = ReplicatedStorage:WaitForChild("DonationShared")
+local Config = require(shared:WaitForChild("Config"))
+local Net = require(shared:WaitForChild("Net"))
+
+local T = Config.Theme
+
+-- ----------------------------------------------------------------- UI helpers
+local function new(class: string, props: { [string]: any }?, children: { Instance }?): any
+	local inst = Instance.new(class)
+	if props then
+		for k, v in props do
+			(inst :: any)[k] = v
+		end
+	end
+	if children then
+		for _, c in children do
+			c.Parent = inst
+		end
+	end
+	return inst
+end
+
+local function corner(radius: number): UICorner
+	return new("UICorner", { CornerRadius = UDim.new(0, radius) })
+end
+
+local function stroke(color: Color3, thickness: number?): UIStroke
+	return new("UIStroke", { Color = color, Thickness = thickness or 1, Transparency = 0.2 })
+end
+
+local function pad(all: number): UIPadding
+	return new("UIPadding", {
+		PaddingTop = UDim.new(0, all),
+		PaddingBottom = UDim.new(0, all),
+		PaddingLeft = UDim.new(0, all),
+		PaddingRight = UDim.new(0, all),
+	})
+end
+
+local function comma(n: number): string
+	local s = tostring(math.floor(tonumber(n) or 0))
+	local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
+	return (out:gsub("^,", ""))
+end
+
+local function button(text: string, color: Color3, size: UDim2): TextButton
+	return new("TextButton", {
+		Text = text,
+		Font = Enum.Font.GothamBold,
+		TextColor3 = T.Text,
+		TextScaled = true,
+		BackgroundColor3 = color,
+		Size = size,
+		AutoButtonColor = true,
+	}, { corner(8), pad(6) })
+end
+
+-- --------------------------------------------------------------- root + layout
+local gui = new("ScreenGui", {
+	Name = "DonationCentralUI",
+	ResetOnSpawn = false,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	IgnoreGuiInset = true,
+})
+gui.Parent = playerGui
+
+-- Top bar
+local topBar = new("Frame", {
+	Size = UDim2.new(1, 0, 0, 56),
+	BackgroundColor3 = T.Panel,
+}, { stroke(T.Stroke) })
+topBar.Parent = gui
+
+local logo = new("TextLabel", {
+	Size = UDim2.new(0, 320, 1, 0),
+	Position = UDim2.fromOffset(16, 0),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "DONATION CENTRAL",
+	TextColor3 = T.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextSize = 24,
+})
+logo.Parent = topBar
+
+local navHolder = new("Frame", {
+	Size = UDim2.new(1, -340, 1, -14),
+	Position = UDim2.new(0, 336, 0, 7),
+	BackgroundTransparency = 1,
+})
+navHolder.Parent = topBar
+new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	HorizontalAlignment = Enum.HorizontalAlignment.Right,
+	VerticalAlignment = Enum.VerticalAlignment.Center,
+	Padding = UDim.new(0, 8),
+}).Parent = navHolder
+
+-- Content area holding the panels
+local content = new("Frame", {
+	Size = UDim2.new(1, -32, 1, -88),
+	Position = UDim2.fromOffset(16, 72),
+	BackgroundTransparency = 1,
+})
+content.Parent = gui
+
+local panels: { [string]: Frame } = {}
+local navButtons: { [string]: TextButton } = {}
+
+local function makePanel(name: string): Frame
+	local p = new("Frame", {
+		Name = name,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = T.Background,
+		BackgroundTransparency = 0.15,
+		Visible = false,
+	}, { corner(14), stroke(T.Stroke), pad(16) })
+	p.Parent = content
+	panels[name] = p
+	return p
+end
+
+local function showPanel(name: string)
+	for key, panel in panels do
+		panel.Visible = (key == name)
+	end
+	for key, btn in navButtons do
+		btn.BackgroundColor3 = (key == name) and T.Accent or T.Panel2
+	end
+end
+
+local function addNav(name: string, label: string)
+	local btn = button(label, T.Panel2, UDim2.fromOffset(130, 1))
+	btn.Size = UDim2.new(0, 130, 1, 0)
+	btn.TextSize = 15
+	btn.TextScaled = false
+	btn.Parent = navHolder
+	btn.Activated:Connect(function()
+		showPanel(name)
+	end)
+	navButtons[name] = btn
+end
+
+-- ------------------------------------------------------------------- toasts
+local toastHolder = new("Frame", {
+	Size = UDim2.new(0, 320, 1, -80),
+	Position = UDim2.new(1, -336, 0, 72),
+	BackgroundTransparency = 1,
+})
+toastHolder.Parent = gui
+new("UIListLayout", {
+	VerticalAlignment = Enum.VerticalAlignment.Bottom,
+	HorizontalAlignment = Enum.HorizontalAlignment.Right,
+	Padding = UDim.new(0, 8),
+	SortOrder = Enum.SortOrder.LayoutOrder,
+}).Parent = toastHolder
+
+local toastId = 0
+local function toast(kind: string, text: string)
+	toastId += 1
+	local color = T.Accent
+	if kind == "good" then
+		color = T.Good
+	elseif kind == "bad" then
+		color = T.Bad
+	elseif kind == "warn" then
+		color = T.Warn
+	end
+
+	local card = new("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = T.Panel,
+		LayoutOrder = toastId,
+		BackgroundTransparency = 1,
+	}, {
+		corner(10),
+		stroke(color, 2),
+		pad(10),
+		new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 0),
+			AutomaticSize = Enum.AutomaticSize.Y,
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			Text = text,
+			TextColor3 = T.Text,
+			TextSize = 15,
+			TextWrapped = true,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}),
+	})
+	card.Parent = toastHolder
+
+	TweenService:Create(card, TweenInfo.new(0.2), { BackgroundTransparency = 0.05 }):Play()
+	task.delay(5, function()
+		TweenService:Create(card, TweenInfo.new(0.3), { BackgroundTransparency = 1 }):Play()
+		task.wait(0.3)
+		card:Destroy()
+	end)
+end
+
+-- ------------------------------------------------------------- event banner
+local eventBanner = new("Frame", {
+	Size = UDim2.new(0, 460, 0, 70),
+	Position = UDim2.new(0.5, -230, 0, 64),
+	BackgroundColor3 = T.Panel,
+	Visible = false,
+}, { corner(12), stroke(T.Accent, 2), pad(10) })
+eventBanner.Parent = gui
+
+local eventTitle = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 24),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "",
+	TextColor3 = T.Text,
+	TextScaled = true,
+})
+eventTitle.Parent = eventBanner
+
+local eventBlurb = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 20),
+	Position = UDim2.fromOffset(0, 26),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium,
+	Text = "",
+	TextColor3 = T.SubText,
+	TextSize = 13,
+	TextWrapped = true,
+})
+eventBlurb.Parent = eventBanner
+
+local eventTimer = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 16),
+	Position = UDim2.fromOffset(0, 50),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBold,
+	Text = "",
+	TextColor3 = T.Accent2,
+	TextSize = 13,
+})
+eventTimer.Parent = eventBanner
+
+local eventCountToken = 0
+local function startEvent(payload)
+	eventCountToken += 1
+	local myToken = eventCountToken
+	eventBanner.Visible = true
+	local bannerStroke = eventBanner:FindFirstChildOfClass("UIStroke")
+	if bannerStroke then
+		bannerStroke.Color = payload.accent or T.Accent
+	end
+	eventTitle.Text = payload.title or "EVENT"
+	eventTitle.TextColor3 = payload.accent or T.Text
+	eventBlurb.Text = payload.blurb or ""
+	if payload.targetName then
+		eventBlurb.Text ..= "  →  " .. payload.targetName
+	end
+
+	local remaining = tonumber(payload.duration) or 0
+	task.spawn(function()
+		while remaining > 0 and myToken == eventCountToken do
+			eventTimer.Text = ("⏳ %d:%02d left"):format(math.floor(remaining / 60), remaining % 60)
+			task.wait(1)
+			remaining -= 1
+		end
+	end)
+end
+
+local function endEvent(payload)
+	eventCountToken += 1
+	eventTitle.Text = payload.title or "EVENT"
+	eventBlurb.Text = payload.resultText or "Event over!"
+	eventTimer.Text = "Finished"
+	task.delay(6, function()
+		if eventTimer.Text == "Finished" then
+			eventBanner.Visible = false
+		end
+	end)
+end
+
+-- =========================================================== MY STAND panel
+local myStand = makePanel("MyStand")
+new("UIListLayout", { Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder }).Parent = myStand
+
+new("TextLabel", {
+	LayoutOrder = 1,
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "My Stand",
+	TextColor3 = T.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextSize = 24,
+}).Parent = myStand
+
+-- Stats strip
+local statStrip = new("Frame", {
+	LayoutOrder = 2,
+	Size = UDim2.new(1, 0, 0, 72),
+	BackgroundTransparency = 1,
+})
+statStrip.Parent = myStand
+new("UIListLayout", {
+	FillDirection = Enum.FillDirection.Horizontal,
+	Padding = UDim.new(0, 10),
+}).Parent = statStrip
+
+local function statCard(title: string, color: Color3): TextLabel
+	local card = new("Frame", {
+		Size = UDim2.new(0.25, -8, 1, 0),
+		BackgroundColor3 = T.Panel,
+	}, { corner(10), stroke(T.Stroke), pad(8) })
+	card.Parent = statStrip
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = title,
+		TextColor3 = T.SubText,
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}).Parent = card
+	local value = new("TextLabel", {
+		Size = UDim2.new(1, 0, 1, -16),
+		Position = UDim2.fromOffset(0, 16),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBlack,
+		Text = "0",
+		TextColor3 = color,
+		TextScaled = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	})
+	value.Parent = card
+	return value
+end
+
+local statEarned = statCard("Robux Raised", T.Accent2)
+local statDonated = statCard("Robux Donated", T.Accent)
+local statRecv = statCard("Donations Received", T.Gold)
+local statGiven = statCard("Donations Given", T.Text)
+
+-- Add-pass row
+local addRow = new("Frame", {
+	LayoutOrder = 3,
+	Size = UDim2.new(1, 0, 0, 44),
+	BackgroundTransparency = 1,
+})
+addRow.Parent = myStand
+
+local passInput = new("TextBox", {
+	Size = UDim2.new(1, -150, 1, 0),
+	BackgroundColor3 = T.Panel2,
+	Font = Enum.Font.GothamMedium,
+	PlaceholderText = "Paste your Game Pass ID (numbers only)",
+	Text = "",
+	TextColor3 = T.Text,
+	PlaceholderColor3 = T.SubText,
+	TextSize = 15,
+	ClearTextOnFocus = false,
+}, { corner(8), pad(8) })
+passInput.Parent = addRow
+
+local addBtn = button("+ Link Pass", T.Accent2, UDim2.new(0, 140, 1, 0))
+addBtn.Position = UDim2.new(1, -140, 0, 0)
+addBtn.Parent = addRow
+
+new("TextLabel", {
+	LayoutOrder = 4,
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.Gotham,
+	Text = ("Tip: create a Game Pass you OWN, set it On Sale, then paste its ID. Buyers pay you directly through Roblox (you keep ~%d%% after Roblox's fee)."):format(
+		math.floor((1 - Config.MarketplaceFee) * 100)
+	),
+	TextColor3 = T.SubText,
+	TextSize = 12,
+	TextWrapped = true,
+	TextXAlignment = Enum.TextXAlignment.Left,
+}).Parent = myStand
+
+local passList = new("ScrollingFrame", {
+	LayoutOrder = 5,
+	Size = UDim2.new(1, 0, 1, -230),
+	BackgroundTransparency = 1,
+	ScrollBarThickness = 6,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+})
+passList.Parent = myStand
+new("UIListLayout", { Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder }).Parent = passList
+
+local function renderMyProfile(profile)
+	if not profile then
+		return
+	end
+	statEarned.Text = comma(profile.earnedRobux) .. " R$"
+	statDonated.Text = comma(profile.donatedRobux) .. " R$"
+	statRecv.Text = comma(profile.receivedCount)
+	statGiven.Text = comma(profile.donationCount)
+
+	for _, child in passList:GetChildren() do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+
+	if #profile.linkedPasses == 0 then
+		new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 40),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			Text = "No passes linked yet. Add one above to start earning!",
+			TextColor3 = T.SubText,
+			TextSize = 14,
+		}).Parent = passList
+		return
+	end
+
+	for i, p in profile.linkedPasses do
+		local row = new("Frame", {
+			LayoutOrder = i,
+			Size = UDim2.new(1, 0, 0, 52),
+			BackgroundColor3 = T.Panel,
+		}, { corner(10), stroke(T.Stroke), pad(8) })
+		row.Parent = passList
+
+		new("TextLabel", {
+			Size = UDim2.new(1, -220, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = p.name,
+			TextColor3 = T.Text,
+			TextSize = 15,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}).Parent = row
+
+		new("TextLabel", {
+			Size = UDim2.new(0, 120, 1, 0),
+			Position = UDim2.new(1, -210, 0, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBlack,
+			Text = comma(p.price) .. " R$",
+			TextColor3 = T.Accent2,
+			TextSize = 16,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		}).Parent = row
+
+		local removeBtn = button("Unlink", T.Bad, UDim2.new(0, 80, 1, 0))
+		removeBtn.Position = UDim2.new(1, -80, 0, 0)
+		removeBtn.TextScaled = false
+		removeBtn.TextSize = 14
+		removeBtn.Parent = row
+		removeBtn.Activated:Connect(function()
+			Net.func("UnregisterPass"):InvokeServer(p.id)
+		end)
+	end
+end
+
+addBtn.Activated:Connect(function()
+	local id = passInput.Text:gsub("%s", "")
+	if id == "" then
+		return
+	end
+	addBtn.Text = "..."
+	local ok, result = pcall(function()
+		return Net.func("RegisterPass"):InvokeServer(id)
+	end)
+	addBtn.Text = "+ Link Pass"
+	if ok and result and result.ok then
+		passInput.Text = ""
+		toast("good", "Linked " .. (result.pass and result.pass.name or "pass") .. "!")
+	elseif ok and result then
+		toast("bad", result.err or "Couldn't link that pass.")
+	else
+		toast("bad", "Something went wrong - try again.")
+	end
+end)
+
+-- =========================================================== DONATE panel
+local donate = makePanel("Donate")
+new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "Donate to a Player",
+	TextColor3 = T.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextSize = 24,
+}).Parent = donate
+
+-- left: player list, right: selected stand
+local playerScroll = new("ScrollingFrame", {
+	Size = UDim2.new(0.4, -8, 1, -44),
+	Position = UDim2.fromOffset(0, 40),
+	BackgroundColor3 = T.Panel,
+	BackgroundTransparency = 0.3,
+	ScrollBarThickness = 6,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, { corner(10), pad(8) })
+playerScroll.Parent = donate
+new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.Name }).Parent = playerScroll
+
+local standView = new("Frame", {
+	Size = UDim2.new(0.6, -8, 1, -44),
+	Position = UDim2.new(0.4, 8, 0, 40),
+	BackgroundColor3 = T.Panel,
+	BackgroundTransparency = 0.3,
+}, { corner(10), pad(12) })
+standView.Parent = donate
+
+local standTitle = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 28),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "Select a player",
+	TextColor3 = T.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextSize = 20,
+})
+standTitle.Parent = standView
+
+local standSub = new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 18),
+	Position = UDim2.fromOffset(0, 28),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamMedium,
+	Text = "Their linked passes appear here.",
+	TextColor3 = T.SubText,
+	TextSize = 13,
+	TextXAlignment = Enum.TextXAlignment.Left,
+})
+standSub.Parent = standView
+
+local standPasses = new("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -56),
+	Position = UDim2.fromOffset(0, 54),
+	BackgroundTransparency = 1,
+	ScrollBarThickness = 6,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+})
+standPasses.Parent = standView
+new("UIListLayout", { Padding = UDim.new(0, 8) }).Parent = standPasses
+
+local function openStand(userId: number)
+	local data = Net.func("GetStand"):InvokeServer(userId)
+	for _, c in standPasses:GetChildren() do
+		if c:IsA("Frame") then
+			c:Destroy()
+		end
+	end
+	if not data then
+		standTitle.Text = "Stand unavailable"
+		standSub.Text = "That player isn't available right now."
+		return
+	end
+	standTitle.Text = data.name .. "'s Stand"
+	standSub.Text = ("Raised %s R$  •  %d donations received"):format(comma(data.earnedRobux), data.receivedCount)
+
+	if #data.passes == 0 then
+		new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 40),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			Text = "This player hasn't linked any passes yet.",
+			TextColor3 = T.SubText,
+			TextSize = 14,
+		}).Parent = standPasses
+		return
+	end
+
+	for i, p in data.passes do
+		local row = new("Frame", {
+			LayoutOrder = i,
+			Size = UDim2.new(1, 0, 0, 54),
+			BackgroundColor3 = T.Panel2,
+		}, { corner(10), pad(8) })
+		row.Parent = standPasses
+		new("TextLabel", {
+			Size = UDim2.new(1, -150, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = p.name,
+			TextColor3 = T.Text,
+			TextSize = 15,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}).Parent = row
+		local donateBtn = button(comma(p.price) .. " R$", T.Accent2, UDim2.new(0, 140, 1, 0))
+		donateBtn.Position = UDim2.new(1, -140, 0, 0)
+		donateBtn.TextScaled = false
+		donateBtn.TextSize = 16
+		donateBtn.Parent = row
+		donateBtn.Activated:Connect(function()
+			Net.event("RequestDonation"):FireServer(userId, p.id)
+		end)
+	end
+end
+
+local function refreshPlayerList()
+	for _, c in playerScroll:GetChildren() do
+		if c:IsA("TextButton") then
+			c:Destroy()
+		end
+	end
+	for _, plr in Players:GetPlayers() do
+		if plr ~= LocalPlayer then
+			local b = button(plr.DisplayName, T.Panel2, UDim2.new(1, 0, 0, 40))
+			b.Name = plr.Name
+			b.TextScaled = false
+			b.TextSize = 15
+			b.TextXAlignment = Enum.TextXAlignment.Left
+			b.Parent = playerScroll
+			local uid = plr.UserId
+			b.Activated:Connect(function()
+				openStand(uid)
+			end)
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(refreshPlayerList)
+Players.PlayerRemoving:Connect(function()
+	task.defer(refreshPlayerList)
+end)
+
+-- =========================================================== LEADERBOARDS panel
+local lb = makePanel("Leaderboards")
+new("TextLabel", {
+	Size = UDim2.new(1, 0, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "Leaderboards",
+	TextColor3 = T.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextSize = 24,
+}).Parent = lb
+
+local function lbColumn(title: string, accent: Color3, xScale: number): ScrollingFrame
+	local col = new("Frame", {
+		Size = UDim2.new(0.5, -8, 1, -44),
+		Position = UDim2.new(xScale, xScale == 0 and 0 or 8, 0, 40),
+		BackgroundColor3 = T.Panel,
+		BackgroundTransparency = 0.3,
+	}, { corner(10), pad(10) })
+	col.Parent = lb
+	new("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 26),
+		BackgroundColor3 = accent,
+		Font = Enum.Font.GothamBlack,
+		Text = title,
+		TextColor3 = Color3.fromRGB(20, 22, 32),
+		TextSize = 16,
+	}, { corner(8) }).Parent = col
+	local scroll = new("ScrollingFrame", {
+		Size = UDim2.new(1, 0, 1, -34),
+		Position = UDim2.fromOffset(0, 32),
+		BackgroundTransparency = 1,
+		ScrollBarThickness = 6,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+	})
+	scroll.Parent = col
+	new("UIListLayout", { Padding = UDim.new(0, 6) }).Parent = scroll
+	return scroll
+end
+
+local earnersCol = lbColumn("🏆 TOP EARNERS", T.Accent2, 0)
+local donorsCol = lbColumn("💎 TOP DONORS", T.Accent, 0.5)
+
+local function renderBoardColumn(scroll: ScrollingFrame, entries, accent: Color3)
+	for _, c in scroll:GetChildren() do
+		if c:IsA("Frame") then
+			c:Destroy()
+		end
+	end
+	if not entries or #entries == 0 then
+		new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 40),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			Text = "No entries yet.",
+			TextColor3 = T.SubText,
+			TextSize = 14,
+		}).Parent = scroll
+		return
+	end
+	for rank, e in entries do
+		local medal = T.Text
+		if rank == 1 then
+			medal = T.Gold
+		elseif rank == 2 then
+			medal = T.Silver
+		elseif rank == 3 then
+			medal = T.Bronze
+		end
+		local row = new("Frame", {
+			LayoutOrder = rank,
+			Size = UDim2.new(1, 0, 0, 36),
+			BackgroundColor3 = T.Panel2,
+		}, { corner(8), pad(6) })
+		row.Parent = scroll
+		new("TextLabel", {
+			Size = UDim2.new(0, 36, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBlack,
+			Text = "#" .. rank,
+			TextColor3 = medal,
+			TextSize = 15,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}).Parent = row
+		new("TextLabel", {
+			Size = UDim2.new(1, -150, 1, 0),
+			Position = UDim2.fromOffset(40, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = e.name,
+			TextColor3 = T.Text,
+			TextSize = 14,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}).Parent = row
+		new("TextLabel", {
+			Size = UDim2.new(0, 110, 1, 0),
+			Position = UDim2.new(1, -110, 0, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBlack,
+			Text = comma(e.value) .. " R$",
+			TextColor3 = accent,
+			TextSize = 14,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		}).Parent = row
+	end
+end
+
+local function renderLeaderboards(snapshot)
+	if not snapshot then
+		return
+	end
+	renderBoardColumn(earnersCol, snapshot.topEarners, T.Accent2)
+	renderBoardColumn(donorsCol, snapshot.topDonors, T.Accent)
+end
+
+-- =========================================================== DASHBOARD (owner)
+local dash = makePanel("Dashboard")
+new("TextLabel", {
+	Size = UDim2.new(1, -120, 0, 30),
+	BackgroundTransparency = 1,
+	Font = Enum.Font.GothamBlack,
+	Text = "Owner Dashboard",
+	TextColor3 = T.Text,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextSize = 24,
+}).Parent = dash
+
+local refreshDash = button("Refresh", T.Accent, UDim2.new(0, 110, 0, 32))
+refreshDash.Position = UDim2.new(1, -110, 0, 0)
+refreshDash.TextScaled = false
+refreshDash.TextSize = 14
+refreshDash.Parent = dash
+
+local dashBody = new("ScrollingFrame", {
+	Size = UDim2.new(1, 0, 1, -44),
+	Position = UDim2.fromOffset(0, 40),
+	BackgroundTransparency = 1,
+	ScrollBarThickness = 6,
+	CanvasSize = UDim2.new(),
+	AutomaticCanvasSize = Enum.AutomaticSize.Y,
+})
+dashBody.Parent = dash
+new("UIListLayout", { Padding = UDim.new(0, 8) }).Parent = dashBody
+
+local function renderDashboard()
+	for _, c in dashBody:GetChildren() do
+		if c:IsA("Frame") or c:IsA("TextLabel") then
+			c:Destroy()
+		end
+	end
+	local stats = Net.func("GetAdminStats"):InvokeServer()
+	if not stats or not stats.ok then
+		new("TextLabel", {
+			Size = UDim2.new(1, 0, 0, 40),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			Text = (stats and stats.err) or "Owner only.",
+			TextColor3 = T.Bad,
+			TextSize = 15,
+		}).Parent = dashBody
+		return
+	end
+
+	new("TextLabel", {
+		LayoutOrder = 1,
+		Size = UDim2.new(1, 0, 0, 24),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = ("This server: %s R$ donated across %d donations • %d players online")
+			:format(comma(stats.session.donated), stats.session.count, stats.session.players),
+		TextColor3 = T.Accent2,
+		TextSize = 15,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}).Parent = dashBody
+
+	new("TextLabel", {
+		LayoutOrder = 2,
+		Size = UDim2.new(1, 0, 0, 36),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.Gotham,
+		Text = ("Note: gamepass donations pay each player directly through Roblox (they keep ~%d%% after the %d%% fee). There's nothing to pay out by hand - this is a performance view.")
+			:format(100 - stats.feePct, stats.feePct),
+		TextColor3 = T.SubText,
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}).Parent = dashBody
+
+	new("TextLabel", {
+		LayoutOrder = 3,
+		Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold,
+		Text = "Online players (by Robux raised)",
+		TextColor3 = T.Text,
+		TextSize = 14,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}).Parent = dashBody
+
+	for i, row in stats.online do
+		local card = new("Frame", {
+			LayoutOrder = 3 + i,
+			Size = UDim2.new(1, 0, 0, 34),
+			BackgroundColor3 = T.Panel2,
+		}, { corner(8), pad(6) })
+		card.Parent = dashBody
+		new("TextLabel", {
+			Size = UDim2.new(0.5, 0, 1, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamBold,
+			Text = row.name,
+			TextColor3 = T.Text,
+			TextSize = 14,
+			TextXAlignment = Enum.TextXAlignment.Left,
+		}).Parent = card
+		new("TextLabel", {
+			Size = UDim2.new(0.5, -8, 1, 0),
+			Position = UDim2.new(0.5, 0, 0, 0),
+			BackgroundTransparency = 1,
+			Font = Enum.Font.GothamMedium,
+			Text = ("raised %s R$ • donated %s R$ • %d passes")
+				:format(comma(row.earnedRobux), comma(row.donatedRobux), row.linkedPasses),
+			TextColor3 = T.SubText,
+			TextSize = 12,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		}).Parent = card
+	end
+end
+
+refreshDash.Activated:Connect(renderDashboard)
+
+-- ------------------------------------------------------------------- nav setup
+addNav("MyStand", "My Stand")
+addNav("Donate", "Donate")
+addNav("Leaderboards", "Leaderboards")
+
+-- Show the dashboard tab only to owners.
+task.spawn(function()
+	local ok, stats = pcall(function()
+		return Net.func("GetAdminStats"):InvokeServer()
+	end)
+	if ok and stats and stats.ok then
+		addNav("Dashboard", "Dashboard")
+	end
+end)
+
+-- ------------------------------------------------------------------- remotes
+Net.event("Notify").OnClientEvent:Connect(function(payload)
+	if type(payload) == "table" then
+		toast(payload.kind or "info", payload.text or "")
+	end
+end)
+
+Net.event("ProfileUpdated").OnClientEvent:Connect(renderMyProfile)
+Net.event("LeaderboardUpdated").OnClientEvent:Connect(renderLeaderboards)
+
+Net.event("GameEvent").OnClientEvent:Connect(function(payload)
+	if type(payload) ~= "table" then
+		return
+	end
+	if payload.phase == "start" then
+		startEvent(payload)
+		toast("info", payload.title .. " started!")
+	elseif payload.phase == "end" then
+		endEvent(payload)
+	end
+end)
+
+-- Walk-up stands: open the Donate panel for a stand when its prompt triggers.
+ProximityPromptService.PromptTriggered:Connect(function(prompt, player)
+	if player ~= LocalPlayer or prompt.Name ~= "DonatePrompt" then
+		return
+	end
+	local model = prompt.Parent and prompt.Parent.Parent
+	local ownerId = model and model:GetAttribute("OwnerUserId")
+	if typeof(ownerId) == "number" then
+		showPanel("Donate")
+		openStand(ownerId)
+	end
+end)
+
+-- ------------------------------------------------------------------- startup
+refreshPlayerList()
+renderMyProfile(Net.func("GetProfile"):InvokeServer())
+renderLeaderboards(Net.func("GetLeaderboards"):InvokeServer())
+showPanel("MyStand")
+
+print("[DonationCentral] Client UI ready.")
+]]></ProtectedString>
+				</Properties>
+			</Item>
+		</Item>
+	</Item>
+</roblox>
